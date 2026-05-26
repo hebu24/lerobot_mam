@@ -112,6 +112,9 @@ class TrainPipelineConfig(HubMixin):
     eval: EvalConfig = field(default_factory=EvalConfig)
     wandb: WandBConfig = field(default_factory=WandBConfig)
     peft: PeftConfig | None = None
+    # Debug mode: train and evaluate on the first N fixed demos / init states.
+    overfit_test: bool = False
+    num_overfit: int = 5
 
     # Sample weighting configuration (e.g., for RA-BC training)
     sample_weighting: SampleWeightingConfig | None = None
@@ -195,6 +198,9 @@ class TrainPipelineConfig(HubMixin):
 
         if isinstance(self.dataset.repo_id, list):
             raise NotImplementedError("LeRobotMultiDataset is not currently implemented.")
+
+        if self.overfit_test and self.num_overfit <= 0:
+            raise ValueError(f"num_overfit must be positive when overfit_test=True, got {self.num_overfit}.")
 
         if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):
             raise ValueError("Optimizer and Scheduler must be set when the policy presets are not used.")

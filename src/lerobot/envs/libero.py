@@ -122,6 +122,7 @@ class LiberoEnv(gym.Env):
         visualization_height: int = 480,
         init_states: bool = True,
         episode_index: int = 0,
+        init_state_id: int | None = None,
         n_envs: int = 1,
         camera_name_mapping: dict[str, str] | None = None,
         num_steps_wait: int = 10,
@@ -165,6 +166,8 @@ class LiberoEnv(gym.Env):
         self._reset_stride = n_envs  # when performing a reset, append `_reset_stride` to `init_state_id`.
 
         self.init_state_id = self.episode_index  # tie each sub-env to a fixed init state
+        if init_state_id is not None:
+            self.init_state_id = init_state_id
 
         # Extract task metadata without allocating GPU resources (safe before fork).
         task = task_suite.get_task(task_id)
@@ -393,6 +396,7 @@ def _make_env_fns(
     init_states: bool,
     gym_kwargs: Mapping[str, Any],
     control_mode: str,
+    init_state_ids: Sequence[int] | None,
     camera_name_mapping: dict[str, str] | None = None,
     is_libero_plus: bool = False,
 ) -> list[Callable[[], LiberoEnv]]:
@@ -408,6 +412,7 @@ def _make_env_fns(
             init_states=init_states,
             episode_length=episode_length,
             episode_index=episode_index,
+            init_state_id=None if init_state_ids is None else int(init_state_ids[episode_index]),
             n_envs=n_envs,
             control_mode=control_mode,
             camera_name_mapping=camera_name_mapping,
@@ -453,6 +458,14 @@ def create_libero_envs(
 
     gym_kwargs = dict(gym_kwargs or {})
     task_ids_filter = gym_kwargs.pop("task_ids", None)  # optional: limit to specific tasks
+    init_state_ids = gym_kwargs.pop("init_state_ids", None)
+    if init_state_ids is not None:
+        init_state_ids = [int(idx) for idx in init_state_ids]
+        if len(init_state_ids) != n_envs:
+            raise ValueError(
+                f"init_state_ids must contain exactly n_envs entries. "
+                f"Got len(init_state_ids)={len(init_state_ids)} and n_envs={n_envs}."
+            )
 
     camera_names = parse_camera_names(camera_name)
     suite_names = [s.strip() for s in str(task).split(",") if s.strip()]
@@ -464,6 +477,8 @@ def create_libero_envs(
     )
     if task_ids_filter is not None:
         print(f"Restricting to task_ids={task_ids_filter}")
+    if init_state_ids is not None:
+        print(f"Using fixed LIBERO init_state_ids={init_state_ids}")
 
     is_async = env_cls is gym.vector.AsyncVectorEnv
 
@@ -492,6 +507,7 @@ def create_libero_envs(
                 init_states=init_states,
                 gym_kwargs=gym_kwargs,
                 control_mode=control_mode,
+                init_state_ids=init_state_ids,
                 camera_name_mapping=camera_name_mapping,
                 is_libero_plus=is_libero_plus,
             )

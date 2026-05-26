@@ -63,6 +63,72 @@ from lerobot.utils.utils import (
 from .lerobot_eval import eval_policy_all
 
 
+LIBERO_INIT_STATE_ID_KEYS = (
+    "libero/init_state_id",
+    "init_state_id",
+)
+
+
+def apply_overfit_test_config(cfg: TrainPipelineConfig) -> None:
+    """Restrict training/eval to the first fixed demos for pipeline debugging."""
+    if not cfg.overfit_test:
+        return
+
+    overfit_episodes = list(range(cfg.num_overfit))
+    if cfg.dataset.episodes is not None and cfg.dataset.episodes != overfit_episodes:
+        logging.warning(
+            "overfit_test=True overrides dataset.episodes=%s with %s",
+            cfg.dataset.episodes,
+            overfit_episodes,
+        )
+    cfg.dataset.episodes = overfit_episodes
+    cfg.eval.n_episodes = cfg.num_overfit
+    cfg.eval.batch_size = cfg.num_overfit
+    logging.info(
+        "Overfit test enabled: training episodes=%s, eval.n_episodes=%d, eval.batch_size=%d",
+        overfit_episodes,
+        cfg.eval.n_episodes,
+        cfg.eval.batch_size,
+    )
+
+
+def apply_overfit_eval_init_state_ids(cfg: TrainPipelineConfig, dataset: Any) -> None:
+    """Read fixed LIBERO init-state ids from the selected demos and pass them to eval envs."""
+    if not cfg.overfit_test or cfg.env is None:
+        return
+    if getattr(cfg.env, "type", None) not in {"libero", "libero_plus"}:
+        return
+    if not hasattr(cfg.env, "init_state_ids"):
+        logging.warning("overfit_test=True but env has no init_state_ids field; skip fixed init-state wiring.")
+        return
+
+    overfit_episodes = cfg.dataset.episodes or list(range(cfg.num_overfit))
+    episode_rows = {int(row["episode_index"]): row for row in dataset.meta.episodes}
+    missing = [ep for ep in overfit_episodes if ep not in episode_rows]
+    if missing:
+        raise ValueError(f"Overfit episodes missing from dataset metadata: {missing}")
+
+    column_names = set(getattr(dataset.meta.episodes, "column_names", []))
+    init_state_key = next((key for key in LIBERO_INIT_STATE_ID_KEYS if key in column_names), None)
+    if init_state_key is None:
+        logging.warning(
+            "Dataset episode metadata has no LIBERO init-state id column (%s). "
+            "Falling back to episode_index as init_state_id.",
+            ", ".join(LIBERO_INIT_STATE_ID_KEYS),
+        )
+
+    init_state_ids = [
+        (
+            int(episode_rows[ep][init_state_key])
+            if init_state_key is not None
+            else int(episode_rows[ep]["episode_index"])
+        )
+        for ep in overfit_episodes
+    ]
+    cfg.env.init_state_ids = init_state_ids
+    logging.info("Overfit eval fixed LIBERO init_state_ids=%s", init_state_ids)
+
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -184,6 +250,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     from accelerate import Accelerator
 
     cfg.validate()
+    apply_overfit_test_config(cfg)
 
     # Create Accelerator if not provided
     # It will automatically detect if running in distributed mode or single-process mode
@@ -242,6 +309,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # Now all other processes can safely load the dataset
     if not is_main_process:
         dataset = make_dataset(cfg)
+
+    if is_main_process:
+        apply_overfit_eval_init_state_ids(cfg, dataset)
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,

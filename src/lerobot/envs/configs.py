@@ -332,6 +332,7 @@ class LiberoEnv(EnvConfig):
     observation_height: int = 360
     observation_width: int = 360
     is_libero_plus: bool = False
+    init_state_ids: list[int] | None = None
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
             ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
@@ -415,6 +416,8 @@ class LiberoEnv(EnvConfig):
         }
         if self.task_ids is not None:
             kwargs["task_ids"] = self.task_ids
+        if self.init_state_ids is not None:
+            kwargs["init_state_ids"] = self.init_state_ids
         return kwargs
 
     def create_envs(self, n_envs: int, use_async_envs: bool = False):
