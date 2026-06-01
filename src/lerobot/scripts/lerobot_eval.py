@@ -54,7 +54,7 @@ import json
 import logging
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable
 from contextlib import nullcontext
 from copy import deepcopy
@@ -83,8 +83,9 @@ from lerobot.envs import (
 )
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.processor import PolicyProcessorPipeline
+from lerobot.processor.libero_relative_action_processor import chunk_relative_to_absolute
 from lerobot.types import PolicyAction
-from lerobot.utils.constants import ACTION, DONE, OBS_STR, REWARD
+from lerobot.utils.constants import ACTION, DONE, OBS_STATE, OBS_STR, REWARD
 from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.io_utils import write_video
@@ -150,6 +151,12 @@ def rollout(
     all_rewards = []
     all_successes = []
     all_dones = []
+    chunk_absolute_action_queue: deque[Tensor] = deque()
+    use_chunk_relative_actions = bool(
+        getattr(getattr(policy, "config", None), "use_relative_actions", False)
+        and hasattr(policy, "update_observation_queue")
+        and hasattr(policy, "predict_action_chunk")
+    )
 
     step = 0
     # Keep track of which environments are done.
@@ -180,11 +187,26 @@ def rollout(
 
         # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
         observation = env_preprocessor(observation)
+        anchor_state = observation.get(OBS_STATE) if use_chunk_relative_actions else None
+        anchor_state = anchor_state.clone() if anchor_state is not None else None
 
         observation = preprocessor(observation)
         with torch.inference_mode():
-            action = policy.select_action(observation)
-        action = postprocessor(action)
+            if use_chunk_relative_actions:
+                observation = policy.update_observation_queue(observation)
+                if len(chunk_absolute_action_queue) == 0:
+                    relative_chunk = policy.predict_action_chunk(observation)
+                    relative_chunk = postprocessor(relative_chunk)
+                    if anchor_state is None:
+                        raise RuntimeError("Chunk-relative actions require observation.state as anchor.")
+                    absolute_chunk = chunk_relative_to_absolute(relative_chunk, anchor_state)
+                    if not isinstance(absolute_chunk, Tensor):
+                        absolute_chunk = torch.as_tensor(absolute_chunk)
+                    chunk_absolute_action_queue.extend(absolute_chunk.transpose(0, 1))
+                action = chunk_absolute_action_queue.popleft()
+            else:
+                action = policy.select_action(observation)
+                action = postprocessor(action)
 
         action_transition = {ACTION: action}
         action_transition = env_postprocessor(action_transition)

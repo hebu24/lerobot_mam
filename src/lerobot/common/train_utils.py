@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import shutil
 from pathlib import Path
 
 from torch.optim import Optimizer
@@ -64,6 +65,31 @@ def update_last_checkpoint(checkpoint_dir: Path) -> Path:
         last_checkpoint_dir.unlink()
     relative_target = checkpoint_dir.relative_to(checkpoint_dir.parent)
     last_checkpoint_dir.symlink_to(relative_target)
+
+
+def update_best_checkpoint(checkpoint_dir: Path) -> Path:
+    best_checkpoint_dir = checkpoint_dir.parent / "best"
+    if best_checkpoint_dir.is_symlink():
+        best_checkpoint_dir.unlink()
+    elif best_checkpoint_dir.exists():
+        shutil.rmtree(best_checkpoint_dir)
+    relative_target = checkpoint_dir.relative_to(checkpoint_dir.parent)
+    best_checkpoint_dir.symlink_to(relative_target)
+    return best_checkpoint_dir
+
+
+def prune_checkpoints(checkpoints_dir: Path, keep_checkpoint_dir: Path | None) -> None:
+    if not checkpoints_dir.exists():
+        return
+
+    keep_name = keep_checkpoint_dir.name if keep_checkpoint_dir is not None else None
+    for child in checkpoints_dir.iterdir():
+        if child.name in {LAST_CHECKPOINT_LINK, "best", keep_name}:
+            continue
+        if child.is_symlink() or child.is_file():
+            child.unlink()
+        elif child.is_dir():
+            shutil.rmtree(child)
 
 
 def save_checkpoint(

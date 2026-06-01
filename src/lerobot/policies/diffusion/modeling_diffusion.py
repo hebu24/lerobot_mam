@@ -109,6 +109,24 @@ class DiffusionPolicy(PreTrainedPolicy):
         return actions
 
     @torch.no_grad()
+    def update_observation_queue(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Push the latest observation into the policy queues."""
+        if ACTION in batch:
+            batch.pop(ACTION)
+
+        if self.config.image_features:
+            batch = dict(batch)
+            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+        self._queues = populate_queues(self._queues, batch)
+        return batch
+
+    @torch.no_grad()
+    def select_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+        """Predict the next action chunk without pushing it into the policy action queue."""
+        batch = self.update_observation_queue(batch)
+        return self.predict_action_chunk(batch, noise=noise)
+
+    @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """Select a single action given environment observations.
 
@@ -131,14 +149,7 @@ class DiffusionPolicy(PreTrainedPolicy):
         actually measured from the first observation which (if `n_obs_steps` > 1) happened in the past.
         """
         # NOTE: for offline evaluation, we have action in the batch, so we need to pop it out
-        if ACTION in batch:
-            batch.pop(ACTION)
-
-        if self.config.image_features:
-            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
-        # NOTE: It's important that this happens after stacking the images into a single key.
-        self._queues = populate_queues(self._queues, batch)
+        batch = self.update_observation_queue(batch)
 
         if len(self._queues[ACTION]) == 0:
             actions = self.predict_action_chunk(batch, noise=noise)

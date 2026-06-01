@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import gymnasium as gym
+import libero.libero as libero_module
 import numpy as np
 import torch
 from gymnasium import spaces
@@ -57,6 +58,59 @@ def _select_task_ids(total_tasks: int, task_ids: Iterable[int] | None) -> list[i
     return ids
 
 
+_LIBERO_PATH_FALLBACKS = {
+    "benchmark_root": ".",
+    "bddl_files": "bddl_files",
+    "init_states": "init_files",
+    "assets": "assets",
+}
+
+
+def _get_libero_path(query_key: str) -> Path:
+    """Return a valid LIBERO resource path, falling back to the installed package."""
+    configured = Path(get_libero_path(query_key))
+    if configured.exists():
+        return configured
+
+    fallback_rel = _LIBERO_PATH_FALLBACKS.get(query_key)
+    if fallback_rel is None:
+        return configured
+
+    package_root = Path(benchmark.__file__).resolve().parents[1]
+    fallback = package_root / fallback_rel
+    if fallback.exists():
+        return fallback
+    return configured
+
+
+def _validate_libero_assets() -> None:
+    """Fail early with an actionable message when LIBERO assets are incomplete."""
+    # `libero.libero.get_assets_path()` attempts a Hugging Face download when
+    # package-local assets are absent. Avoid that side effect here; this check
+    # should only report what is available locally.
+    package_assets_path = Path(benchmark.__file__).resolve().parents[1] / "assets"
+    cache_assets_path = Path.home() / ".cache" / "libero" / "assets"
+    assets_path = package_assets_path if package_assets_path.exists() else cache_assets_path
+
+    required = [
+        assets_path / "turbosquid_objects" / "wine_rack" / "wine_rack.xml",
+        assets_path / "stable_scanned_objects" / "akita_black_bowl" / "akita_black_bowl.xml",
+        assets_path / "stable_hope_objects" / "cream_cheese" / "cream_cheese.xml",
+    ]
+    missing = [path for path in required if not path.exists()]
+    if missing:
+        missing_text = "\n".join(f"  - {path}" for path in missing)
+        raise FileNotFoundError(
+            "LIBERO assets are missing or incomplete. Missing required files:\n"
+            f"{missing_text}\n"
+            "Run this once with network access to refresh the asset cache:\n"
+            "  uv run python -c \"from libero.libero.utils.download_utils import "
+            "download_assets_from_huggingface; "
+            "download_assets_from_huggingface('/home/hebu/.cache/libero/assets')\""
+        )
+    libero_module._assets_path_cache = str(assets_path)
+
+
 # LIBERO-plus perturbation variants encode the perturbation in the filename
 # but on disk only the base `.pruned_init` exists — strip the suffix to match
 # LIBERO-plus's own suite.get_task_init_states() (we reimplement it here so we
@@ -67,7 +121,7 @@ _LIBERO_PERTURBATION_SUFFIX_RE = re.compile(r"_(?:language|view|light)_[^.]*|_(?
 def get_task_init_states(task_suite: Any, i: int, is_libero_plus: bool = False) -> np.ndarray:
     task = task_suite.tasks[i]
     filename = Path(task.init_states_file)
-    root = Path(get_libero_path("init_states"))
+    root = _get_libero_path("init_states")
 
     if not is_libero_plus:
         init_states_path = root / task.problem_folder / filename.name
@@ -123,6 +177,7 @@ class LiberoEnv(gym.Env):
         init_states: bool = True,
         episode_index: int = 0,
         init_state_id: int | None = None,
+        init_state_ids: Sequence[int] | None = None,
         n_envs: int = 1,
         camera_name_mapping: dict[str, str] | None = None,
         num_steps_wait: int = 10,
@@ -164,6 +219,8 @@ class LiberoEnv(gym.Env):
             else None
         )
         self._reset_stride = n_envs  # when performing a reset, append `_reset_stride` to `init_state_id`.
+        self._init_state_ids = [int(idx) for idx in init_state_ids] if init_state_ids is not None else None
+        self._init_state_cursor = self.episode_index
 
         self.init_state_id = self.episode_index  # tie each sub-env to a fixed init state
         if init_state_id is not None:
@@ -174,7 +231,7 @@ class LiberoEnv(gym.Env):
         self.task = task.name
         self.task_description = task.language
         self._task_bddl_file = os.path.join(
-            get_libero_path("bddl_files"), task.problem_folder, task.bddl_file
+            _get_libero_path("bddl_files"), task.problem_folder, task.bddl_file
         )
         self._env: OffScreenRenderEnv | None = (
             None  # deferred — created on first reset() inside the worker subprocess
@@ -259,6 +316,7 @@ class LiberoEnv(gym.Env):
         """
         if self._env is not None:
             return
+        _validate_libero_assets()
         env = OffScreenRenderEnv(
             bddl_file_name=self._task_bddl_file,
             camera_heights=self.observation_height,
@@ -327,14 +385,21 @@ class LiberoEnv(gym.Env):
             "Please switch to an image-based obs_type (e.g. 'pixels', 'pixels_agent_pos')."
         )
 
-    def reset(self, seed=None, **kwargs):
+    def reset(self, seed=None, advance_init_state: bool = True, **kwargs):
         self._ensure_env()
         super().reset(seed=seed)
         self._env.seed(seed)
         raw_obs = self._env.reset()
         if self.init_states and self._init_states is not None:
-            raw_obs = self._env.set_init_state(self._init_states[self.init_state_id % len(self._init_states)])
-            self.init_state_id += self._reset_stride  # Change init_state_id when reset
+            if self._init_state_ids is not None:
+                init_state_id = self._init_state_ids[self._init_state_cursor % len(self._init_state_ids)]
+                if advance_init_state:
+                    self._init_state_cursor += self._reset_stride
+            else:
+                init_state_id = self.init_state_id
+                if advance_init_state:
+                    self.init_state_id += self._reset_stride  # Change init_state_id when reset
+            raw_obs = self._env.set_init_state(self._init_states[init_state_id % len(self._init_states)])
 
         # After reset, objects may be unstable (slightly floating, intersecting, etc.).
         # Step the simulator with a no-op action for a few frames so everything settles.
@@ -376,13 +441,16 @@ class LiberoEnv(gym.Env):
         )
         observation = self._format_raw_obs(raw_obs)
         if terminated:
-            self.reset()
+            self.reset(advance_init_state=False)
         truncated = False
         return observation, reward, terminated, truncated, info
 
     def close(self):
         if self._env is not None:
-            self._env.close()
+            try:
+                self._env.close()
+            finally:
+                self._env = None
 
 
 def _make_env_fns(
@@ -413,6 +481,7 @@ def _make_env_fns(
             episode_length=episode_length,
             episode_index=episode_index,
             init_state_id=None if init_state_ids is None else int(init_state_ids[episode_index]),
+            init_state_ids=init_state_ids,
             n_envs=n_envs,
             control_mode=control_mode,
             camera_name_mapping=camera_name_mapping,
@@ -461,9 +530,9 @@ def create_libero_envs(
     init_state_ids = gym_kwargs.pop("init_state_ids", None)
     if init_state_ids is not None:
         init_state_ids = [int(idx) for idx in init_state_ids]
-        if len(init_state_ids) != n_envs:
+        if len(init_state_ids) < n_envs:
             raise ValueError(
-                f"init_state_ids must contain exactly n_envs entries. "
+                f"init_state_ids must contain at least n_envs entries. "
                 f"Got len(init_state_ids)={len(init_state_ids)} and n_envs={n_envs}."
             )
 

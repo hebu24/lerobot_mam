@@ -152,6 +152,10 @@ class DiffusionConfig(PreTrainedConfig):
     # Loss computation
     do_mask_loss_for_padding: bool = False
 
+    # LIBERO absolute-action training can use chunk-relative targets:
+    # absolute action chunk -> relative to the latest observation.state -> normalize.
+    use_relative_actions: bool = False
+
     # Training presets
     optimizer_lr: float = 1e-4
     optimizer_betas: tuple = (0.95, 0.999)

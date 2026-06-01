@@ -20,6 +20,7 @@ import logging
 import numpy as np
 
 from lerobot.processor import RelativeActionsProcessorStep
+from lerobot.processor.libero_relative_action_processor import absolute_to_chunk_relative
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .io_utils import load_image_as_numpy
@@ -644,6 +645,17 @@ def _get_valid_chunk_starts(episode_indices: np.ndarray, chunk_size: int) -> np.
     return starts[valid]
 
 
+def _get_valid_anchor_indices(episode_indices: np.ndarray, delta_indices: np.ndarray) -> np.ndarray:
+    """Return anchor indices whose shifted action frames stay within the same episode."""
+    total = len(episode_indices)
+    anchors = np.arange(total)
+    frame_idx = anchors[:, None] + delta_indices[None, :]
+    in_bounds = (frame_idx >= 0) & (frame_idx < total)
+    safe_frame_idx = np.clip(frame_idx, 0, max(total - 1, 0))
+    same_episode = episode_indices[safe_frame_idx] == episode_indices[anchors, None]
+    return anchors[np.all(in_bounds & same_episode, axis=1)]
+
+
 def _compute_relative_chunk_batch(
     start_indices: np.ndarray,
     all_actions: np.ndarray,
@@ -664,6 +676,23 @@ def _compute_relative_chunk_batch(
     mask_dim = len(relative_mask)
     chunks[:, :, :mask_dim] -= states[:, None, :mask_dim] * relative_mask[None, None, :]
     return chunks.reshape(-1, all_actions.shape[1])
+
+
+def _compute_libero_relative_chunk_batch(
+    anchor_indices: np.ndarray,
+    all_actions: np.ndarray,
+    all_states: np.ndarray,
+    action_delta_indices: np.ndarray,
+) -> np.ndarray:
+    """Compute LIBERO SE(3) chunk-relative actions for a batch of anchor frames."""
+    if len(anchor_indices) == 0:
+        return np.empty((0, all_actions.shape[1]), dtype=np.float32)
+
+    frame_idx = anchor_indices[:, None] + action_delta_indices[None, :]
+    chunks = all_actions[frame_idx].astype(np.float32, copy=True)
+    anchors = all_states[anchor_indices].astype(np.float32, copy=False)
+    relative = absolute_to_chunk_relative(chunks, anchors)
+    return np.asarray(relative, dtype=np.float32).reshape(-1, all_actions.shape[1])
 
 
 def compute_relative_action_stats(
@@ -766,4 +795,85 @@ def compute_relative_action_stats(
         f"q01={stats['q01'].mean():.4f}, q99={stats['q99'].mean():.4f}"
     )
 
+    return stats
+
+
+def compute_libero_relative_action_stats(
+    hf_dataset,
+    action_delta_indices: list[int],
+    num_workers: int = 0,
+) -> dict[str, np.ndarray]:
+    """Compute action stats for LIBERO absolute actions after chunk-relative conversion.
+
+    This matches Diffusion training with ``policy.use_relative_actions=True``:
+    each sampled action horizon is converted relative to the current
+    ``observation.state`` before normalization. Position uses subtraction,
+    orientation uses ``R_rel = R_abs @ R_anchor.T``, and gripper stays absolute.
+    """
+    action_delta_indices_np = np.asarray(action_delta_indices, dtype=np.int64)
+    if action_delta_indices_np.ndim != 1 or len(action_delta_indices_np) == 0:
+        raise ValueError(f"action_delta_indices must be a non-empty 1-D list, got {action_delta_indices}.")
+
+    logging.info("Loading action/state data for LIBERO relative action stats...")
+    all_actions = np.array(hf_dataset[ACTION], dtype=np.float32)
+    all_states = np.array(hf_dataset[OBS_STATE], dtype=np.float32)
+    episode_indices = np.array(hf_dataset["episode_index"])
+
+    valid_anchors = _get_valid_anchor_indices(episode_indices, action_delta_indices_np)
+    if len(valid_anchors) == 0:
+        raise RuntimeError(
+            f"No valid anchors found (total_frames={len(episode_indices)}, "
+            f"action_delta_indices={action_delta_indices})."
+        )
+
+    effective_workers = max(num_workers, 1)
+    logging.info(
+        "Computing LIBERO relative action stats from %d anchors (chunk_size=%d, workers=%d)",
+        len(valid_anchors),
+        len(action_delta_indices_np),
+        effective_workers,
+    )
+
+    batch_size = 50_000
+    batches = [valid_anchors[i : i + batch_size] for i in range(0, len(valid_anchors), batch_size)]
+    running_stats = RunningQuantileStats()
+
+    if num_workers > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            futures = [
+                pool.submit(
+                    _compute_libero_relative_chunk_batch,
+                    batch,
+                    all_actions,
+                    all_states,
+                    action_delta_indices_np,
+                )
+                for batch in batches
+            ]
+            for future in as_completed(futures):
+                running_stats.update(future.result())
+    else:
+        for batch in batches:
+            running_stats.update(
+                _compute_libero_relative_chunk_batch(
+                    batch,
+                    all_actions,
+                    all_states,
+                    action_delta_indices_np,
+                )
+            )
+
+    stats = running_stats.get_statistics()
+    total_frames = len(valid_anchors) * len(action_delta_indices_np)
+    logging.info(
+        "LIBERO relative action stats (%d anchors, %d frames): mean=%.4f, std=%.4f, q01=%.4f, q99=%.4f",
+        len(valid_anchors),
+        total_frames,
+        np.abs(stats["mean"]).mean(),
+        stats["std"].mean(),
+        stats["q01"].mean(),
+        stats["q99"].mean(),
+    )
     return stats

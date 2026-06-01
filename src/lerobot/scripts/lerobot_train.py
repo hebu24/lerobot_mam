@@ -37,7 +37,9 @@ from lerobot.common.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_state,
+    prune_checkpoints,
     save_checkpoint,
+    update_best_checkpoint,
     update_last_checkpoint,
 )
 from lerobot.common.wandb_utils import WandBLogger
@@ -49,6 +51,7 @@ from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
+from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
@@ -83,7 +86,7 @@ def apply_overfit_test_config(cfg: TrainPipelineConfig) -> None:
         )
     cfg.dataset.episodes = overfit_episodes
     cfg.eval.n_episodes = cfg.num_overfit
-    cfg.eval.batch_size = cfg.num_overfit
+    cfg.eval.batch_size = min(cfg.eval.batch_size, cfg.num_overfit) if cfg.eval.batch_size else cfg.num_overfit
     logging.info(
         "Overfit test enabled: training episodes=%s, eval.n_episodes=%d, eval.batch_size=%d",
         overfit_episodes,
@@ -127,6 +130,27 @@ def apply_overfit_eval_init_state_ids(cfg: TrainPipelineConfig, dataset: Any) ->
     ]
     cfg.env.init_state_ids = init_state_ids
     logging.info("Overfit eval fixed LIBERO init_state_ids=%s", init_state_ids)
+
+
+def apply_diffusion_relative_action_stats(cfg: TrainPipelineConfig, dataset: Any) -> None:
+    """Swap action normalization stats to LIBERO chunk-relative stats when requested."""
+    active_cfg = cfg.trainable_config
+    if getattr(active_cfg, "type", None) != "diffusion":
+        return
+    if not getattr(active_cfg, "use_relative_actions", False):
+        return
+    if ACTION not in dataset.meta.features or OBS_STATE not in dataset.meta.features:
+        raise ValueError("Diffusion use_relative_actions=True requires action and observation.state features.")
+
+    from lerobot.datasets.compute_stats import compute_libero_relative_action_stats
+
+    dataset.meta.stats = dataset.meta.stats or {}
+    dataset.meta.stats[ACTION] = compute_libero_relative_action_stats(
+        hf_dataset=dataset.hf_dataset,
+        action_delta_indices=active_cfg.action_delta_indices,
+        num_workers=cfg.num_workers,
+    )
+    logging.info("Using LIBERO chunk-relative action stats for normalization.")
 
 
 def update_policy(
@@ -310,16 +334,15 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if not is_main_process:
         dataset = make_dataset(cfg)
 
+    apply_diffusion_relative_action_stats(cfg, dataset)
+
     if is_main_process:
         apply_overfit_eval_init_state_ids(cfg, dataset)
 
-    # Create environment used for evaluating checkpoints during training on simulation data.
-    # On real-world data, no need to create an environment as evaluations are done outside train.py,
-    # using the eval.py instead, with gym_dora environment and dora-rs.
+    # Create evaluation environments lazily at each eval step. `eval_policy_all`
+    # closes the vector envs it receives, so reusing one across eval steps would
+    # leave LIBERO's wrapped robosuite env in a partially closed state.
     eval_env = None
-    if cfg.eval_freq > 0 and cfg.env is not None and is_main_process:
-        logging.info("Creating env")
-        eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
 
     if cfg.is_reward_model_training:
         if is_main_process:
@@ -530,6 +553,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
+    save_best_eval_checkpoint_only = cfg.env is not None and cfg.eval_freq > 0
+    best_eval_score: tuple[float, float] | None = None
+    best_checkpoint_dir = None
+
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
@@ -573,7 +600,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
 
-        if cfg.save_checkpoint and is_saving_step:
+        if cfg.save_checkpoint and is_saving_step and not save_best_eval_checkpoint_only:
             if is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")
                 checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
@@ -597,22 +624,30 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             if is_main_process:
                 step_id = get_step_identifier(step, cfg.steps)
                 logging.info(f"Eval policy at step {step}")
-                with torch.no_grad(), accelerator.autocast():
-                    eval_info = eval_policy_all(
-                        envs=eval_env,  # dict[suite][task_id] -> vec_env
-                        policy=accelerator.unwrap_model(policy),
-                        env_preprocessor=env_preprocessor,
-                        env_postprocessor=env_postprocessor,
-                        preprocessor=preprocessor,
-                        postprocessor=postprocessor,
-                        n_episodes=cfg.eval.n_episodes,
-                        videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
-                        max_episodes_rendered=4,
-                        start_seed=cfg.seed,
-                        max_parallel_tasks=cfg.env.max_parallel_tasks,
-                    )
+                logging.info("Creating eval env")
+                eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
+                try:
+                    with torch.no_grad(), accelerator.autocast():
+                        eval_info = eval_policy_all(
+                            envs=eval_env,  # dict[suite][task_id] -> vec_env
+                            policy=accelerator.unwrap_model(policy),
+                            env_preprocessor=env_preprocessor,
+                            env_postprocessor=env_postprocessor,
+                            preprocessor=preprocessor,
+                            postprocessor=postprocessor,
+                            n_episodes=cfg.eval.n_episodes,
+                            videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
+                            max_episodes_rendered=4,
+                            start_seed=cfg.seed,
+                            max_parallel_tasks=cfg.env.max_parallel_tasks,
+                        )
+                finally:
+                    if eval_env is not None:
+                        close_envs(eval_env)
+                    eval_env = None
                 # overall metrics (suite-agnostic)
                 aggregated = eval_info["overall"]
+                eval_score = (float(aggregated["pc_success"]), float(aggregated["avg_sum_reward"]))
 
                 # optional: per-suite logging
                 for suite, suite_info in eval_info.items():
@@ -639,6 +674,47 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
                     wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+
+                if cfg.save_checkpoint:
+                    if best_eval_score is None or eval_score > best_eval_score:
+                        checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+                        logging.info(
+                            "New best eval checkpoint at step %s: pc_success=%.1f, avg_sum_reward=%.3f",
+                            step,
+                            eval_score[0],
+                            eval_score[1],
+                        )
+                        prune_checkpoints(checkpoint_dir.parent, keep_checkpoint_dir=None)
+                        save_checkpoint(
+                            checkpoint_dir=checkpoint_dir,
+                            step=step,
+                            cfg=cfg,
+                            policy=accelerator.unwrap_model(policy),
+                            optimizer=optimizer,
+                            scheduler=lr_scheduler,
+                            preprocessor=preprocessor,
+                            postprocessor=postprocessor,
+                        )
+                        update_last_checkpoint(checkpoint_dir)
+                        update_best_checkpoint(checkpoint_dir)
+                        prune_checkpoints(checkpoint_dir.parent, keep_checkpoint_dir=checkpoint_dir)
+                        best_eval_score = eval_score
+                        best_checkpoint_dir = checkpoint_dir
+                        if wandb_logger:
+                            wandb_logger.log_policy(checkpoint_dir)
+                    else:
+                        logging.info(
+                            "Eval did not improve best checkpoint: current pc_success=%.1f, "
+                            "avg_sum_reward=%.3f; best pc_success=%.1f, avg_sum_reward=%.3f",
+                            eval_score[0],
+                            eval_score[1],
+                            best_eval_score[0],
+                            best_eval_score[1],
+                        )
+                        prune_checkpoints(
+                            cfg.output_dir / "checkpoints",
+                            keep_checkpoint_dir=best_checkpoint_dir,
+                        )
 
             accelerator.wait_for_everyone()
 

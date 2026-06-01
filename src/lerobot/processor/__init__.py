@@ -61,6 +61,12 @@ from .hil_processor import (
     RewardClassifierProcessorStep,
     TimeLimitProcessorStep,
 )
+from .libero_relative_action_processor import (
+    LiberoChunkRelativeActionsProcessorStep,
+    absolute_to_chunk_relative,
+    chunk_relative_to_absolute,
+    delta_to_absolute_action,
+)
 from .newline_task_processor import NewLineTaskProcessorStep
 from .normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep, hotswap_stats
 from .observation_processor import VanillaObservationProcessorStep
@@ -157,6 +163,7 @@ __all__ = [
     "DataProcessorPipeline",
     "IsaaclabArenaProcessorStep",
     "LiberoProcessorStep",
+    "LiberoChunkRelativeActionsProcessorStep",
     "TimeLimitProcessorStep",
     "AddBatchDimensionProcessorStep",
     "RobotProcessorPipeline",
@@ -170,6 +177,9 @@ __all__ = [
     "TruncatedProcessorStep",
     "to_absolute_actions",
     "to_relative_actions",
+    "absolute_to_chunk_relative",
+    "chunk_relative_to_absolute",
+    "delta_to_absolute_action",
     "UnnormalizerProcessorStep",
     "VanillaObservationProcessorStep",
 ]
