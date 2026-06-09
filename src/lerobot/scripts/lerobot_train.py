@@ -316,6 +316,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     # Use accelerator's device
     device = accelerator.device
+    # Keep model and processor construction on the local rank device selected by Accelerate.
+    # This matters for launchers that expose multiple CUDA devices to every worker.
+    active_cfg = cfg.trainable_config
+    active_cfg.device = str(device)
     if cfg.cudnn_deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
@@ -338,6 +342,26 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     if is_main_process:
         apply_overfit_eval_init_state_ids(cfg, dataset)
+        mam_eval_episodes = None
+        if (
+            getattr(cfg.trainable_config, "type", None) == "mam"
+            and getattr(cfg.trainable_config, "mam_eval_dataset_repo_id", None)
+            and cfg.env is not None
+        ):
+            from lerobot.policies.mam.eval_mam import (
+                configure_mam_eval_init_state_ids,
+                load_mam_eval_episodes,
+            )
+
+            mam_eval_episodes = load_mam_eval_episodes(
+                repo_id=cfg.trainable_config.mam_eval_dataset_repo_id,
+                root=getattr(cfg.trainable_config, "mam_eval_dataset_root", None),
+                episodes=getattr(cfg.trainable_config, "mam_eval_episodes", None),
+            )
+            configure_mam_eval_init_state_ids(cfg, mam_eval_episodes, cfg.eval.n_episodes)
+            logging.info("MAM eval fixed LIBERO init_state_ids=%s", cfg.env.init_state_ids)
+    else:
+        mam_eval_episodes = None
 
     # Create evaluation environments lazily at each eval step. `eval_policy_all`
     # closes the vector envs it receives, so reusing one across eval steps would
@@ -383,7 +407,6 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # Wait for all processes to finish model creation before continuing
     accelerator.wait_for_everyone()
 
-    active_cfg = cfg.trainable_config
     processor_pretrained_path = active_cfg.pretrained_path
     if (
         getattr(active_cfg, "use_relative_actions", False)
@@ -406,7 +429,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     if not cfg.is_reward_model_training and processor_pretrained_path is not None:
         processor_kwargs["preprocessor_overrides"] = {
-            "device_processor": {"device": device.type},
+            "device_processor": {"device": str(device)},
             "normalizer_processor": {
                 "stats": dataset.meta.stats,
                 "features": {**policy.config.input_features, **policy.config.output_features},
@@ -625,22 +648,40 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 step_id = get_step_identifier(step, cfg.steps)
                 logging.info(f"Eval policy at step {step}")
                 logging.info("Creating eval env")
-                eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
+                eval_env = make_env(
+                    cfg.env,
+                    n_envs=cfg.eval.batch_size,
+                    use_async_envs=cfg.eval.use_async_envs,
+                )
                 try:
                     with torch.no_grad(), accelerator.autocast():
-                        eval_info = eval_policy_all(
-                            envs=eval_env,  # dict[suite][task_id] -> vec_env
-                            policy=accelerator.unwrap_model(policy),
-                            env_preprocessor=env_preprocessor,
-                            env_postprocessor=env_postprocessor,
-                            preprocessor=preprocessor,
-                            postprocessor=postprocessor,
-                            n_episodes=cfg.eval.n_episodes,
-                            videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
-                            max_episodes_rendered=4,
-                            start_seed=cfg.seed,
-                            max_parallel_tasks=cfg.env.max_parallel_tasks,
-                        )
+                        if mam_eval_episodes is not None:
+                            from lerobot.policies.mam.eval_mam import eval_mam_policy_all
+
+                            eval_info = eval_mam_policy_all(
+                                envs=eval_env,
+                                policy=accelerator.unwrap_model(policy),
+                                env_preprocessor=env_preprocessor,
+                                env_postprocessor=env_postprocessor,
+                                preprocessor=preprocessor,
+                                postprocessor=postprocessor,
+                                episodes=mam_eval_episodes,
+                                n_episodes=cfg.eval.n_episodes,
+                            )
+                        else:
+                            eval_info = eval_policy_all(
+                                envs=eval_env,  # dict[suite][task_id] -> vec_env
+                                policy=accelerator.unwrap_model(policy),
+                                env_preprocessor=env_preprocessor,
+                                env_postprocessor=env_postprocessor,
+                                preprocessor=preprocessor,
+                                postprocessor=postprocessor,
+                                n_episodes=cfg.eval.n_episodes,
+                                videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
+                                max_episodes_rendered=4,
+                                start_seed=cfg.seed,
+                                max_parallel_tasks=cfg.env.max_parallel_tasks,
+                            )
                 finally:
                     if eval_env is not None:
                         close_envs(eval_env)
@@ -673,7 +714,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 if wandb_logger:
                     wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
-                    wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
+                    video_paths = eval_info["overall"].get("video_paths", [])
+                    if video_paths:
+                        wandb_logger.log_video(video_paths[0], step, mode="eval")
 
                 if cfg.save_checkpoint:
                     if best_eval_score is None or eval_score > best_eval_score:

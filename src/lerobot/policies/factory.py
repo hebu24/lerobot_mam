@@ -49,6 +49,7 @@ from .diffusion.configuration_diffusion import DiffusionConfig
 from .eo1.configuration_eo1 import EO1Config
 from .gaussian_actor.configuration_gaussian_actor import GaussianActorConfig
 from .groot.configuration_groot import GrootConfig
+from .mam.configuration_mam import MamConfig
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
 from .pi0.configuration_pi0 import PI0Config
 from .pi05.configuration_pi05 import PI05Config
@@ -103,6 +104,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .diffusion.modeling_diffusion import DiffusionPolicy
 
         return DiffusionPolicy
+    elif name == "mam":
+        from .mam.modeling_mam import MamPolicy
+
+        return MamPolicy
     elif name == "act":
         from .act.modeling_act import ACTPolicy
 
@@ -181,6 +186,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return TDMPCConfig(**kwargs)
     elif policy_type == "diffusion":
         return DiffusionConfig(**kwargs)
+    elif policy_type == "mam":
+        return MamConfig(**kwargs)
     elif policy_type == "act":
         return ACTConfig(**kwargs)
     elif policy_type == "multi_task_dit":
@@ -285,13 +292,19 @@ def make_pre_post_processors(
             kwargs["preprocessor_overrides"] = preprocessor_overrides
             kwargs["postprocessor_overrides"] = postprocessor_overrides
 
+        preprocessor_to_transition = batch_to_transition
+        if isinstance(policy_cfg, MamConfig):
+            from .mam.processor_mam import mam_batch_to_transition
+
+            preprocessor_to_transition = mam_batch_to_transition
+
         preprocessor = PolicyProcessorPipeline.from_pretrained(
             pretrained_model_name_or_path=pretrained_path,
             config_filename=kwargs.get(
                 "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
             ),
             overrides=kwargs.get("preprocessor_overrides", {}),
-            to_transition=batch_to_transition,
+            to_transition=preprocessor_to_transition,
             to_output=transition_to_batch,
         )
         postprocessor = PolicyProcessorPipeline.from_pretrained(
@@ -311,6 +324,14 @@ def make_pre_post_processors(
         from .tdmpc.processor_tdmpc import make_tdmpc_pre_post_processors
 
         processors = make_tdmpc_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, MamConfig):
+        from .mam.processor_mam import make_mam_pre_post_processors
+
+        processors = make_mam_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

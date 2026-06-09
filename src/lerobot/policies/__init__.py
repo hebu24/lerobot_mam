@@ -20,6 +20,7 @@ from .eo1.configuration_eo1 import EO1Config as EO1Config
 from .factory import get_policy_class, make_policy, make_policy_config, make_pre_post_processors
 from .gaussian_actor.configuration_gaussian_actor import GaussianActorConfig as GaussianActorConfig
 from .groot.configuration_groot import GrootConfig as GrootConfig
+from .mam.configuration_mam import MamConfig as MamConfig
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig as MultiTaskDiTConfig
 from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi0_fast.configuration_pi0_fast import PI0FastConfig as PI0FastConfig
@@ -43,6 +44,7 @@ __all__ = [
     "EO1Config",
     "GaussianActorConfig",
     "GrootConfig",
+    "MamConfig",
     "MultiTaskDiTConfig",
     "PI0Config",
     "PI0FastConfig",

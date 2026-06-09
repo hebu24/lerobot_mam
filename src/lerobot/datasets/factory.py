@@ -58,6 +58,8 @@ def resolve_delta_timestamps(
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
         if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
+        if key.startswith("mam.") and hasattr(cfg, "mam_delta_indices"):
+            delta_timestamps[key] = [i / ds_meta.fps for i in cfg.mam_delta_indices]
 
     if len(delta_timestamps) == 0:
         delta_timestamps = None

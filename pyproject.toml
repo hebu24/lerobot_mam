@@ -190,6 +190,7 @@ phone = ["hebi-py>=2.8.0,<2.12.0", "teleop>=0.1.0,<0.2.0", "fastapi<1.0", "lerob
 
 # Policies
 diffusion = ["lerobot[diffusers-dep]"]
+mam = ["lerobot[training]", "lerobot[diffusion]", "lerobot[libero]", "lerobot[transformers-dep]"]
 wallx = [
     "lerobot[transformers-dep]",
     "lerobot[peft-dep]",
@@ -302,6 +303,8 @@ lerobot-setup-motors="lerobot.scripts.lerobot_setup_motors:main"
 lerobot-teleoperate="lerobot.scripts.lerobot_teleoperate:main"
 lerobot-eval="lerobot.scripts.lerobot_eval:main"
 lerobot-train="lerobot.scripts.lerobot_train:main"
+lerobot-train-mam="lerobot.scripts.lerobot_train_mam:main"
+lerobot-train-stpm="lerobot.scripts.lerobot_train_stpm:main"
 lerobot-train-tokenizer="lerobot.scripts.lerobot_train_tokenizer:main"
 lerobot-dataset-viz="lerobot.scripts.lerobot_dataset_viz:main"
 lerobot-info="lerobot.scripts.lerobot_info:main"
