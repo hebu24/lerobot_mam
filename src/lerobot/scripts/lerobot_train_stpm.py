@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 from lerobot.stpm import FrameLeRobotDataset, FrozenCLIPEncoder, RewardTransformer
 from lerobot.stpm.normalizer import save_state_norm
+from lerobot.utils.constants import OBS_STATE
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,6 +46,17 @@ def _parse_episodes(raw: str | None) -> list[int] | None:
     if raw is None or raw.strip() == "":
         return None
     return [int(x) for x in raw.strip("[]").split(",") if x.strip()]
+
+
+def _load_all_states(dataset: FrameLeRobotDataset) -> torch.Tensor:
+    states = dataset.dataset.select_columns(OBS_STATE)[OBS_STATE]
+    return torch.stack(
+        [
+            state.float() if hasattr(state, "float") else torch.as_tensor(state, dtype=torch.float32)
+            for state in states
+        ],
+        dim=0,
+    )
 
 
 def _resolve_device(device_arg: str, require_cuda: bool) -> torch.device:
@@ -106,7 +118,7 @@ def main() -> None:
         frame_gap=args.frame_gap,
         task_description=args.task_description or None,
     )
-    all_states = torch.stack([dataset[i]["state"] for i in range(len(dataset))], dim=0)
+    all_states = _load_all_states(dataset)
     state_norm_path = args.output_dir / "state_norm.json"
     save_state_norm(
         state_norm_path,
