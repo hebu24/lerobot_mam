@@ -6,7 +6,7 @@ set -euo pipefail
 # supplies an Accelerate launch wrapper plus task defaults.
 
 if [[ -z "${NUM_GPUS:-}" ]]; then
-  NUM_GPUS="$(uv run python -c 'import torch; print(torch.cuda.device_count())')"
+  NUM_GPUS="$(python -c 'import torch; print(torch.cuda.device_count())')"
 fi
 
 if [[ "${NUM_GPUS}" -lt 1 ]]; then
@@ -81,4 +81,4 @@ if [[ "${ENABLE_EVAL:-false}" == "true" ]]; then
 fi
 
 echo "Launching ${NUM_GPUS} process(es); per-GPU batch=${BATCH_SIZE}; effective batch=$((NUM_GPUS * BATCH_SIZE))"
-uv run accelerate launch "${launch_args[@]}" -m lerobot.scripts.lerobot_train "${train_args[@]}" "$@"
+accelerate launch "${launch_args[@]}" -m lerobot.scripts.lerobot_train "${train_args[@]}" "$@"

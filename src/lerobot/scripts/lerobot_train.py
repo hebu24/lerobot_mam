@@ -19,6 +19,7 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 """
 
 import dataclasses
+import json
 import logging
 import time
 from contextlib import nullcontext
@@ -70,6 +71,32 @@ LIBERO_INIT_STATE_ID_KEYS = (
     "libero/init_state_id",
     "init_state_id",
 )
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return value.detach().cpu().item()
+        return value.detach().cpu().tolist()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if hasattr(value, "__fspath__"):
+        return str(value)
+    if hasattr(value, "tolist"):
+        return _json_safe(value.tolist())
+    if hasattr(value, "item"):
+        return _json_safe(value.item())
+    return str(value)
+
+
+def _append_jsonl(path: Any, record: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(_json_safe(record), ensure_ascii=False, sort_keys=True) + "\n")
 
 
 def apply_overfit_test_config(cfg: TrainPipelineConfig) -> None:
@@ -564,6 +591,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     )
 
     if is_main_process:
+        train_log_path = cfg.output_dir / "logs" / "train_metrics.jsonl"
+        eval_log_path = cfg.output_dir / "logs" / "eval_metrics.jsonl"
         progbar = tqdm(
             total=cfg.steps - step,
             desc="Training",
@@ -575,6 +604,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         logging.info(
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
+        logging.info("Training metrics will be appended to %s", train_log_path)
+        if cfg.env is not None and cfg.eval_freq > 0:
+            logging.info("Eval metrics will be appended to %s", eval_log_path)
 
     save_best_eval_checkpoint_only = cfg.env is not None and cfg.eval_freq > 0
     best_eval_score: tuple[float, float] | None = None
@@ -612,15 +644,23 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
         if is_log_step:
             logging.info(train_tracker)
+            log_dict = train_tracker.to_dict()
+            if output_dict:
+                log_dict.update(output_dict)
+            if sample_weighter is not None:
+                weighter_stats = sample_weighter.get_stats()
+                log_dict.update({f"sample_weighting/{k}": v for k, v in weighter_stats.items()})
+            _append_jsonl(
+                train_log_path,
+                {
+                    "mode": "train",
+                    "step": step,
+                    "time": time.time(),
+                    "metrics": log_dict,
+                },
+            )
             if wandb_logger:
-                wandb_log_dict = train_tracker.to_dict()
-                if output_dict:
-                    wandb_log_dict.update(output_dict)
-                # Log sample weighting statistics if enabled
-                if sample_weighter is not None:
-                    weighter_stats = sample_weighter.get_stats()
-                    wandb_log_dict.update({f"sample_weighting/{k}": v for k, v in weighter_stats.items()})
-                wandb_logger.log_dict(wandb_log_dict, step)
+                wandb_logger.log_dict(log_dict, step)
             train_tracker.reset_averages()
 
         if cfg.save_checkpoint and is_saving_step and not save_best_eval_checkpoint_only:
@@ -693,6 +733,15 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 # optional: per-suite logging
                 for suite, suite_info in eval_info.items():
                     logging.info("Suite %s aggregated: %s", suite, suite_info)
+                _append_jsonl(
+                    eval_log_path,
+                    {
+                        "mode": "eval",
+                        "step": step,
+                        "time": time.time(),
+                        "metrics": eval_info,
+                    },
+                )
 
                 # meters/tracker
                 eval_metrics = {

@@ -88,27 +88,52 @@ def _validate_libero_assets() -> None:
     # `libero.libero.get_assets_path()` attempts a Hugging Face download when
     # package-local assets are absent. Avoid that side effect here; this check
     # should only report what is available locally.
-    package_assets_path = Path(benchmark.__file__).resolve().parents[1] / "assets"
     cache_assets_path = Path.home() / ".cache" / "libero" / "assets"
-    assets_path = package_assets_path if package_assets_path.exists() else cache_assets_path
-
-    required = [
-        assets_path / "turbosquid_objects" / "wine_rack" / "wine_rack.xml",
-        assets_path / "stable_scanned_objects" / "akita_black_bowl" / "akita_black_bowl.xml",
-        assets_path / "stable_hope_objects" / "cream_cheese" / "cream_cheese.xml",
+    package_assets_path = Path(benchmark.__file__).resolve().parents[1] / "assets"
+    candidate_paths = [
+        *(Path(path) for path in os.environ.get("LIBERO_ASSETS_PATH", "").split(os.pathsep) if path),
+        _get_libero_path("assets"),
+        package_assets_path,
+        cache_assets_path,
     ]
-    missing = [path for path in required if not path.exists()]
-    if missing:
-        missing_text = "\n".join(f"  - {path}" for path in missing)
-        raise FileNotFoundError(
-            "LIBERO assets are missing or incomplete. Missing required files:\n"
-            f"{missing_text}\n"
-            "Run this once with network access to refresh the asset cache:\n"
-            "  uv run python -c \"from libero.libero.utils.download_utils import "
-            "download_assets_from_huggingface; "
-            "download_assets_from_huggingface('/home/hebu/.cache/libero/assets')\""
-        )
-    libero_module._assets_path_cache = str(assets_path)
+    required_rel_paths = [
+        Path("turbosquid_objects") / "wine_rack" / "wine_rack.xml",
+        Path("stable_scanned_objects") / "akita_black_bowl" / "akita_black_bowl.xml",
+        Path("stable_hope_objects") / "cream_cheese" / "cream_cheese.xml",
+    ]
+
+    seen: set[Path] = set()
+    missing_by_candidate: list[tuple[Path, list[Path]]] = []
+    for assets_path in candidate_paths:
+        assets_path = assets_path.expanduser()
+        if assets_path in seen:
+            continue
+        seen.add(assets_path)
+        missing = [
+            assets_path / rel_path
+            for rel_path in required_rel_paths
+            if not (assets_path / rel_path).exists()
+        ]
+        if not missing:
+            libero_module._assets_path_cache = str(assets_path)
+            return
+        if assets_path.exists():
+            missing_by_candidate.append((assets_path, missing))
+
+    assets_path, missing = (
+        missing_by_candidate[0]
+        if missing_by_candidate
+        else (cache_assets_path, [cache_assets_path / rel for rel in required_rel_paths])
+    )
+    missing_text = "\n".join(f"  - {path}" for path in missing)
+    raise FileNotFoundError(
+        "LIBERO assets are missing or incomplete. Missing required files:\n"
+        f"{missing_text}\n"
+        "Run this once with network access to refresh the asset cache:\n"
+        "  uv run python -c \"from libero.libero.utils.download_utils import "
+        "download_assets_from_huggingface; "
+        f"download_assets_from_huggingface('{cache_assets_path}')\""
+    )
 
 
 # LIBERO-plus perturbation variants encode the perturbation in the filename
