@@ -92,6 +92,41 @@ CUDA_VISIBLE_DEVICES=0 MUJOCO_GL=egl lerobot-train-mam \
   --policy.device=cuda
 ```
 
+### 3.1 Train 80M MAM with 8 GPUs
+
+Run this on a node where GPUs `0,1,2,3,4,5,6,7` are all visible.
+`BATCH_SIZE=32` is the per-GPU batch size, so the effective batch size is
+`256`.
+
+```bash
+MUJOCO_GL=egl \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+NUM_GPUS=8 \
+DATASET_REPO_ID=local/libero_put_bowl_on_plate_mam_train \
+DATASET_ROOT=/cephfs/shared/Yanbang/lerobot/mam_lerobot0.5.1/lerobot_mam/libero_put_bowl_on_plate_mam_train \
+MAM_EVAL_DATASET_REPO_ID=local/libero_put_bowl_on_plate_mam_eval \
+MAM_EVAL_DATASET_ROOT=/cephfs/shared/Yanbang/lerobot/mam_lerobot0.5.1/lerobot_mam/libero_put_bowl_on_plate_mam_eval \
+BATCH_SIZE=32 \
+NUM_WORKERS=4 \
+STEPS=100000 \
+SAVE_FREQ=5000 \
+EVAL_FREQ=5000 \
+LOG_FREQ=5000 \
+ENABLE_EVAL=true \
+EVAL_BATCH_SIZE=1 \
+ENV_TASK=libero_goal \
+ENV_TASK_IDS='[8]' \
+ENV_CONTROL_MODE=absolute \
+MIXED_PRECISION=fp16 \
+OUTPUT_DIR=outputs/train/mam_libero_put_bowl_on_plate_80m_multigpu \
+bash scripts/train_mam_libero_put_bowl_on_plate_multigpu.sh \
+  --policy.down_dims='[256,512,896]' \
+  --policy.diffusion_step_embed_dim=64 \
+  --policy.spatial_softmax_num_keypoints=16 \
+  --policy.stpm_path=outputs/train/stpm_libero_put_bowl_on_plate_mam \
+  --eval.n_episodes=5
+```
+
 Enable MAM inpainting by appending:
 
 ```bash
@@ -129,6 +164,34 @@ bash scripts/run_mam_libero_put_bowl_on_plate_conda.sh
 Useful overrides:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 NUM_GPUS=4 BATCH_SIZE=32 STEPS=50000 \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NUM_GPUS=8 BATCH_SIZE=32 STEPS=50000 \
   bash scripts/run_mam_libero_put_bowl_on_plate_conda.sh
 ```
+
+
+# agent记录
+训练时仍然输入图像。改动只跳过了训练前 state_norm 阶段的图像读取；正式训练 loop 仍然使用
+  batch["image_frames"]，通过 CLIP 编码图像，再结合 text/state 训练 STPM。
+
+  我已经重新跑完 116 steps：
+
+  outputs/train/stpm_libero_put_bowl_on_plate_mam/checkpoints/reward_best.pt
+  outputs/train/stpm_libero_put_bowl_on_plate_mam/checkpoints/reward_final.pt
+
+  最后训练 loss 约 0.0022。
+
+
+  # MAM 使用的是relative：
+
+  - 数据集动作：absolute
+  - 训练输入给模型前：会转换成 chunk-relative
+  - 环境 eval/control：absolute
+
+  关键代码在 src/lerobot/policies/mam/processor_mam.py：
+
+  new_transition[TransitionKey.ACTION] = absolute_to_chunk_relative(action, anchor_state)
+  ...
+  rel_mas = absolute_to_chunk_relative(mas_abs, anchor_state)
+
+  所以实际训练目标不是直接 absolute action，而是以当前 observation state 为 anchor 的 relative action
+  chunk。--env.control_mode=absolute 是 rollout 时给 LIBERO 环境执行 absolute 控制用的。

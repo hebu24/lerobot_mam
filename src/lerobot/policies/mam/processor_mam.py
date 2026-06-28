@@ -123,6 +123,8 @@ class MamFeaturesProcessorStep(ProcessorStep):
         rel_mas = _normalize_with_action_stats(rel_mas, self._tensor_action_stats, eps=self.eps)
         mas_mask = mas_mask.to(device=rel_mas.device, dtype=rel_mas.dtype)
         progress = progress.to(device=rel_mas.device, dtype=rel_mas.dtype)
+        if progress.ndim == rel_mas.ndim - 1:
+            progress = progress.unsqueeze(-1)
 
         long_len = self.mas_long_backward_length + self.mas_long_forward_length
         long_window = _slice_window(rel_mas, 0, long_len)

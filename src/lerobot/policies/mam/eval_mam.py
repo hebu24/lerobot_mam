@@ -64,6 +64,13 @@ def _column_names(obj: Any) -> set[str]:
     return set(getattr(obj, "column_names", []) or [])
 
 
+def _stack_float32(values: list[Any], *, keep_feature_dim: bool = False) -> torch.Tensor:
+    stacked = torch.stack([torch.as_tensor(value, dtype=torch.float32) for value in values], dim=0)
+    if keep_feature_dim and stacked.ndim == 1:
+        stacked = stacked.unsqueeze(-1)
+    return stacked
+
+
 def load_mam_eval_episodes(
     repo_id: str,
     root: str | Path | None = None,
@@ -129,11 +136,9 @@ def load_mam_eval_episodes(
                 mask_type=mask_type,
                 mask_type_slot=mask_type_slot,
                 task=task,
-                mas_action_absolute=torch.as_tensor(
-                    grouped[ep_idx][MAM_MAS_ACTION_ABSOLUTE], dtype=torch.float32
-                ),
-                mas_action_mask=torch.as_tensor(grouped[ep_idx][MAM_MAS_ACTION_MASK], dtype=torch.float32),
-                progress=torch.as_tensor(grouped[ep_idx][MAM_PROGRESS], dtype=torch.float32),
+                mas_action_absolute=_stack_float32(grouped[ep_idx][MAM_MAS_ACTION_ABSOLUTE]),
+                mas_action_mask=_stack_float32(grouped[ep_idx][MAM_MAS_ACTION_MASK]),
+                progress=_stack_float32(grouped[ep_idx][MAM_PROGRESS], keep_feature_dim=True),
             )
         )
     return out
