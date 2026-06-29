@@ -64,7 +64,7 @@ def _column_names(obj: Any) -> set[str]:
     return set(getattr(obj, "column_names", []) or [])
 
 
-def _stack_float32(values: list[Any], *, keep_feature_dim: bool = False) -> torch.Tensor:
+def _stack_float32(values: list[Any], *, keep_feature_dim: bool = False) -> Tensor:
     stacked = torch.stack([torch.as_tensor(value, dtype=torch.float32) for value in values], dim=0)
     if keep_feature_dim and stacked.ndim == 1:
         stacked = stacked.unsqueeze(-1)

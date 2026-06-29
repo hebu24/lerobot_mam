@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n_heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--prefetch_factor", type=int, default=2)
+    parser.add_argument("--clip_encode_batch_size", type=int, default=64)
     return parser.parse_args()
 
 
@@ -98,6 +99,17 @@ def _load_reward_checkpoint(
         f"[Init] Partially loaded STPM reward checkpoint: {ckpt_path} "
         f"({len(matched)} tensors loaded, {len(skipped)} skipped)"
     )
+
+
+def _encode_images_in_chunks(
+    clip_encoder: FrozenCLIPEncoder,
+    images: torch.Tensor,
+    *,
+    chunk_size: int,
+) -> torch.Tensor:
+    if chunk_size <= 0 or images.shape[0] <= chunk_size:
+        return clip_encoder.encode_image(images)
+    return torch.cat([clip_encoder.encode_image(chunk) for chunk in images.split(chunk_size)], dim=0)
 
 
 def main() -> None:
@@ -200,6 +212,7 @@ def main() -> None:
         "dropout": args.dropout,
         "vision_ckpt": args.vision_ckpt,
         "reward_ckpt": str(args.reward_ckpt) if args.reward_ckpt is not None else "",
+        "clip_encode_batch_size": args.clip_encode_batch_size,
     }
     with open(args.output_dir / "config.yaml", "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
@@ -219,7 +232,11 @@ def main() -> None:
         targets = batch["targets"].to(device)
         b, t, n = images.shape[:3]
         flat = images.permute(2, 0, 1, 3, 4, 5).reshape(n * b * t, 3, images.shape[-2], images.shape[-1])
-        img_emb = clip_encoder.encode_image(flat).view(n, b, t, -1).permute(1, 0, 2, 3)
+        img_emb = (
+            _encode_images_in_chunks(clip_encoder, flat, chunk_size=args.clip_encode_batch_size)
+            .view(n, b, t, -1)
+            .permute(1, 0, 2, 3)
+        )
         text_emb = clip_encoder.encode_text(list(batch["task"]))
         norm_state = (state - state_mean) / state_std
         pred = model(img_emb, text_emb, norm_state, batch["lengths"].to(device))
@@ -243,7 +260,11 @@ def main() -> None:
                         flat = images.permute(2, 0, 1, 3, 4, 5).reshape(
                             n * b * t, 3, images.shape[-2], images.shape[-1]
                         )
-                        img_emb = clip_encoder.encode_image(flat).view(n, b, t, -1).permute(1, 0, 2, 3)
+                        img_emb = (
+                            _encode_images_in_chunks(clip_encoder, flat, chunk_size=args.clip_encode_batch_size)
+                            .view(n, b, t, -1)
+                            .permute(1, 0, 2, 3)
+                        )
                         text_emb = clip_encoder.encode_text(list(val_batch["task"]))
                         norm_state = (state - state_mean) / state_std
                         losses.append(F.mse_loss(model(img_emb, text_emb, norm_state), targets).item())
