@@ -32,6 +32,7 @@ from lerobot.processor import (
     RenameObservationsProcessorStep,
     TransitionKey,
     UnnormalizerProcessorStep,
+    chunk_relative_to_absolute,
 )
 from lerobot.processor.converters import create_transition, transition_to_batch
 from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
@@ -88,6 +89,39 @@ def test_make_diffusion_processor_basic():
     assert len(postprocessor.steps) == 2
     assert isinstance(postprocessor.steps[0], UnnormalizerProcessorStep)
     assert isinstance(postprocessor.steps[1], DeviceProcessorStep)
+
+
+def test_libero_v3_preprocess_normalize_unnormalize_and_absolute_roundtrip():
+    config = create_default_config()
+    config.use_relative_actions = True
+    config.input_features[OBS_STATE] = PolicyFeature(type=FeatureType.STATE, shape=(14,))
+    config.output_features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=(7,))
+    stats = create_default_stats()
+    stats[OBS_STATE] = {"mean": torch.zeros(14), "std": torch.ones(14)}
+    stats[ACTION] = {"min": torch.full((7,), -2.0), "max": torch.full((7,), 2.0)}
+    preprocessor, postprocessor = make_diffusion_pre_post_processors(config, stats)
+
+    anchor = torch.zeros(14)
+    anchor[:3] = torch.tensor([0.4, -0.2, 0.7])
+    anchor[6] = 1.0  # xyzw identity quaternion
+    relative = torch.tensor(
+        [
+            [0.1, 0.0, 0.0, 0.0, 0.0, 0.1, 1.0],
+            [0.2, -0.1, 0.0, 0.1, 0.0, 0.0, -1.0],
+        ]
+    )
+    absolute = chunk_relative_to_absolute(relative, anchor)
+    transition = create_transition(
+        {OBS_STATE: anchor, OBS_IMAGE: torch.zeros(3, 224, 224)},
+        absolute,
+    )
+
+    normalized = preprocessor(transition_to_batch(transition))[TransitionKey.ACTION.value]
+    recovered_relative = postprocessor(normalized)
+    recovered_absolute = chunk_relative_to_absolute(recovered_relative, anchor)
+
+    torch.testing.assert_close(recovered_relative.squeeze(0), relative, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(recovered_absolute.squeeze(0), absolute, atol=1e-6, rtol=1e-6)
 
 
 def test_diffusion_processor_with_images():

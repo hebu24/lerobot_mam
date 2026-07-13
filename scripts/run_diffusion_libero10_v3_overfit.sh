@@ -15,6 +15,10 @@ if [[ -z "${K:-}" && ${#} -gt 0 && "${1}" != --* ]]; then
 else
   K="${K:-3}"
 fi
+if (( ${#} > 0 )); then
+  echo "Only one optional positional argument (K) is supported; configure other knobs with environment variables." >&2
+  exit 2
+fi
 DEMO_RANK="${DEMO_RANK:-0}"
 TASK_IDS_CSV="${TASK_IDS:-}"
 DATASET_ROOT="${DATASET_ROOT:-outputs/datasets/libero10_mam_v3_sample_train}"
@@ -35,6 +39,18 @@ DRY_RUN="${DRY_RUN:-false}"
 
 if ! [[ "${K}" =~ ^[0-9]+$ ]] || (( K < 1 || K > 10 )); then
   echo "K must be an integer in [1, 10], got ${K}." >&2
+  exit 2
+fi
+if ! [[ "${STEPS}" =~ ^[0-9]+$ ]] || (( STEPS <= 0 )); then
+  echo "STEPS must be a positive integer, got ${STEPS}." >&2
+  exit 2
+fi
+if ! [[ "${EVAL_FREQ}" =~ ^[0-9]+$ ]] || (( EVAL_FREQ <= 0 )); then
+  echo "EVAL_FREQ must be a positive integer, got ${EVAL_FREQ}." >&2
+  exit 2
+fi
+if (( STEPS < EVAL_FREQ || STEPS % EVAL_FREQ != 0 )); then
+  echo "STEPS must be an EVAL_FREQ multiple so the final training step is evaluated." >&2
   exit 2
 fi
 if [[ -e "${OUTPUT_DIR}" ]]; then
@@ -137,4 +153,4 @@ fi
 
 nvidia-smi >/dev/null
 uv run python -c 'import sys, torch; print(f"CUDA={torch.cuda.is_available()} GPUs={torch.cuda.device_count()}"); sys.exit(0 if torch.cuda.is_available() and torch.cuda.device_count() > 0 else 1)'
-exec "${train_cmd[@]}" "$@"
+exec "${train_cmd[@]}"

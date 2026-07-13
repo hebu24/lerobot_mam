@@ -427,10 +427,15 @@ def _write_split(
 
 def main() -> None:
     args = parse_args()
-    require_libero_v3_action_dataset(
+    input_manifest = require_libero_v3_action_dataset(
         args.input_root,
         action_representation=LIBERO_ABSOLUTE_ACTION,
     )
+    if input_manifest.get("stage") != "delta_to_absolute":
+        raise ValueError(
+            "MAM conversion input must be the immutable delta_to_absolute v3 dataset, "
+            f"got stage={input_manifest.get('stage')!r}."
+        )
     mask_types = _resolve_mask_types(args)
     input_repo_id = args.input_repo_id or _repo_id_from_root(args.input_root)
     source = LeRobotDataset(input_repo_id, root=args.input_root, return_uint8=True)

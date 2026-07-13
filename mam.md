@@ -2,38 +2,13 @@
 
 本文件只保留当前有效的 LIBERO-10 v3 DP/MAM 流程。旧的单任务和中间调试命令已删除，避免误用。
 
-## 2026-07-12 LIBERO-10 DP/MAM 全流程 debug 最终结论
+## LIBERO-10 v3 DP/MAM 当前流程
 
 > 本节是当前唯一保留的 LIBERO-10 正式训练命令来源。
 
-### 1. 当前产物红线
+### 1. 唯一 v3 pipeline 不变量
 
-以下现有产物不可用于正式 MAM 训练：
-
-- `outputs/datasets/libero10_mam_train` 和 `outputs/datasets/libero10_mam_eval` 是旧格式。旧转换器先逐元素 mask absolute axis-angle，再做 SE(3) relative 变换；该操作在旋转空间不成立，而且被遮掉的 MAS 数值无法恢复。
-- 旧 MAM 数据实测 `max(abs(mam.mas_action_absolute - action)) = 3.14017`；当前 train/eval 为 431/48 个 episode，task 4 和 9 的 eval 只有 4 个，不满足每 task 45/5。
-- 旧数据的 `action` stats 是 absolute stats，不是模型实际使用的 chunk-relative stats。
-- 现有 task 2/8 STPM checkpoint 是旧 v1 架构。v2 修复了 token 顺序、时间位置、causal/padding mask 和 episode 泄漏，因此会明确拒绝加载 v1，必须重训。
-- 当前没有可用于正式 LIBERO-10 的 MAM policy checkpoint。下面必须从原始 HDF5 重建数据，再训练 STPM 和 MAM。
-
-### 2. 两条 pipeline 的最终不变量
-
-#### 2.1 DP 原始 delta 过拟合路径
-
-```text
-官方 delta action
-  -> DP normalize
-  -> diffusion noise/loss
-  -> denoise action chunk
-  -> unnormalize
-  -> LIBERO relative controller
-```
-
-- 该路径必须使用 `policy.use_relative_actions=false` 和 `env.control_mode=relative`。
-- 这里的 `relative` 是 LIBERO 单步 delta controller，不是 chunk-relative SE(3) action。
-- 已有单 demo DP checkpoint 属于该路径，不能做 relative-to-absolute SE(3) 后处理。
-
-#### 2.2 DP 正式 chunk-relative 路径
+#### 1.1 DP v3 chunk-relative 路径
 
 ```text
 官方 delta action
@@ -47,7 +22,7 @@
   -> 用当前真实 state: p_abs = p_rel + p_anchor,
      R_abs = R_rel @ R_anchor
   -> 整段 absolute action 入队
-  -> LIBERO absolute controller
+  -> LIBERO absolute controller (`env.control_mode=absolute`)
 ```
 
 - 14D state 的 quaternion 描述 Panda `right_hand` body，而 OSC 控制 `grip_site`。anchor rotation 已统一右乘 `Rz(-pi/2)` 转到 controller frame。
@@ -55,7 +30,7 @@
 - rollout 只在 action queue 为空时预测并转换整段 chunk，不能逐步重新 anchor。
 - 固定评估从独立 eval dataset metadata 读取每个 task 的原始 `libero/init_state`。DP 的 `eval.n_episodes=5` 表示每 task 5 个。
 
-#### 2.3 MAM 路径
+#### 1.2 MAM v3 路径
 
 ```text
 absolute action + 完整 absolute MAS + 独立 binary mask + progress
@@ -78,6 +53,16 @@ absolute action + 完整 absolute MAS + 独立 binary mask + progress
 - STPM 使用独立 camera/language/state token、time-major 排列、时间/模态位置编码、按时间 causal mask 和 padding mask。
 - STPM train/val 按 `(task, libero/source_episode_id)` 分组，state normalization 只统计 train split，避免帧级泄漏和多 mask 轨迹泄漏。
 - MAM 评估的 `eval.n_episodes=50` 表示所有 task 的总数，即每 task 5 个；这与通用 DP eval 的参数语义不同。
+
+### 2. v3 K-task 过拟合
+
+`K` 可取 `1..10`，默认选择前 K 个 task，每个 task 选 1 条 trajectory。训练和评估使用完全相同的 episode ID 及 init state。
+
+```bash
+bash scripts/run_diffusion_libero10_v3_overfit.sh 3
+```
+
+也可用 `K=5 bash scripts/run_diffusion_libero10_v3_overfit.sh`。该入口固定 `policy.use_relative_actions=true` 和 `env.control_mode=absolute`，且启动前校验 v3 manifest、数据 schema、source identity 以及 CUDA。
 
 ### 3. 正式数据重建命令
 
@@ -110,7 +95,7 @@ uv run python scripts/convert_libero10_hdf5_to_lerobot.py \
 
 #### 3.3 delta 转 absolute controller goal
 
-正式数据必须使用 replay 和每条 demo 自带的 XML。`--no-replay` 仅允许做 codec 调试，不允许生成正式训练集。
+正式数据必须通过 `--source-hdf5-dir` 读取每条 demo 自带的 XML/状态，生成精确的 absolute controller goal。
 
 ```bash
 uv run python scripts/convert_libero_delta_to_absolute.py \
@@ -123,7 +108,6 @@ uv run python scripts/convert_libero_delta_to_absolute.py \
   --observation-width=128 \
   --source-hdf5-dir=outputs/source/libero_official/libero_10 \
   --source-action-strategy=controller-goal \
-  --replay \
   --overwrite
 ```
 
@@ -156,6 +140,8 @@ uv run python scripts/audit_libero10_mam_dataset.py \
   --train-repo-id=local/libero10_mam_v3_train \
   --eval-root=outputs/datasets/libero10_mam_v3_eval \
   --eval-repo-id=local/libero10_mam_v3_eval \
+  --source-root=outputs/datasets/libero10_absolute_v3 \
+  --source-repo-id=local/libero10_absolute_v3 \
   --train-per-task=45 \
   --eval-per-task=5 \
   --n-obs-steps=2 \
@@ -166,7 +152,7 @@ uv run python scripts/audit_libero10_mam_dataset.py \
 
 ### 4. 训练 v2 STPM
 
-每个 task 使用各自的 train episode；不要复用旧 task2/task8 checkpoint。
+每个 task 使用各自的 train episode，checkpoint 必须由当前 v3 split 训练生成。
 
 ```bash
 for TASK_ID in 0 1 2 3 4 5 6 7 8 9; do
@@ -243,16 +229,6 @@ bash scripts/run_mam_libero10_conda.sh
 
 这里 `EVAL_N_EPISODES=50` 是所有 task 的总数。评估使用同一个选中 episode 前缀同时配置 init state、MAS 和 task 分组，避免三者错位；STPM 只在 action queue 为空时运行一次。
 
-### 7. 已完成验证
+### 7. 尚未执行的长任务
 
-- rotation codec：病理 `pi` 旋转、10,000 个随机 SO(3)、14D state controller-frame roundtrip 均通过。
-- 真实 MAM train 118,283 帧全量 codec 扫描：position 最大误差 `3.73e-9`，rotation matrix 最大误差 `7.15e-7`，gripper 误差 `0`。
-- MAM 真实数据 CUDA smoke：单 batch preprocess、forward、backward、inference、relative-to-absolute 全通过；loss `1.118688`，action shape `(1,15,7)`，显存峰值 `551.2 MB`。
-- STPM v2：真实 episode 的 1-step train/val、checkpoint reload 和 inference 通过。
-- absolute expert replay：旧 eval episode 0 在 EGL absolute controller 下 `1/1 success`。
-- DP 单 demo checkpoint：CUDA 静态 denoise loss `0.00500688`，native action MAE `0.0266374`；已有 step 2000 闭环日志为 `100%`。
-- 定向单元/集成回归为 `75 passed, 4 skipped`；ruff、shell 语法和 `git diff --check` 全部通过。skip 为当前 CPU 测试设备下的既定 CUDA 分支，GPU 另由真实 CUDA smoke 覆盖。
-
-### 8. 尚未执行的长任务
-
-正式 500 episode 数据重建、10 个 STPM 的完整 10k-step 训练，以及 LIBERO-10 DP/MAM 的完整长训练尚未执行。原因不是代码路径仍有已知错误，而是现有 MAM/STPM 产物已被审计判定无效，必须先按本节重建；在新数据通过硬审计前，不应启动长训练。
+正式 500 episode 数据重建、10 个 STPM 的完整 10k-step 训练，以及 LIBERO-10 DP/MAM 的完整长训练尚未执行。必须先按本节重建正式数据；在新数据通过硬审计前，不应启动长训练。

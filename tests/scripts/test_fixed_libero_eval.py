@@ -27,7 +27,7 @@ def _cfg(n_episodes: int = 2):
             num_steps_wait=10,
         ),
         eval=SimpleNamespace(
-            dataset_repo_id="local/libero10_mam_eval",
+            dataset_repo_id="local/libero10_mam_v3_eval",
             dataset_root="/tmp/eval",
             dataset_episodes=None,
             n_episodes=n_episodes,

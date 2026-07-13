@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import shutil
@@ -31,6 +32,30 @@ from lerobot.processor.libero_relative_action_processor import (
     matrix_to_axis_angle,
 )
 from lerobot.utils.constants import ACTION
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for block in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _inventory_sha256(root: Path, paths: list[Path]) -> str:
+    """Fingerprint a file set cheaply enough to run before every resume."""
+    inventory = []
+    for path in sorted(paths):
+        stat = path.stat()
+        inventory.append(
+            {
+                "path": path.relative_to(root).as_posix(),
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            }
+        )
+    payload = json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _episode_rows(meta: LeRobotDatasetMetadata) -> pd.DataFrame:
@@ -259,7 +284,7 @@ def _convert_file_with_replay(
 
 
 def convert_dataset(args: argparse.Namespace) -> None:
-    require_libero_v3_action_dataset(
+    input_manifest = require_libero_v3_action_dataset(
         args.input_root,
         action_representation=LIBERO_DELTA_ACTION,
     )
@@ -275,6 +300,16 @@ def convert_dataset(args: argparse.Namespace) -> None:
     if args.resume and args.overwrite:
         raise ValueError("Pass either --resume or --overwrite, not both.")
 
+    input_data_files = sorted((args.input_root / "data").glob("chunk-*/*.parquet"))
+    input_episode_files = sorted((args.input_root / "meta" / "episodes").glob("**/*.parquet"))
+    source_hdf5_files = sorted(
+        [*args.source_hdf5_dir.glob("*.hdf5"), *args.source_hdf5_dir.glob("*.h5")]
+    )
+    if not input_data_files or not input_episode_files or not source_hdf5_files:
+        raise FileNotFoundError(
+            "v3 conversion requires input data parquet, episode metadata parquet, and source HDF5 files."
+        )
+
     conversion_config = {
         "input_root": str(args.input_root.resolve()),
         "input_repo_id": args.input_repo_id,
@@ -283,10 +318,26 @@ def convert_dataset(args: argparse.Namespace) -> None:
         "source_action_strategy": args.source_action_strategy,
         "pose_offset": args.pose_offset,
         "pose_gripper_offset": args.pose_gripper_offset,
+        "input_manifest_sha256": _file_sha256(
+            args.input_root / "meta" / "libero_pipeline.json"
+        ),
+        "input_data_inventory_sha256": _inventory_sha256(args.input_root, input_data_files),
+        "input_episode_metadata_inventory_sha256": _inventory_sha256(
+            args.input_root, input_episode_files
+        ),
+        "source_hdf5_inventory_sha256": _inventory_sha256(
+            args.source_hdf5_dir, source_hdf5_files
+        ),
+        "input_episode_count": input_manifest.get("episode_count"),
         "episode_strategy_overrides": (
             None
             if args.episode_strategy_overrides is None
             else str(args.episode_strategy_overrides.resolve())
+        ),
+        "episode_strategy_overrides_sha256": (
+            None
+            if args.episode_strategy_overrides is None
+            else _file_sha256(args.episode_strategy_overrides)
         ),
     }
 

@@ -68,13 +68,25 @@ DEFAULT_ACTION_KEYS = ("actions", "action")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-dir", type=Path, default=Path("data/libero_10"))
-    parser.add_argument("--output-root", type=Path, default=Path("outputs/datasets/libero10"))
-    parser.add_argument("--output-repo-id", default="local/libero10")
+    parser.add_argument(
+        "--output-root", type=Path, default=Path("outputs/datasets/libero10_full_v3")
+    )
+    parser.add_argument("--output-repo-id", default="local/libero10_full_v3")
     parser.add_argument("--suite", default="libero_10")
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--height", type=int, default=128)
     parser.add_argument("--width", type=int, default=128)
     parser.add_argument("--max-episodes-per-task", type=int, default=None)
+    parser.add_argument(
+        "--demo-index-map-json",
+        type=Path,
+        default=None,
+        help=(
+            "Optional mapping from task id/filename to explicit demo indices for audited subsets. "
+            "An explicit list replaces prefix selection for that task and may not exceed "
+            "--max-episodes-per-task."
+        ),
+    )
     parser.add_argument("--task-id-map-json", type=Path, default=None)
     parser.add_argument("--agentview-key", default=None)
     parser.add_argument("--wrist-key", default=None)
@@ -126,6 +138,58 @@ def _load_task_id_map(path: Path | None) -> dict[str, int]:
         return {}
     data = json.loads(path.read_text(encoding="utf-8"))
     return {str(key): int(value) for key, value in data.items()}
+
+
+def _load_demo_index_map(path: Path | None) -> dict[str, list[int]]:
+    if path is None:
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    mapping = {str(key): [int(index) for index in value] for key, value in data.items()}
+    for key, indices in mapping.items():
+        if not indices or len(indices) != len(set(indices)) or any(index < 0 for index in indices):
+            raise ValueError(f"Invalid demo indices for {key!r}: {indices}.")
+    return mapping
+
+
+def _assign_demo_index_map(
+    files: list[Path],
+    file_tasks: dict[Path, dict[str, Any]],
+    demo_index_map: dict[str, list[int]],
+    max_episodes_per_task: int | None,
+) -> dict[Path, list[int]]:
+    assigned: dict[Path, list[int]] = {}
+    consumed: set[str] = set()
+    for hdf5_path in files:
+        task = file_tasks[hdf5_path]
+        matching_keys = [
+            key
+            for key in (str(task["task_id"]), hdf5_path.name, hdf5_path.stem)
+            if key in demo_index_map
+        ]
+        if len(matching_keys) > 1:
+            raise ValueError(
+                f"Demo index map has ambiguous aliases for {hdf5_path.name}: "
+                f"{matching_keys}. Use exactly one key per task."
+            )
+        if not matching_keys:
+            continue
+        key = matching_keys[0]
+        indices = demo_index_map[key]
+        if max_episodes_per_task is not None and len(indices) > max_episodes_per_task:
+            raise ValueError(
+                f"Demo index map selects {len(indices)} demos for {hdf5_path.name}, "
+                f"exceeding --max-episodes-per-task={max_episodes_per_task}."
+            )
+        assigned[hdf5_path] = indices
+        consumed.add(key)
+
+    unused_keys = sorted(set(demo_index_map) - consumed)
+    if unused_keys:
+        raise ValueError(
+            "Demo index map contains keys that did not match any resolved task/file: "
+            f"{unused_keys}."
+        )
+    return assigned
 
 
 def _resolve_file_tasks(
@@ -314,6 +378,13 @@ def convert(args: argparse.Namespace) -> None:
 
     files = _hdf5_files(args.input_dir)
     file_tasks = _resolve_file_tasks(files, args.suite, _load_task_id_map(args.task_id_map_json))
+    demo_index_map = _load_demo_index_map(args.demo_index_map_json)
+    demo_indices_by_file = _assign_demo_index_map(
+        files,
+        file_tasks,
+        demo_index_map,
+        args.max_episodes_per_task,
+    )
     features = {
         ACTION: {"dtype": "float32", "shape": (7,), "names": None},
         OBS_STATE: {"dtype": "float32", "shape": (14,), "names": None},
@@ -343,7 +414,14 @@ def convert(args: argparse.Namespace) -> None:
         task = file_tasks[hdf5_path]
         with h5py.File(hdf5_path, "r") as h5:
             demos = _demo_groups(h5)
-            if args.max_episodes_per_task is not None:
+            explicit_indices = demo_indices_by_file.get(hdf5_path)
+            if explicit_indices is not None:
+                if max(explicit_indices) >= len(demos):
+                    raise ValueError(
+                        f"Demo index map for {hdf5_path.name} exceeds available range 0..{len(demos) - 1}."
+                    )
+                demos = [demos[index] for index in explicit_indices]
+            elif args.max_episodes_per_task is not None:
                 demos = demos[: args.max_episodes_per_task]
             for demo_name, group in tqdm(demos, desc=hdf5_path.stem, leave=False):
                 actions = np.asarray(
@@ -408,6 +486,7 @@ def convert(args: argparse.Namespace) -> None:
             "source_file_count": len(files),
             "episode_count": local_episode_index,
             "max_episodes_per_task": args.max_episodes_per_task,
+            "demo_index_map": demo_index_map,
         },
     )
     logging.info("Wrote %d episodes to %s", local_episode_index, args.output_root)

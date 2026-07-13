@@ -1,9 +1,20 @@
+import subprocess
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from lerobot.datasets.libero_pipeline import (
+    LIBERO_ABSOLUTE_ACTION,
+    LIBERO_CHUNK_RELATIVE_ACTION,
+    LIBERO_PIPELINE_VERSION,
+    LIBERO_STATE_14D,
+    write_libero_pipeline_manifest,
+)
 from lerobot.scripts.lerobot_eval import validate_libero_action_semantics
+from lerobot.scripts.lerobot_train import validate_libero_v3_training_dataset
+from scripts import convert_libero_absolute_to_mam
+from scripts.convert_libero10_hdf5_to_lerobot import _assign_demo_index_map
 from scripts.convert_libero_absolute_to_mam import _as_float_list
 from scripts.prepare_libero10_v3_overfit import select_overfit_episodes
 
@@ -65,3 +76,101 @@ def test_chunk_relative_libero_requires_absolute_controller():
 
     cfg.env.control_mode = "absolute"
     validate_libero_action_semantics(cfg)
+
+
+def _write_mam_manifest(root, split):
+    write_libero_pipeline_manifest(
+        root,
+        {
+            "pipeline_version": LIBERO_PIPELINE_VERSION,
+            "stage": "absolute_to_mam",
+            "conversion_complete": True,
+            "dataset_split": split,
+            "action_representation": LIBERO_ABSOLUTE_ACTION,
+            "policy_action_representation": LIBERO_CHUNK_RELATIVE_ACTION,
+            "state_representation": LIBERO_STATE_14D,
+        },
+    )
+
+
+def _training_cfg(train_root, eval_root, *, overfit):
+    episodes = [3, 8]
+    return SimpleNamespace(
+        trainable_config=SimpleNamespace(type="diffusion", use_relative_actions=True),
+        dataset=SimpleNamespace(repo_id="local/train", root=str(train_root), episodes=episodes),
+        eval=SimpleNamespace(
+            dataset_repo_id="local/train" if overfit else "local/eval",
+            dataset_root=str(train_root if overfit else eval_root),
+            dataset_episodes=episodes if overfit else None,
+        ),
+        env=SimpleNamespace(type="libero"),
+        eval_freq=100,
+        overfit_test=overfit,
+    )
+
+
+def test_training_preflight_certifies_normal_and_exact_overfit_splits(tmp_path):
+    train_root = tmp_path / "train"
+    eval_root = tmp_path / "eval"
+    _write_mam_manifest(train_root, "train")
+    _write_mam_manifest(eval_root, "eval")
+    dataset = SimpleNamespace(root=train_root, meta=SimpleNamespace(robot_type="libero"))
+
+    validate_libero_v3_training_dataset(
+        _training_cfg(train_root, eval_root, overfit=False), dataset
+    )
+    validate_libero_v3_training_dataset(
+        _training_cfg(train_root, eval_root, overfit=True), dataset
+    )
+
+
+def test_training_preflight_rejects_overfit_eval_trajectory_mismatch(tmp_path):
+    train_root = tmp_path / "train"
+    eval_root = tmp_path / "eval"
+    _write_mam_manifest(train_root, "train")
+    cfg = _training_cfg(train_root, eval_root, overfit=True)
+    cfg.eval.dataset_episodes = [3]
+    dataset = SimpleNamespace(root=train_root, meta=SimpleNamespace(robot_type="libero"))
+
+    with pytest.raises(ValueError, match="exactly identical"):
+        validate_libero_v3_training_dataset(cfg, dataset)
+
+
+def test_mam_conversion_rejects_an_already_materialized_split(tmp_path, monkeypatch):
+    source_root = tmp_path / "mam_train"
+    _write_mam_manifest(source_root, "train")
+    monkeypatch.setattr(
+        convert_libero_absolute_to_mam,
+        "parse_args",
+        lambda: SimpleNamespace(input_root=source_root),
+    )
+
+    with pytest.raises(ValueError, match="delta_to_absolute"):
+        convert_libero_absolute_to_mam.main()
+
+
+def test_launcher_rejects_uncontrolled_extra_cli_arguments():
+    result = subprocess.run(
+        ["bash", "scripts/run_diffusion_libero10_v3_overfit.sh", "3", "--resume=true"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "Only one optional positional argument" in result.stderr
+
+
+def test_demo_index_map_rejects_unused_ambiguous_and_oversized_keys(tmp_path):
+    source = tmp_path / "task.hdf5"
+    tasks = {source: {"task_id": 8}}
+
+    assert _assign_demo_index_map([source], tasks, {"8": [0, 2]}, 2) == {
+        source: [0, 2]
+    }
+    with pytest.raises(ValueError, match="did not match"):
+        _assign_demo_index_map([source], tasks, {"typo": [0]}, 2)
+    with pytest.raises(ValueError, match="ambiguous aliases"):
+        _assign_demo_index_map([source], tasks, {"8": [0], "task.hdf5": [0]}, 2)
+    with pytest.raises(ValueError, match="exceeding"):
+        _assign_demo_index_map([source], tasks, {"8": [0, 1, 2]}, 2)

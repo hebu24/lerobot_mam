@@ -447,6 +447,84 @@ def apply_diffusion_relative_action_stats(cfg: TrainPipelineConfig, dataset: Any
     logging.info("Using LIBERO chunk-relative action stats for %s normalization.", policy_type)
 
 
+def validate_libero_v3_training_dataset(cfg: TrainPipelineConfig, dataset: Any) -> None:
+    """Certify the dataset boundary for LIBERO chunk-relative Diffusion training."""
+    active_cfg = cfg.trainable_config
+    if getattr(active_cfg, "type", None) != "diffusion" or not getattr(
+        active_cfg, "use_relative_actions", False
+    ):
+        return
+    if getattr(dataset.meta, "robot_type", None) != "libero":
+        return
+
+    from lerobot.datasets.libero_pipeline import (
+        LIBERO_ABSOLUTE_ACTION,
+        LIBERO_CHUNK_RELATIVE_ACTION,
+        require_libero_v3_action_dataset,
+    )
+
+    train_root_value = getattr(dataset, "root", None) or cfg.dataset.root
+    if train_root_value is None:
+        raise ValueError("LIBERO v3 relative-action training requires an explicit dataset.root.")
+    train_root = Path(train_root_value)
+    train_manifest = require_libero_v3_action_dataset(
+        train_root,
+        action_representation=LIBERO_ABSOLUTE_ACTION,
+    )
+    if (
+        train_manifest.get("stage") != "absolute_to_mam"
+        or train_manifest.get("dataset_split") != "train"
+        or train_manifest.get("policy_action_representation") != LIBERO_CHUNK_RELATIVE_ACTION
+    ):
+        raise ValueError(
+            "LIBERO v3 relative-action training requires an absolute_to_mam/train dataset "
+            "with chunk-relative SE(3) policy actions."
+        )
+
+    eval_repo_id = getattr(cfg.eval, "dataset_repo_id", None)
+    eval_root_value = getattr(cfg.eval, "dataset_root", None)
+    eval_episodes = getattr(cfg.eval, "dataset_episodes", None)
+    if cfg.overfit_test:
+        same_root = eval_root_value is not None and Path(eval_root_value).resolve() == train_root.resolve()
+        if (
+            eval_repo_id != cfg.dataset.repo_id
+            or not same_root
+            or list(eval_episodes or []) != list(cfg.dataset.episodes or [])
+        ):
+            raise ValueError(
+                "LIBERO v3 overfit requires eval repo/root/episodes to be exactly identical "
+                "to the selected training trajectories."
+            )
+        return
+
+    if (
+        cfg.env is not None
+        and cfg.eval_freq > 0
+        and getattr(cfg.env, "type", None) == "libero"
+        and (eval_repo_id is None or eval_root_value is None)
+    ):
+        raise ValueError(
+            "Normal LIBERO v3 online evaluation requires an explicit eval dataset repo/root."
+        )
+    if eval_repo_id is None:
+        return
+    if eval_root_value is None:
+        raise ValueError("LIBERO v3 fixed evaluation requires an explicit eval.dataset_root.")
+    eval_manifest = require_libero_v3_action_dataset(
+        eval_root_value,
+        action_representation=LIBERO_ABSOLUTE_ACTION,
+    )
+    if (
+        eval_manifest.get("stage") != "absolute_to_mam"
+        or eval_manifest.get("dataset_split") != "eval"
+        or eval_manifest.get("policy_action_representation") != LIBERO_CHUNK_RELATIVE_ACTION
+    ):
+        raise ValueError(
+            "Normal LIBERO v3 evaluation requires an absolute_to_mam/eval dataset "
+            "with chunk-relative SE(3) policy actions."
+        )
+
+
 def apply_overfit_subset_stats(cfg: TrainPipelineConfig, dataset: Any) -> None:
     """Recompute numeric policy-feature stats on the episodes used by an overfit run.
 
@@ -751,6 +829,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if not is_main_process:
         dataset = make_dataset(cfg)
 
+    validate_libero_v3_training_dataset(cfg, dataset)
     apply_overfit_subset_stats(cfg, dataset)
     apply_diffusion_relative_action_stats(cfg, dataset)
 

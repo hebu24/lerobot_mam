@@ -16,12 +16,13 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 from torch import Tensor, nn
 
 import lerobot.scripts.lerobot_eval as eval_module
 from lerobot.policies import PreTrainedPolicy
-from lerobot.utils.constants import ACTION
+from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.random_utils import set_seed
 
 
@@ -47,6 +48,69 @@ class _StubPolicy(PreTrainedPolicy):
 
     def select_action(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
         raise NotImplementedError
+
+
+class _RelativeChunkPolicy(_StubPolicy):
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(use_relative_actions=True)
+        self.prediction_calls = 0
+
+    def reset(self) -> None:
+        self.prediction_calls = 0
+
+    def update_observation_queue(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        return batch
+
+    def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
+        self.prediction_calls += 1
+        return torch.tensor(
+            [
+                [
+                    [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                    [0.2, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+
+
+class _TwoStepEnv:
+    num_envs = 1
+
+    def __init__(self) -> None:
+        self.steps = 0
+        self.actions: list[np.ndarray] = []
+
+    @staticmethod
+    def _observation(position: tuple[float, float, float]) -> dict[str, np.ndarray]:
+        state = np.zeros((1, 14), dtype=np.float32)
+        state[0, :3] = position
+        state[0, 6] = 1.0
+        return {"agent_pos": state}
+
+    def reset(self, seed=None):
+        self.steps = 0
+        return self._observation((0.4, -0.2, 0.7)), {}
+
+    def call(self, name):
+        if name == "_max_episode_steps":
+            return [2]
+        if name in {"task_description", "task"}:
+            return ["test task"]
+        raise AttributeError(name)
+
+    def step(self, action):
+        self.actions.append(np.asarray(action).copy())
+        self.steps += 1
+        terminated = np.asarray([self.steps >= 2])
+        return (
+            self._observation((9.0, 9.0, 9.0)),
+            np.asarray([0.0], dtype=np.float32),
+            terminated,
+            np.asarray([False]),
+            {"is_success": np.asarray([False])},
+        )
 
 
 def test_eval_policy_seeds_policy_rng_and_restores_caller_state(monkeypatch):
@@ -111,3 +175,28 @@ def test_eval_policy_metrics_exclude_steps_after_first_done(monkeypatch):
 
     assert result["per_episode"][0]["sum_reward"] == 0.0
     assert result["per_episode"][0]["success"] is False
+
+
+def test_relative_rollout_converts_one_chunk_to_absolute_once(monkeypatch):
+    monkeypatch.setattr(eval_module, "check_env_attributes_and_types", lambda env: None)
+    env = _TwoStepEnv()
+    policy = _RelativeChunkPolicy()
+
+    def identity(value):
+        return value
+
+    result = eval_module.rollout(
+        env=env,
+        policy=policy,
+        env_preprocessor=identity,
+        env_postprocessor=identity,
+        preprocessor=identity,
+        postprocessor=identity,
+    )
+
+    executed = result[ACTION][0]
+    assert policy.prediction_calls == 1
+    torch.testing.assert_close(executed[:, :3], torch.tensor([[0.5, -0.2, 0.7], [0.6, -0.2, 0.7]]))
+    torch.testing.assert_close(executed[:, 6], torch.tensor([1.0, -1.0]))
+    assert not torch.allclose(executed[0, 3:6], torch.zeros(3))
+    assert OBS_STATE not in result
