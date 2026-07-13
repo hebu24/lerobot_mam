@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import defaultdict, deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ from lerobot.scripts.lerobot_eval import _compile_episode_data
 from lerobot.stpm import STPMEncoder
 from lerobot.types import PolicyAction
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE, OBS_STR
+from lerobot.utils.random_utils import seeded_context
 from lerobot.utils.utils import inside_slurm
 
 from .configuration_mam import MamConfig
@@ -33,20 +35,26 @@ from .processor_mam import (
     MAM_SHORT_WINDOW_MASK,
 )
 
-
 LIBERO_INIT_STATE_ID_KEYS = ("libero/init_state_id", "init_state_id")
+LIBERO_INIT_STATE_VALUE_KEYS = ("libero/init_state", "init_state")
+LIBERO_TASK_ID_KEYS = ("libero/task_id", "task_id")
+LIBERO_SUITE_KEYS = ("libero/suite", "suite")
 
 
 @dataclass
 class MamEvalEpisode:
     episode_index: int
     init_state_id: int
+    init_state: list[float] | None
+    suite: str
+    task_id: int | None
     mask_type: str
     mask_type_slot: int
     task: str
     mas_action_absolute: Tensor
     mas_action_mask: Tensor
     progress: Tensor
+    source_episode_id: int | None = None
 
 
 def _row_get(row: Any, key: str, default: Any = None) -> Any:
@@ -62,6 +70,18 @@ def _episode_rows(meta: LeRobotDatasetMetadata) -> dict[int, Any]:
 
 def _column_names(obj: Any) -> set[str]:
     return set(getattr(obj, "column_names", []) or [])
+
+
+def _as_float_list(value: Any) -> list[float] | None:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().tolist()
+    elif hasattr(value, "tolist"):
+        value = value.tolist()
+    if not isinstance(value, (list, tuple)) or len(value) == 0:
+        return None
+    return [float(item) for item in value]
 
 
 def _stack_float32(values: list[Any], *, keep_feature_dim: bool = False) -> Tensor:
@@ -117,10 +137,21 @@ def load_mam_eval_episodes(
     rows = _episode_rows(meta)
     episode_columns = _column_names(meta.episodes)
     init_key = next((key for key in LIBERO_INIT_STATE_ID_KEYS if key in episode_columns), None)
+    init_value_key = next((key for key in LIBERO_INIT_STATE_VALUE_KEYS if key in episode_columns), None)
+    task_id_key = next((key for key in LIBERO_TASK_ID_KEYS if key in episode_columns), None)
+    suite_key = next((key for key in LIBERO_SUITE_KEYS if key in episode_columns), None)
     out: list[MamEvalEpisode] = []
     for ep_idx in sorted(grouped):
         row = rows.get(ep_idx, {})
         init_state_id = int(_row_get(row, init_key, ep_idx)) if init_key is not None else ep_idx
+        init_state = _as_float_list(_row_get(row, init_value_key)) if init_value_key is not None else None
+        raw_suite = _row_get(row, suite_key, "")
+        suite = "" if raw_suite is None else str(raw_suite)
+        raw_task_id = _row_get(row, task_id_key, None)
+        try:
+            task_id = int(raw_task_id) if raw_task_id is not None else None
+        except (TypeError, ValueError):
+            task_id = None
         mask_type = str(_row_get(row, "mask_type", "unknown"))
         raw_mask_slot = _row_get(row, "mask_type_slot", -1)
         try:
@@ -129,16 +160,29 @@ def load_mam_eval_episodes(
             mask_type_slot = -1
         task_values = grouped[ep_idx]["task"]
         task = str(task_values[0]) if task_values else ""
+        source_episode_id = _row_get(
+            row,
+            "libero/source_episode_id",
+            _row_get(row, "source_episode_id", ep_idx),
+        )
+        try:
+            source_episode_id = int(source_episode_id)
+        except (TypeError, ValueError):
+            source_episode_id = ep_idx
         out.append(
             MamEvalEpisode(
                 episode_index=ep_idx,
                 init_state_id=init_state_id,
+                init_state=init_state,
+                suite=suite,
+                task_id=task_id,
                 mask_type=mask_type,
                 mask_type_slot=mask_type_slot,
                 task=task,
                 mas_action_absolute=_stack_float32(grouped[ep_idx][MAM_MAS_ACTION_ABSOLUTE]),
                 mas_action_mask=_stack_float32(grouped[ep_idx][MAM_MAS_ACTION_MASK]),
                 progress=_stack_float32(grouped[ep_idx][MAM_PROGRESS], keep_feature_dim=True),
+                source_episode_id=source_episode_id,
             )
         )
     return out
@@ -149,16 +193,100 @@ def configure_mam_eval_init_state_ids(cfg: Any, episodes: list[MamEvalEpisode], 
         raise ValueError("MAM online eval currently requires env.type=libero or libero_plus.")
     if not hasattr(cfg.env, "init_state_ids"):
         raise ValueError("MAM online eval requires env config with init_state_ids support.")
+    control_mode = getattr(cfg.env, "control_mode", None)
+    if control_mode is not None and control_mode != "absolute":
+        raise ValueError(
+            f"MAM online eval emits absolute OSC targets and requires env.control_mode='absolute', "
+            f"got {control_mode!r}."
+        )
     if len(episodes) < n_episodes:
         raise ValueError(f"MAM eval requested {n_episodes} episodes but dataset only has {len(episodes)}.")
+    selected = episodes[:n_episodes]
+    task_scoped = [ep for ep in selected if ep.task_id is not None]
+    if task_scoped:
+        if len(task_scoped) != len(selected):
+            raise ValueError("MAM eval episodes must either all have task_id metadata or none of them can.")
+        grouped: dict[tuple[str, int], list[int]] = defaultdict(list)
+        grouped_values: dict[tuple[str, int], list[list[float]]] = defaultdict(list)
+        for ep in task_scoped:
+            suite = ep.suite or getattr(cfg.env, "task", "")
+            key = (suite, int(ep.task_id))
+            grouped[key].append(int(ep.init_state_id))
+            if ep.init_state is not None:
+                grouped_values[key].append(ep.init_state)
+        all_have_init_values = all(ep.init_state is not None for ep in task_scoped)
+        init_groups = grouped_values if all_have_init_values else grouped
+        min_task_episodes = min(len(values) for values in init_groups.values())
+        if getattr(cfg.eval, "batch_size", 1) > min_task_episodes:
+            cfg.eval.batch_size = min_task_episodes
+        suites = {suite for suite, _ in grouped}
+        if len(suites) == 1:
+            cfg.env.task = next(iter(suites))
+            cfg.env.task_ids = sorted({task_id for _, task_id in grouped})
+        if all_have_init_values:
+            cfg.env.init_state_values_by_task = {
+                f"{suite}/{task_id}": values for (suite, task_id), values in sorted(grouped_values.items())
+            }
+            cfg.env.init_state_ids_by_task = None
+            cfg.env.init_state_values = None
+            cfg.env.init_state_ids = None
+            if hasattr(cfg.env, "num_steps_wait"):
+                cfg.env.num_steps_wait = 0
+        else:
+            cfg.env.init_state_ids_by_task = {
+                f"{suite}/{task_id}": values for (suite, task_id), values in sorted(grouped.items())
+            }
+            cfg.env.init_state_values_by_task = None
+            cfg.env.init_state_values = None
+            cfg.env.init_state_ids = None
+        return
     if getattr(cfg.eval, "batch_size", 1) > n_episodes:
         cfg.eval.batch_size = n_episodes
-    cfg.env.init_state_ids = [int(ep.init_state_id) for ep in episodes[:n_episodes]]
+    if all(ep.init_state is not None for ep in selected):
+        cfg.env.init_state_values = [ep.init_state for ep in selected if ep.init_state is not None]
+        cfg.env.init_state_ids = None
+        cfg.env.init_state_values_by_task = None
+        cfg.env.init_state_ids_by_task = None
+        if hasattr(cfg.env, "num_steps_wait"):
+            cfg.env.num_steps_wait = 0
+    else:
+        cfg.env.init_state_ids = [int(ep.init_state_id) for ep in selected]
+        cfg.env.init_state_values = None
+        cfg.env.init_state_values_by_task = None
+        cfg.env.init_state_ids_by_task = None
 
 
-def _resolve_stpm_paths(config: MamConfig) -> tuple[Path | None, Path | None]:
-    ckpt = Path(config.stpm_checkpoint_path) if config.stpm_checkpoint_path else None
-    cfg = Path(config.stpm_config_path) if config.stpm_config_path else None
+def _map_lookup(mapping: dict[str, str] | None, task_group: str | None, task_id: int | None) -> str | None:
+    if not mapping or task_id is None:
+        return None
+    candidates = []
+    if task_group:
+        candidates.extend([f"{task_group}/{task_id}", f"{task_group}:{task_id}", f"{task_group}.{task_id}"])
+    candidates.append(str(task_id))
+    for key in candidates:
+        if key in mapping:
+            return mapping[key]
+    return None
+
+
+def _resolve_stpm_paths(
+    config: MamConfig,
+    task_group: str | None = None,
+    task_id: int | None = None,
+) -> tuple[Path | None, Path | None]:
+    task_root_value = _map_lookup(config.stpm_paths, task_group, task_id)
+    task_ckpt_value = _map_lookup(config.stpm_checkpoint_paths, task_group, task_id)
+    task_cfg_value = _map_lookup(config.stpm_config_paths, task_group, task_id)
+    if task_root_value:
+        root = Path(task_root_value)
+        ckpt = Path(task_ckpt_value) if task_ckpt_value else root / "checkpoints" / "reward_best.pt"
+        cfg = Path(task_cfg_value) if task_cfg_value else root / "config.yaml"
+        return ckpt, cfg
+
+    ckpt_value = task_ckpt_value or config.stpm_checkpoint_path
+    cfg_value = task_cfg_value or config.stpm_config_path
+    ckpt = Path(ckpt_value) if ckpt_value else None
+    cfg = Path(cfg_value) if cfg_value else None
     if config.stpm_path:
         root = Path(config.stpm_path)
         ckpt = ckpt or root / "checkpoints" / "reward_best.pt"
@@ -166,22 +294,48 @@ def _resolve_stpm_paths(config: MamConfig) -> tuple[Path | None, Path | None]:
     return ckpt, cfg
 
 
-def make_stpm_encoder(config: MamConfig) -> STPMEncoder | None:
-    ckpt, cfg = _resolve_stpm_paths(config)
+def make_stpm_encoder(
+    config: MamConfig,
+    task_group: str | None = None,
+    task_id: int | None = None,
+) -> STPMEncoder | None:
+    ckpt, cfg = _resolve_stpm_paths(config, task_group=task_group, task_id=task_id)
     if ckpt is None or cfg is None:
         return None
     if not ckpt.exists() or not cfg.exists():
         raise FileNotFoundError(f"STPM artifacts not found: checkpoint={ckpt}, config={cfg}")
-    return STPMEncoder(ckpt_path=ckpt, config_path=cfg, device=config.device)
+    encoder = STPMEncoder(ckpt_path=ckpt, config_path=cfg, device=config.device)
+    _validate_stpm_task_identity(encoder, task_group, task_id, cfg)
+    return encoder
 
 
-def _stack_history(history: deque[Tensor], target_len: int) -> Tensor:
+def _validate_stpm_task_identity(
+    encoder: STPMEncoder,
+    task_group: str | None,
+    task_id: int | None,
+    config_path: Path | None = None,
+) -> None:
+    if task_id is not None:
+        trained_tasks = {str(value) for value in encoder.cfg.get("split_identity", {}).get("tasks", [])}
+        if trained_tasks and str(task_id) not in trained_tasks:
+            raise ValueError(
+                f"STPM task mismatch for {task_group}/{task_id}: {config_path or encoder.config_path} "
+                "was trained for "
+                f"task identities {sorted(trained_tasks)}."
+            )
+
+
+def _stack_history(history: deque[Tensor], target_len: int, frame_gap: int = 1) -> Tensor:
     if not history:
         raise RuntimeError("Cannot stack empty history.")
+    if target_len <= 0 or frame_gap <= 0:
+        raise ValueError(f"target_len and frame_gap must be positive, got {target_len=}, {frame_gap=}.")
     frames = list(history)
-    while len(frames) < target_len:
+    required_history = (target_len - 1) * frame_gap + 1
+    while len(frames) < required_history:
         frames.insert(0, frames[0])
-    return torch.stack(frames[-target_len:], dim=1)
+    indices = range(len(frames) - required_history, len(frames), frame_gap)
+    return torch.stack([frames[index] for index in indices], dim=1)
 
 
 def _predict_progress(
@@ -202,9 +356,11 @@ def _predict_progress(
             raise ValueError(
                 f"STPM expected camera '{key}' but current observation has {list(image_history)}"
             )
-        camera_tensors.append(_stack_history(image_history[key], stpm.n_obs_steps + 1))
+        camera_tensors.append(
+            _stack_history(image_history[key], stpm.n_obs_steps + 1, frame_gap=stpm.frame_gap)
+        )
     rgb = torch.stack(camera_tensors, dim=2)
-    state = _stack_history(state_history, stpm.n_obs_steps + 1)
+    state = _stack_history(state_history, stpm.n_obs_steps + 1, frame_gap=stpm.frame_gap)
     return stpm.predict_progress(rgb, state, tasks=tasks).detach().cpu().float().clamp(0, 1)
 
 
@@ -215,13 +371,10 @@ def _slice_episode_window(
 ) -> tuple[Tensor, Tensor, Tensor]:
     ep_len = int(episode.mas_action_absolute.shape[0])
     center = int(round(float(np.clip(progress, 0.0, 1.0)) * max(ep_len - 1, 0)))
-    start = max(0, center - config.mas_long_backward_length)
-    length = max(
-        config.mas_long_window_horizon,
-        config.mas_long_backward_length + config.mas_short_window_horizon,
-        config.n_action_steps,
-    )
-    indices = torch.arange(start, start + length).clamp(max=max(ep_len - 1, 0))
+    if ep_len <= 0:
+        raise ValueError(f"MAM eval episode {episode.episode_index} is empty.")
+    offsets = torch.as_tensor(config.mam_delta_indices, dtype=torch.long)
+    indices = (center + offsets).clamp(min=0, max=ep_len - 1)
     return (
         episode.mas_action_absolute[indices],
         episode.mas_action_mask[indices],
@@ -271,12 +424,13 @@ def rollout_mam(
     episodes: list[MamEvalEpisode],
     episode_offset: int,
     stpm: STPMEncoder | None,
+    seeds: list[int] | None = None,
     return_observations: bool = False,
 ) -> dict[str, Tensor | dict[str, Tensor]]:
     assert isinstance(policy.config, MamConfig)
     config = policy.config
     policy.reset()
-    observation, _ = env.reset(seed=None)
+    observation, _ = env.reset(seed=seeds)
 
     all_observations = []
     all_actions = []
@@ -284,9 +438,9 @@ def rollout_mam(
     all_successes = []
     all_dones = []
     absolute_action_queue: deque[Tensor] = deque()
-    history_len = stpm.n_obs_steps + 1 if stpm else 1
+    history_len = stpm.n_obs_steps * stpm.frame_gap + 1 if stpm else 1
     image_history: dict[str, deque[Tensor]] = defaultdict(lambda: deque(maxlen=history_len))
-    state_history: deque[Tensor] = deque(maxlen=(stpm.n_obs_steps + 1 if stpm else 1))
+    state_history: deque[Tensor] = deque(maxlen=history_len)
 
     done = np.array([False] * env.num_envs)
     max_steps = env.call("_max_episode_steps")[0]
@@ -316,22 +470,23 @@ def rollout_mam(
             if key.startswith(f"{OBS_IMAGES}."):
                 image_history[key].append(value)
 
-        progress = _predict_progress(
-            stpm=stpm,
-            image_history=image_history,
-            state_history=state_history,
-            tasks=list(observation.get("task", [""] * env.num_envs)),
-            step=step,
-            max_steps=max_steps,
-        )
-        observation.update(_build_mam_fields(episodes, progress, config, episode_offset, env.num_envs))
+        needs_prediction = len(absolute_action_queue) == 0
+        if needs_prediction:
+            progress = _predict_progress(
+                stpm=stpm,
+                image_history=image_history,
+                state_history=state_history,
+                tasks=list(observation.get("task", [""] * env.num_envs)),
+                step=step,
+                max_steps=max_steps,
+            )
+            observation.update(_build_mam_fields(episodes, progress, config, episode_offset, env.num_envs))
         processed = preprocessor(observation)
 
         with torch.inference_mode():
             processed = policy.update_observation_queue(processed)
-            if len(absolute_action_queue) == 0:
+            if needs_prediction:
                 relative_chunk = policy.predict_action_chunk(processed)
-                relative_chunk = _apply_inpainting(config, relative_chunk, processed)
                 relative_chunk = postprocessor(relative_chunk)
                 absolute_chunk = chunk_relative_to_absolute(
                     relative_chunk, anchor_state.to(relative_chunk.device)
@@ -380,8 +535,7 @@ def rollout_mam(
     }
     if return_observations:
         ret[OBS_STR] = {
-            key: torch.stack([obs[key] for obs in all_observations], dim=1)
-            for key in all_observations[0]
+            key: torch.stack([obs[key] for obs in all_observations], dim=1) for key in all_observations[0]
         }
     return ret
 
@@ -397,11 +551,14 @@ def eval_mam_policy(
     n_episodes: int,
     stpm: STPMEncoder | None = None,
     return_episode_data: bool = False,
+    start_seed: int | None = None,
 ) -> dict[str, Any]:
     start = time.time()
     policy.eval()
     if not episodes:
         raise ValueError("MAM eval requires at least one episode.")
+    if len(episodes) < n_episodes:
+        raise ValueError(f"MAM eval requested {n_episodes} episodes but only received {len(episodes)}.")
     n_batches = n_episodes // env.num_envs + int((n_episodes % env.num_envs) != 0)
     padded_len = n_batches * env.num_envs
     rollout_episodes = episodes + [episodes[-1]] * max(0, padded_len - len(episodes))
@@ -413,21 +570,29 @@ def eval_mam_policy(
 
     for batch_ix in trange(n_batches, desc="Stepping through MAM eval batches", disable=inside_slurm()):
         offset = batch_ix * env.num_envs
-        rollout_data = rollout_mam(
-            env=env,
-            policy=policy,
-            env_preprocessor=env_preprocessor,
-            env_postprocessor=env_postprocessor,
-            preprocessor=preprocessor,
-            postprocessor=postprocessor,
-            episodes=rollout_episodes,
-            episode_offset=offset,
-            stpm=stpm,
-            return_observations=return_episode_data,
+        seeds = (
+            list(range(start_seed + offset, start_seed + offset + env.num_envs))
+            if start_seed is not None
+            else None
         )
+        rng_context = seeded_context(seeds[0]) if seeds else nullcontext()
+        with rng_context:
+            rollout_data = rollout_mam(
+                env=env,
+                policy=policy,
+                env_preprocessor=env_preprocessor,
+                env_postprocessor=env_postprocessor,
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                episodes=rollout_episodes,
+                episode_offset=offset,
+                stpm=stpm,
+                seeds=seeds,
+                return_observations=return_episode_data,
+            )
         n_steps = rollout_data["done"].shape[1]
         done_indices = torch.argmax(rollout_data["done"].to(int), dim=1)
-        mask = (torch.arange(n_steps) <= (done_indices + 1).unsqueeze(1)).int()
+        mask = (torch.arange(n_steps) <= done_indices.unsqueeze(1)).int()
         batch_sum_rewards = ((rollout_data["reward"] * mask).sum(dim=1)).tolist()
         batch_max_rewards = ((rollout_data["reward"] * mask).max(dim=1).values).tolist()
         batch_successes = ((rollout_data["success"] * mask).any(dim=1)).tolist()
@@ -444,8 +609,13 @@ def eval_mam_policy(
             per_episode.append(
                 {
                     "episode_ix": offset + env_i,
-                    "source_episode_id": ep.episode_index,
+                    "source_episode_id": (
+                        ep.source_episode_id if ep.source_episode_id is not None else ep.episode_index
+                    ),
+                    "mam_episode_index": ep.episode_index,
                     "init_state_id": ep.init_state_id,
+                    "suite": ep.suite,
+                    "task_id": ep.task_id,
                     "mask_type": ep.mask_type,
                     "mask_type_slot": ep.mask_type_slot,
                     "sum_reward": sum_reward,
@@ -455,16 +625,27 @@ def eval_mam_policy(
             )
 
         if return_episode_data:
+            valid_batch = min(env.num_envs, n_episodes - offset)
+            compile_rollout = {
+                key: (
+                    {nested_key: value[:valid_batch] for nested_key, value in item.items()}
+                    if key == OBS_STR
+                    else item[:valid_batch]
+                )
+                for key, item in rollout_data.items()
+            }
             this_episode_data = _compile_episode_data(
-                rollout_data,
-                done_indices,
+                compile_rollout,
+                done_indices[:valid_batch],
                 start_episode_index=offset,
                 start_data_index=(0 if episode_data is None else (episode_data["index"][-1].item() + 1)),
                 fps=env.unwrapped.metadata["render_fps"],
             )
-            episode_data = this_episode_data if episode_data is None else {
-                key: torch.cat([episode_data[key], this_episode_data[key]]) for key in episode_data
-            }
+            episode_data = (
+                this_episode_data
+                if episode_data is None
+                else {key: torch.cat([episode_data[key], this_episode_data[key]]) for key in episode_data}
+            )
 
     info: dict[str, Any] = {
         "per_episode": per_episode[:n_episodes],
@@ -498,26 +679,70 @@ def eval_mam_policy_all(
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
     episodes: list[MamEvalEpisode],
     n_episodes: int,
+    start_seed: int | None = None,
 ) -> dict[str, Any]:
     start = time.time()
     if not isinstance(policy.config, MamConfig):
         raise TypeError("eval_mam_policy_all requires a MamPolicy/MamConfig.")
-    stpm = make_stpm_encoder(policy.config)
-    if stpm is None:
+    if len(episodes) < n_episodes:
+        raise ValueError(f"MAM eval requested {n_episodes} episodes but dataset only has {len(episodes)}.")
+    selected_episodes = episodes[:n_episodes]
+    default_stpm = make_stpm_encoder(policy.config)
+    has_task_stpm = bool(
+        policy.config.stpm_paths or policy.config.stpm_checkpoint_paths or policy.config.stpm_config_paths
+    )
+    if default_stpm is None and not has_task_stpm:
         logging.warning("MAM eval running without STPM; using rollout step ratio as progress fallback.")
+
+    grouped_episodes: dict[tuple[str, int], list[MamEvalEpisode]] = defaultdict(list)
+    task_scoped = all(ep.task_id is not None for ep in selected_episodes)
+    if task_scoped:
+        for ep in selected_episodes:
+            grouped_episodes[(ep.suite, int(ep.task_id))].append(ep)
 
     per_task_infos = []
     all_per_episode = []
     all_sum_rewards = []
     all_max_rewards = []
     all_successes = []
-    offset = 0
+    consumed = 0
     for task_group, task_map in envs.items():
         for task_id, env in task_map.items():
-            remaining = n_episodes - offset
+            remaining = n_episodes - consumed
             if remaining <= 0:
                 break
-            task_n = min(remaining, len(episodes) - offset)
+            if task_scoped:
+                task_episodes = grouped_episodes.get((task_group, task_id), [])
+                if not task_episodes:
+                    task_episodes = grouped_episodes.get(("", task_id), [])
+            else:
+                task_episodes = selected_episodes[consumed:]
+            task_n = min(remaining, len(task_episodes))
+            if task_n <= 0:
+                env.close()
+                continue
+            stpm = default_stpm
+            if task_scoped:
+                has_override = any(
+                    _map_lookup(mapping, task_group, task_id) is not None
+                    for mapping in (
+                        policy.config.stpm_paths,
+                        policy.config.stpm_checkpoint_paths,
+                        policy.config.stpm_config_paths,
+                    )
+                )
+                # Load task-specific STPMs one at a time. Keeping ten encoders alive
+                # would also retain ten CLIP vision backbones on the GPU.
+                if has_override:
+                    stpm = make_stpm_encoder(policy.config, task_group, task_id) or default_stpm
+                elif stpm is not None:
+                    _validate_stpm_task_identity(stpm, task_group, task_id)
+                if stpm is None:
+                    logging.warning(
+                        "No STPM configured for %s/%s; using rollout step ratio as progress fallback.",
+                        task_group,
+                        task_id,
+                    )
             task_result = eval_mam_policy(
                 env=env,
                 policy=policy,
@@ -525,11 +750,14 @@ def eval_mam_policy_all(
                 env_postprocessor=env_postprocessor,
                 preprocessor=preprocessor,
                 postprocessor=postprocessor,
-                episodes=episodes[offset : offset + task_n],
+                episodes=task_episodes[:task_n],
                 n_episodes=task_n,
                 stpm=stpm,
+                start_seed=None if start_seed is None else start_seed + consumed,
             )
             per_episode = task_result["per_episode"]
+            for episode_info in per_episode:
+                episode_info["episode_ix"] = int(episode_info["episode_ix"]) + consumed
             all_per_episode.extend(per_episode)
             all_sum_rewards.extend([ep["sum_reward"] for ep in per_episode])
             all_max_rewards.extend([ep["max_reward"] for ep in per_episode])
@@ -541,8 +769,16 @@ def eval_mam_policy_all(
                     "metrics": task_result["aggregated"],
                 }
             )
-            offset += task_n
+            consumed += task_n
             env.close()
+            if stpm is not None and stpm is not default_stpm:
+                del stpm
+
+    if consumed < n_episodes:
+        raise ValueError(
+            f"MAM eval consumed only {consumed}/{n_episodes} requested episode(s). "
+            "Check eval dataset task metadata and env.task/env.task_ids."
+        )
 
     return {
         "per_task": per_task_infos,

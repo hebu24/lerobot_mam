@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Multi-GPU launcher for MAM on LIBERO put_bowl_on_plate.
+# Multi-GPU launcher for MAM on LIBERO datasets.
+# The filename is kept for compatibility with existing local commands.
 # The dataset must be materialized with scripts/convert_libero_absolute_to_mam.py
 # so that mam.mas_action_absolute, mam.mas_action_mask, and mam.progress exist.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
 if [[ -z "${NUM_GPUS:-}" ]]; then
   NUM_GPUS="$(python -c 'import torch; print(torch.cuda.device_count())')"
@@ -15,11 +20,11 @@ if [[ "${NUM_GPUS}" -lt 1 ]]; then
 fi
 
 MIXED_PRECISION="${MIXED_PRECISION:-no}"
-DATASET_REPO_ID="${DATASET_REPO_ID:-local/libero_put_bowl_on_plate_mam_train}"
-DATASET_ROOT="${DATASET_ROOT:-outputs/datasets/libero_put_bowl_on_plate_mam_train}"
-MAM_EVAL_DATASET_REPO_ID="${MAM_EVAL_DATASET_REPO_ID:-local/libero_put_bowl_on_plate_mam_eval}"
-MAM_EVAL_DATASET_ROOT="${MAM_EVAL_DATASET_ROOT:-outputs/datasets/libero_put_bowl_on_plate_mam_eval}"
-JOB_NAME="${JOB_NAME:-mam_libero_put_bowl_on_plate_${NUM_GPUS}gpu}"
+DATASET_REPO_ID="${DATASET_REPO_ID:-local/libero10_mam_v3_train}"
+DATASET_ROOT="${DATASET_ROOT:-outputs/datasets/libero10_mam_v3_train}"
+MAM_EVAL_DATASET_REPO_ID="${MAM_EVAL_DATASET_REPO_ID:-local/libero10_mam_v3_eval}"
+MAM_EVAL_DATASET_ROOT="${MAM_EVAL_DATASET_ROOT:-outputs/datasets/libero10_mam_v3_eval}"
+JOB_NAME="${JOB_NAME:-mam_libero10_v3_${NUM_GPUS}gpu}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
@@ -31,6 +36,7 @@ EVAL_FREQ="${EVAL_FREQ:-0}"
 POLICY_DEVICE="${POLICY_DEVICE:-cuda}"
 PUSH_TO_HUB="${PUSH_TO_HUB:-false}"
 WANDB_ENABLE="${WANDB_ENABLE:-false}"
+PRETRAINED_BACKBONE_WEIGHTS="${PRETRAINED_BACKBONE_WEIGHTS:-}"
 
 launch_args=(
   --num_processes="${NUM_GPUS}"
@@ -44,6 +50,7 @@ train_args=(
   --policy.type=mam
   --policy.device="${POLICY_DEVICE}"
   --policy.push_to_hub="${PUSH_TO_HUB}"
+  --policy.do_mask_loss_for_padding="${DO_MASK_LOSS_FOR_PADDING:-true}"
   --policy.mam_eval_dataset_repo_id="${MAM_EVAL_DATASET_REPO_ID}"
   --policy.mam_eval_dataset_root="${MAM_EVAL_DATASET_ROOT}"
   --dataset.repo_id="${DATASET_REPO_ID}"
@@ -72,15 +79,32 @@ if [[ -n "${MAM_EVAL_EPISODES:-}" ]]; then
   train_args+=(--policy.mam_eval_episodes="${MAM_EVAL_EPISODES}")
 fi
 
+if [[ -n "${STPM_PATHS:-}" ]]; then
+  train_args+=(--policy.stpm_paths="${STPM_PATHS}")
+fi
+
+if [[ -n "${STPM_CHECKPOINT_PATHS:-}" ]]; then
+  train_args+=(--policy.stpm_checkpoint_paths="${STPM_CHECKPOINT_PATHS}")
+fi
+
+if [[ -n "${STPM_CONFIG_PATHS:-}" ]]; then
+  train_args+=(--policy.stpm_config_paths="${STPM_CONFIG_PATHS}")
+fi
+
+if [[ -n "${PRETRAINED_BACKBONE_WEIGHTS:-}" ]]; then
+  train_args+=(--policy.pretrained_backbone_weights="${PRETRAINED_BACKBONE_WEIGHTS}")
+fi
+
 if [[ "${ENABLE_EVAL:-false}" == "true" ]]; then
   train_args+=(
     --env.type=libero
-    --env.task="${ENV_TASK:-libero_goal}"
-    --env.task_ids="${ENV_TASK_IDS:-[8]}"
+    --env.task="${ENV_TASK:-libero_10}"
+    --env.task_ids="${ENV_TASK_IDS:-[0,1,2,3,4,5,6,7,8,9]}"
     --env.control_mode="${ENV_CONTROL_MODE:-absolute}"
-    --env.observation_height="${ENV_OBSERVATION_HEIGHT:-256}"
-    --env.observation_width="${ENV_OBSERVATION_WIDTH:-256}"
+    --env.observation_height="${ENV_OBSERVATION_HEIGHT:-128}"
+    --env.observation_width="${ENV_OBSERVATION_WIDTH:-128}"
     --env.max_parallel_tasks="${ENV_MAX_PARALLEL_TASKS:-1}"
+    --eval.n_episodes="${EVAL_N_EPISODES:-50}"
     --eval.batch_size="${EVAL_BATCH_SIZE:-1}"
     --eval.use_async_envs="${EVAL_USE_ASYNC_ENVS:-false}"
   )

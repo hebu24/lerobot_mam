@@ -27,6 +27,7 @@ from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DataProcessorPipeline,
     DeviceProcessorStep,
+    LiberoChunkRelativeActionsProcessorStep,
     NormalizerProcessorStep,
     RenameObservationsProcessorStep,
     TransitionKey,
@@ -76,11 +77,12 @@ def test_make_diffusion_processor_basic():
     assert postprocessor.name == "policy_postprocessor"
 
     # Check steps in preprocessor
-    assert len(preprocessor.steps) == 4
+    assert len(preprocessor.steps) == 5
     assert isinstance(preprocessor.steps[0], RenameObservationsProcessorStep)
     assert isinstance(preprocessor.steps[1], AddBatchDimensionProcessorStep)
     assert isinstance(preprocessor.steps[2], DeviceProcessorStep)
-    assert isinstance(preprocessor.steps[3], NormalizerProcessorStep)
+    assert isinstance(preprocessor.steps[3], LiberoChunkRelativeActionsProcessorStep)
+    assert isinstance(preprocessor.steps[4], NormalizerProcessorStep)
 
     # Check steps in postprocessor
     assert len(postprocessor.steps) == 2
@@ -369,7 +371,7 @@ def test_diffusion_processor_bfloat16_device_float32_normalizer():
     preprocessor.steps = modified_steps
 
     # Verify initial normalizer configuration
-    normalizer_step = preprocessor.steps[3]  # NormalizerProcessorStep
+    normalizer_step = preprocessor.steps[4]  # NormalizerProcessorStep
     assert normalizer_step.dtype == torch.float32
 
     # Create test data with both state and visual observations

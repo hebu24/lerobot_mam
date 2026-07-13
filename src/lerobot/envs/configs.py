@@ -333,6 +333,11 @@ class LiberoEnv(EnvConfig):
     observation_width: int = 360
     is_libero_plus: bool = False
     init_state_ids: list[int] | None = None
+    init_state_ids_by_task: dict[str, list[int]] | None = None
+    init_state_values: list[list[float]] | None = None
+    init_state_values_by_task: dict[str, list[list[float]]] | None = None
+    num_steps_wait: int = 10
+    flip_images: bool = False
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
             ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
@@ -413,11 +418,18 @@ class LiberoEnv(EnvConfig):
             "render_mode": self.render_mode,
             "observation_height": self.observation_height,
             "observation_width": self.observation_width,
+            "num_steps_wait": self.num_steps_wait,
         }
         if self.task_ids is not None:
             kwargs["task_ids"] = self.task_ids
         if self.init_state_ids is not None:
             kwargs["init_state_ids"] = self.init_state_ids
+        if self.init_state_ids_by_task is not None:
+            kwargs["init_state_ids_by_task"] = self.init_state_ids_by_task
+        if self.init_state_values is not None:
+            kwargs["init_state_values"] = self.init_state_values
+        if self.init_state_values_by_task is not None:
+            kwargs["init_state_values_by_task"] = self.init_state_values_by_task
         return kwargs
 
     def create_envs(self, n_envs: int, use_async_envs: bool = False):
@@ -441,7 +453,7 @@ class LiberoEnv(EnvConfig):
 
     def get_env_processors(self):
         return (
-            PolicyProcessorPipeline(steps=[LiberoProcessorStep()]),
+            PolicyProcessorPipeline(steps=[LiberoProcessorStep(flip_images=self.flip_images)]),
             PolicyProcessorPipeline(steps=[]),
         )
 

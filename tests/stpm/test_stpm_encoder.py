@@ -2,8 +2,34 @@ import json
 
 import torch
 
-from lerobot.stpm import RewardTransformer, STPMEncoder
+from lerobot.stpm import FrameLeRobotDataset, RewardTransformer, STPMEncoder
 from lerobot.stpm.normalizer import save_state_norm
+from lerobot.utils.constants import OBS_STATE
+
+
+def test_frame_dataset_uses_episode_index_metadata_lookup():
+    dataset = FrameLeRobotDataset.__new__(FrameLeRobotDataset)
+    dataset.camera_keys = ["observation.images.image"]
+    dataset.relative_indices = [-1, 0]
+    dataset.sequence_length = 2
+    dataset.episode_rows = {5: {"episode_index": 5, "length": 10}}
+
+    class FakeDataset:
+        def __getitem__(self, index):
+            return {
+                OBS_STATE: torch.zeros(2, 8),
+                "observation.images.image": torch.zeros(2, 3, 16, 16),
+                "episode_index": torch.tensor(5),
+                "frame_index": torch.tensor(7),
+                "task": "put bowl on plate",
+            }
+
+    dataset.dataset = FakeDataset()
+
+    item = dataset[0]
+
+    assert item["episode_index"] == 5
+    assert torch.allclose(item["targets"], torch.tensor([6 / 9, 7 / 9], dtype=torch.float32))
 
 
 def test_stpm_encoder_predicts_batched_progress(tmp_path):

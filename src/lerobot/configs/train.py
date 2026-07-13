@@ -115,6 +115,8 @@ class TrainPipelineConfig(HubMixin):
     # Debug mode: train and evaluate on the first N fixed demos / init states.
     overfit_test: bool = False
     num_overfit: int = 5
+    overfit_per_task: bool = False
+    num_overfit_per_task: int = 1
 
     # Sample weighting configuration (e.g., for RA-BC training)
     sample_weighting: SampleWeightingConfig | None = None
@@ -201,6 +203,11 @@ class TrainPipelineConfig(HubMixin):
 
         if self.overfit_test and self.num_overfit <= 0:
             raise ValueError(f"num_overfit must be positive when overfit_test=True, got {self.num_overfit}.")
+        if self.overfit_per_task and self.num_overfit_per_task <= 0:
+            raise ValueError(
+                "num_overfit_per_task must be positive when overfit_per_task=True, "
+                f"got {self.num_overfit_per_task}."
+            )
 
         if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):
             raise ValueError("Optimizer and Scheduler must be set when the policy presets are not used.")

@@ -122,14 +122,14 @@ act_preprocessor, act_postprocessor = make_pre_post_processors(act_cfg)
 Want to try different state representations for LIBERO? Just create a new processor:
 
 ```python
-# Original: 8D state (pos + quat→axisangle + gripper)
+# Current: 14D state (eef pos + eef quaternion + arm joints)
 @ProcessorStepRegistry.register("libero_processor")
 class LiberoProcessorStep(ObservationProcessorStep):
     def _process_observation(self, obs):
         eef_pos = robot_state["eef"]["pos"]          # 3D
-        eef_axisangle = quat2axisangle(quat)         # 3D
-        gripper = robot_state["gripper"]["qpos"]     # 2D
-        state = torch.cat([eef_pos, eef_axisangle, gripper], dim=-1)  # 8D
+        eef_quat = robot_state["eef"]["quat"]        # 4D
+        joints = robot_state["joints"]["pos"]        # 7D
+        state = torch.cat([eef_pos, eef_quat, joints], dim=-1)  # 14D
         return state
 
 # Experiment: Add velocity for better control
@@ -267,9 +267,9 @@ class LiberoProcessorStep(ObservationProcessorStep):
 
     **State Processing:**
     - Extracts end-effector position (3D)
-    - Converts quaternion to axis-angle representation (3D)
-    - Extracts gripper joint positions (2D)
-    - Concatenates into 8D state vector
+    - Extracts end-effector quaternion (4D)
+    - Extracts arm joint positions (7D)
+    - Concatenates into 14D state vector
 
     **Image Processing:**
     - Rotates images 180° to match HuggingFaceVLA/libero convention
@@ -285,19 +285,16 @@ class LiberoProcessorStep(ObservationProcessorStep):
                 img = torch.flip(img, dims=[2, 3])  # Flip H and W
                 processed_obs[key] = img
 
-        # Process robot_state: Flatten to 8D vector
+        # Process robot_state: Flatten to 14D vector
         if "observation.robot_state" in processed_obs:
             robot_state = processed_obs.pop("observation.robot_state")
 
             eef_pos = robot_state["eef"]["pos"]           # (B, 3)
             eef_quat = robot_state["eef"]["quat"]         # (B, 4)
-            gripper_qpos = robot_state["gripper"]["qpos"] # (B, 2)
-
-            # Convert quaternion to axis-angle
-            eef_axisangle = self._quat2axisangle(eef_quat)  # (B, 3)
+            joints_pos = robot_state["joints"]["pos"]     # (B, 7)
 
             # Concatenate into single state vector
-            state = torch.cat((eef_pos, eef_axisangle, gripper_qpos), dim=-1)
+            state = torch.cat((eef_pos, eef_quat, joints_pos), dim=-1)
             state = state.float()
 
             processed_obs["observation.state"] = state
@@ -310,9 +307,9 @@ class LiberoProcessorStep(ObservationProcessorStep):
 1. **Image Rotation**: The HuggingFaceVLA/libero dataset has images rotated 180° from the raw LIBERO simulator. The processor handles this convention mismatch so policies trained on the dataset work seamlessly.
 
 2. **State Flattening**: The raw LIBERO environment exposes nested dictionaries with all available state information (position, quaternion, velocity, matrix representation, etc.). The processor:
-   - Selects the relevant components (pos, quat, gripper)
-   - Converts quaternion to axis-angle (more suitable for learning)
-   - Flattens to a single 8D vector that policies expect
+   - Selects the relevant components (eef pos, eef quat, arm joints)
+   - Keeps quaternion orientation and arm joint positions
+   - Flattens to a single 14D vector that policies expect
 
 3. **Flexibility**: The environment still exposes **all** raw data. If you want to try different state representations (e.g., including velocities, using matrix representation instead of axis-angle), you can create a new processor without modifying the environment code.
 

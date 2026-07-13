@@ -24,15 +24,15 @@ from pathlib import Path
 from typing import Any
 
 import gymnasium as gym
-import libero.libero as libero_module
 import numpy as np
 import torch
 from gymnasium import spaces
-from libero.libero import benchmark, get_libero_path
+from libero.libero import benchmark
 from libero.libero.envs import OffScreenRenderEnv
 
 from lerobot.types import RobotObservation
 
+from .libero_assets import get_libero_resource_path, validate_libero_assets
 from .utils import _LazyAsyncVectorEnv, parse_camera_names
 
 
@@ -58,82 +58,30 @@ def _select_task_ids(total_tasks: int, task_ids: Iterable[int] | None) -> list[i
     return ids
 
 
-_LIBERO_PATH_FALLBACKS = {
-    "benchmark_root": ".",
-    "bddl_files": "bddl_files",
-    "init_states": "init_files",
-    "assets": "assets",
-}
-
-
-def _get_libero_path(query_key: str) -> Path:
-    """Return a valid LIBERO resource path, falling back to the installed package."""
-    configured = Path(get_libero_path(query_key))
-    if configured.exists():
-        return configured
-
-    fallback_rel = _LIBERO_PATH_FALLBACKS.get(query_key)
-    if fallback_rel is None:
-        return configured
-
-    package_root = Path(benchmark.__file__).resolve().parents[1]
-    fallback = package_root / fallback_rel
-    if fallback.exists():
-        return fallback
-    return configured
-
-
-def _validate_libero_assets() -> None:
-    """Fail early with an actionable message when LIBERO assets are incomplete."""
-    # `libero.libero.get_assets_path()` attempts a Hugging Face download when
-    # package-local assets are absent. Avoid that side effect here; this check
-    # should only report what is available locally.
-    cache_assets_path = Path.home() / ".cache" / "libero" / "assets"
-    package_assets_path = Path(benchmark.__file__).resolve().parents[1] / "assets"
-    candidate_paths = [
-        *(Path(path) for path in os.environ.get("LIBERO_ASSETS_PATH", "").split(os.pathsep) if path),
-        _get_libero_path("assets"),
-        package_assets_path,
-        cache_assets_path,
-    ]
-    required_rel_paths = [
-        Path("turbosquid_objects") / "wine_rack" / "wine_rack.xml",
-        Path("stable_scanned_objects") / "akita_black_bowl" / "akita_black_bowl.xml",
-        Path("stable_hope_objects") / "cream_cheese" / "cream_cheese.xml",
-    ]
-
-    seen: set[Path] = set()
-    missing_by_candidate: list[tuple[Path, list[Path]]] = []
-    for assets_path in candidate_paths:
-        assets_path = assets_path.expanduser()
-        if assets_path in seen:
-            continue
-        seen.add(assets_path)
-        missing = [
-            assets_path / rel_path
-            for rel_path in required_rel_paths
-            if not (assets_path / rel_path).exists()
-        ]
-        if not missing:
-            libero_module._assets_path_cache = str(assets_path)
-            return
-        if assets_path.exists():
-            missing_by_candidate.append((assets_path, missing))
-
-    assets_path, missing = (
-        missing_by_candidate[0]
-        if missing_by_candidate
-        else (cache_assets_path, [cache_assets_path / rel for rel in required_rel_paths])
+def _task_map_value(mapping: Mapping[str, Any], suite_name: str, task_id: int) -> Any | None:
+    """Resolve task-scoped config maps with permissive key formats."""
+    candidates = (
+        f"{suite_name}/{task_id}",
+        f"{suite_name}:{task_id}",
+        f"{suite_name}.{task_id}",
+        str(task_id),
     )
-    missing_text = "\n".join(f"  - {path}" for path in missing)
-    raise FileNotFoundError(
-        "LIBERO assets are missing or incomplete. Missing required files:\n"
-        f"{missing_text}\n"
-        "Run this once with network access to refresh the asset cache:\n"
-        "  uv run python -c \"from libero.libero.utils.download_utils import "
-        "download_assets_from_huggingface; "
-        f"download_assets_from_huggingface('{cache_assets_path}')\""
-    )
+    for key in candidates:
+        if key in mapping:
+            return mapping[key]
+    return None
+
+
+def _normalize_init_state_values(values: Any, name: str) -> list[list[float]]:
+    out: list[list[float]] = []
+    for index, value in enumerate(values):
+        array = np.asarray(value, dtype=np.float64).reshape(-1)
+        if array.size == 0:
+            raise ValueError(f"{name}[{index}] is empty.")
+        out.append(array.tolist())
+    if not out:
+        raise ValueError(f"{name} must contain at least one init state.")
+    return out
 
 
 # LIBERO-plus perturbation variants encode the perturbation in the filename
@@ -146,7 +94,7 @@ _LIBERO_PERTURBATION_SUFFIX_RE = re.compile(r"_(?:language|view|light)_[^.]*|_(?
 def get_task_init_states(task_suite: Any, i: int, is_libero_plus: bool = False) -> np.ndarray:
     task = task_suite.tasks[i]
     filename = Path(task.init_states_file)
-    root = _get_libero_path("init_states")
+    root = get_libero_resource_path("init_states")
 
     if not is_libero_plus:
         init_states_path = root / task.problem_folder / filename.name
@@ -169,6 +117,13 @@ def get_task_init_states(task_suite: Any, i: int, is_libero_plus: bool = False) 
 def get_libero_dummy_action():
     """Get dummy/no-op action, used to roll out the simulation while the robot does nothing."""
     return [0, 0, 0, 0, 0, 0, -1]
+
+
+def sync_libero_controllers(env: Any) -> None:
+    """Synchronize controller goals after directly replacing the MuJoCo state."""
+    for robot in env.robots:
+        robot.controller.update(force=True)
+        robot.controller.reset_goal()
 
 
 ACTION_DIM = 7
@@ -203,6 +158,7 @@ class LiberoEnv(gym.Env):
         episode_index: int = 0,
         init_state_id: int | None = None,
         init_state_ids: Sequence[int] | None = None,
+        init_state_values: Sequence[Sequence[float]] | None = None,
         n_envs: int = 1,
         camera_name_mapping: dict[str, str] | None = None,
         num_steps_wait: int = 10,
@@ -240,11 +196,16 @@ class LiberoEnv(gym.Env):
         # Load once and keep
         self._init_states = (
             get_task_init_states(task_suite, self.task_id, is_libero_plus=self.is_libero_plus)
-            if self.init_states
+            if self.init_states and init_state_values is None
             else None
         )
         self._reset_stride = n_envs  # when performing a reset, append `_reset_stride` to `init_state_id`.
         self._init_state_ids = [int(idx) for idx in init_state_ids] if init_state_ids is not None else None
+        self._init_state_values = (
+            [np.asarray(value, dtype=np.float64).reshape(-1) for value in init_state_values]
+            if init_state_values is not None
+            else None
+        )
         self._init_state_cursor = self.episode_index
 
         self.init_state_id = self.episode_index  # tie each sub-env to a fixed init state
@@ -256,7 +217,7 @@ class LiberoEnv(gym.Env):
         self.task = task.name
         self.task_description = task.language
         self._task_bddl_file = os.path.join(
-            _get_libero_path("bddl_files"), task.problem_folder, task.bddl_file
+            get_libero_resource_path("bddl_files"), task.problem_folder, task.bddl_file
         )
         self._env: OffScreenRenderEnv | None = (
             None  # deferred — created on first reset() inside the worker subprocess
@@ -328,9 +289,16 @@ class LiberoEnv(gym.Env):
                 }
             )
 
-        self.action_space = spaces.Box(
-            low=ACTION_LOW, high=ACTION_HIGH, shape=(ACTION_DIM,), dtype=np.float32
-        )
+        if self.control_mode == "absolute":
+            # Absolute OSC targets contain world-frame position and axis-angle
+            # values outside [-1, 1]; only the gripper command is bounded.
+            low = np.asarray([-np.inf] * 6 + [ACTION_LOW], dtype=np.float32)
+            high = np.asarray([np.inf] * 6 + [ACTION_HIGH], dtype=np.float32)
+            self.action_space = spaces.Box(low=low, high=high, dtype=np.float32)
+        else:
+            self.action_space = spaces.Box(
+                low=ACTION_LOW, high=ACTION_HIGH, shape=(ACTION_DIM,), dtype=np.float32
+            )
 
     def _ensure_env(self) -> None:
         """Create the underlying OffScreenRenderEnv on first use.
@@ -341,7 +309,7 @@ class LiberoEnv(gym.Env):
         """
         if self._env is not None:
             return
-        _validate_libero_assets()
+        validate_libero_assets()
         env = OffScreenRenderEnv(
             bddl_file_name=self._task_bddl_file,
             camera_heights=self.observation_height,
@@ -397,11 +365,11 @@ class LiberoEnv(gym.Env):
 
         if self.obs_type == "pixels_agent_pos":
             # Validate required fields are present
-            if eef_pos is None or eef_quat is None or gripper_qpos is None:
+            if eef_pos is None or eef_quat is None or joint_pos is None:
                 raise ValueError(
                     f"Missing required robot state fields in raw observation. "
                     f"Got eef_pos={eef_pos is not None}, eef_quat={eef_quat is not None}, "
-                    f"gripper_qpos={gripper_qpos is not None}"
+                    f"joint_pos={joint_pos is not None}"
                 )
             return obs
 
@@ -415,22 +383,33 @@ class LiberoEnv(gym.Env):
         super().reset(seed=seed)
         self._env.seed(seed)
         raw_obs = self._env.reset()
-        if self.init_states and self._init_states is not None:
-            if self._init_state_ids is not None:
+        if self.init_states:
+            if self._init_state_values is not None:
+                init_state = self._init_state_values[self._init_state_cursor % len(self._init_state_values)]
+                if advance_init_state:
+                    self._init_state_cursor += self._reset_stride
+                raw_obs = self._env.set_init_state(init_state)
+            elif self._init_states is not None and self._init_state_ids is not None:
                 init_state_id = self._init_state_ids[self._init_state_cursor % len(self._init_state_ids)]
                 if advance_init_state:
                     self._init_state_cursor += self._reset_stride
-            else:
+                raw_obs = self._env.set_init_state(self._init_states[init_state_id % len(self._init_states)])
+            elif self._init_states is not None:
                 init_state_id = self.init_state_id
                 if advance_init_state:
                     self.init_state_id += self._reset_stride  # Change init_state_id when reset
-            raw_obs = self._env.set_init_state(self._init_states[init_state_id % len(self._init_states)])
+                raw_obs = self._env.set_init_state(self._init_states[init_state_id % len(self._init_states)])
+
+        # set_init_state() only replaces MuJoCo state. The OSC goal and
+        # interpolator still refer to the preceding random reset unless synced.
+        sync_libero_controllers(self._env)
 
         # After reset, objects may be unstable (slightly floating, intersecting, etc.).
         # Step the simulator with a no-op action for a few frames so everything settles.
         # Increasing this value can improve determinism and reproducibility across resets.
         for _ in range(self.num_steps_wait):
             raw_obs, _, _, _ = self._env.step(get_libero_dummy_action())
+        sync_libero_controllers(self._env)
 
         if self.control_mode == "absolute":
             for robot in self._env.robots:
@@ -490,6 +469,7 @@ def _make_env_fns(
     gym_kwargs: Mapping[str, Any],
     control_mode: str,
     init_state_ids: Sequence[int] | None,
+    init_state_values: Sequence[Sequence[float]] | None,
     camera_name_mapping: dict[str, str] | None = None,
     is_libero_plus: bool = False,
 ) -> list[Callable[[], LiberoEnv]]:
@@ -507,6 +487,7 @@ def _make_env_fns(
             episode_index=episode_index,
             init_state_id=None if init_state_ids is None else int(init_state_ids[episode_index]),
             init_state_ids=init_state_ids,
+            init_state_values=init_state_values,
             n_envs=n_envs,
             control_mode=control_mode,
             camera_name_mapping=camera_name_mapping,
@@ -552,7 +533,19 @@ def create_libero_envs(
 
     gym_kwargs = dict(gym_kwargs or {})
     task_ids_filter = gym_kwargs.pop("task_ids", None)  # optional: limit to specific tasks
+    init_state_values = gym_kwargs.pop("init_state_values", None)
+    init_state_values_by_task = gym_kwargs.pop("init_state_values_by_task", None)
     init_state_ids = gym_kwargs.pop("init_state_ids", None)
+    init_state_ids_by_task = gym_kwargs.pop("init_state_ids_by_task", None)
+    if init_state_values is not None:
+        init_state_values = _normalize_init_state_values(init_state_values, "init_state_values")
+        if len(init_state_values) < n_envs:
+            raise ValueError(
+                f"init_state_values must contain at least n_envs entries. "
+                f"Got len(init_state_values)={len(init_state_values)} and n_envs={n_envs}."
+            )
+    if init_state_values_by_task is not None:
+        init_state_values_by_task = dict(init_state_values_by_task)
     if init_state_ids is not None:
         init_state_ids = [int(idx) for idx in init_state_ids]
         if len(init_state_ids) < n_envs:
@@ -560,6 +553,8 @@ def create_libero_envs(
                 f"init_state_ids must contain at least n_envs entries. "
                 f"Got len(init_state_ids)={len(init_state_ids)} and n_envs={n_envs}."
             )
+    if init_state_ids_by_task is not None:
+        init_state_ids_by_task = dict(init_state_ids_by_task)
 
     camera_names = parse_camera_names(camera_name)
     suite_names = [s.strip() for s in str(task).split(",") if s.strip()]
@@ -571,6 +566,8 @@ def create_libero_envs(
     )
     if task_ids_filter is not None:
         print(f"Restricting to task_ids={task_ids_filter}")
+    if init_state_values is not None:
+        print(f"Using fixed LIBERO raw init_state_values count={len(init_state_values)}")
     if init_state_ids is not None:
         print(f"Using fixed LIBERO init_state_ids={init_state_ids}")
 
@@ -591,6 +588,31 @@ def create_libero_envs(
         cached_metadata: dict[str, Any] | None = None
 
         for tid in selected:
+            task_init_state_values = init_state_values
+            task_init_state_ids = init_state_ids
+            if init_state_values_by_task is not None:
+                value = _task_map_value(init_state_values_by_task, suite_name, tid)
+                if value is not None:
+                    task_init_state_values = _normalize_init_state_values(
+                        value, f"init_state_values_by_task[{suite_name}/{tid}]"
+                    )
+                    if len(task_init_state_values) < n_envs:
+                        raise ValueError(
+                            "init_state_values_by_task entries must contain at least n_envs values. "
+                            f"Got suite={suite_name} task_id={tid} "
+                            f"len={len(task_init_state_values)} n_envs={n_envs}."
+                        )
+                    task_init_state_ids = None
+            if init_state_ids_by_task is not None:
+                value = _task_map_value(init_state_ids_by_task, suite_name, tid)
+                if value is not None and task_init_state_values is None:
+                    task_init_state_ids = [int(idx) for idx in value]
+                    if len(task_init_state_ids) < n_envs:
+                        raise ValueError(
+                            "init_state_ids_by_task entries must contain at least n_envs values. "
+                            f"Got suite={suite_name} task_id={tid} "
+                            f"len={len(task_init_state_ids)} n_envs={n_envs}."
+                        )
             fns = _make_env_fns(
                 suite=suite,
                 episode_length=episode_length,
@@ -601,7 +623,8 @@ def create_libero_envs(
                 init_states=init_states,
                 gym_kwargs=gym_kwargs,
                 control_mode=control_mode,
-                init_state_ids=init_state_ids,
+                init_state_ids=task_init_state_ids,
+                init_state_values=task_init_state_values,
                 camera_name_mapping=camera_name_mapping,
                 is_libero_plus=is_libero_plus,
             )

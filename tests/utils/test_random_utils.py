@@ -123,3 +123,16 @@ def test_seeded_context(fixed_seed):
     assert seeded_val1 == seeded_val2
     assert all(a != b for a, b in zip(val1, seeded_val1, strict=True))  # changed inside the context
     assert all(a != b for a, b in zip(val2, seeded_val2, strict=True))  # changed again after exiting
+
+
+def test_seeded_context_restores_rng_after_exception(fixed_seed):
+    state = get_rng_state()
+    expected = (random.random(), np.random.rand(), torch.rand(1).item())
+    set_rng_state(state)
+
+    with pytest.raises(RuntimeError, match="test error"), seeded_context(1337):
+        _ = (random.random(), np.random.rand(), torch.rand(1).item())
+        raise RuntimeError("test error")
+
+    actual = (random.random(), np.random.rand(), torch.rand(1).item())
+    assert actual == expected

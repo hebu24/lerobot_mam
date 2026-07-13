@@ -18,7 +18,6 @@ class FrameLeRobotDataset(torch.utils.data.Dataset):
         n_obs_steps: int = 1,
         frame_gap: int = 1,
         image_names: list[str] | None = None,
-        task_description: str | None = None,
     ):
         self.meta = LeRobotDatasetMetadata(repo_id, root=root)
         self.n_obs_steps = int(n_obs_steps)
@@ -26,7 +25,7 @@ class FrameLeRobotDataset(torch.utils.data.Dataset):
         self.sequence_length = self.n_obs_steps + 1
         self.relative_indices = list(range(-self.n_obs_steps * self.frame_gap, 1, self.frame_gap))
         self.camera_keys = image_names or list(self.meta.camera_keys)
-        self.task_description = task_description
+        self.episode_rows = {int(row["episode_index"]): row for row in self.meta.episodes}
         delta_timestamps = {
             OBS_STATE: [i / self.meta.fps for i in self.relative_indices],
             **{key: [i / self.meta.fps for i in self.relative_indices] for key in self.camera_keys},
@@ -38,6 +37,20 @@ class FrameLeRobotDataset(torch.utils.data.Dataset):
             delta_timestamps=delta_timestamps,
             return_uint8=True,
         )
+
+    @staticmethod
+    def _task_from_item(item: dict[str, Any]) -> str:
+        task = item.get("task")
+        if isinstance(task, list):
+            if len(task) != 1:
+                raise ValueError(f"Expected one task string per STPM frame, got {task!r}.")
+            task = task[0]
+        if task is None or str(task).strip() == "":
+            raise ValueError(
+                "STPM training requires task descriptions in the dataset. "
+                "Populate meta/tasks.parquet and task_index before training."
+            )
+        return str(task)
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -60,20 +73,19 @@ class FrameLeRobotDataset(torch.utils.data.Dataset):
         image_frames = torch.stack([self._as_chw_sequence(item[key]) for key in self.camera_keys], dim=1)
         ep_idx = int(item["episode_index"])
         frame_idx = int(item["frame_index"])
-        ep = self.dataset.meta.episodes[ep_idx]
+        ep = self.episode_rows[ep_idx]
         ep_len = int(ep["length"])
         sampled = torch.tensor(
             [min(max(frame_idx + rel, 0), ep_len - 1) for rel in self.relative_indices],
             dtype=torch.float32,
         )
         targets = sampled / float(max(ep_len - 1, 1))
-        task = self.task_description if self.task_description is not None else item["task"]
         return {
             "image_frames": image_frames,
             "state": state,
             "targets": targets,
             "lengths": torch.tensor(self.sequence_length, dtype=torch.long),
-            "task": task,
+            "task": self._task_from_item(item),
             "episode_index": ep_idx,
             "anchor_index": frame_idx,
         }

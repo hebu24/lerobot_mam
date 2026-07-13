@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import shutil
+from collections.abc import Iterable
 from pathlib import Path
 
 from torch.optim import Optimizer
@@ -78,18 +79,22 @@ def update_best_checkpoint(checkpoint_dir: Path) -> Path:
     return best_checkpoint_dir
 
 
-def prune_checkpoints(checkpoints_dir: Path, keep_checkpoint_dir: Path | None) -> None:
+def prune_checkpoints_keep(checkpoints_dir: Path, keep_checkpoint_dirs: Iterable[Path | None]) -> None:
     if not checkpoints_dir.exists():
         return
 
-    keep_name = keep_checkpoint_dir.name if keep_checkpoint_dir is not None else None
+    keep_names = {checkpoint_dir.name for checkpoint_dir in keep_checkpoint_dirs if checkpoint_dir is not None}
     for child in checkpoints_dir.iterdir():
-        if child.name in {LAST_CHECKPOINT_LINK, "best", keep_name}:
+        if child.name in {LAST_CHECKPOINT_LINK, "best"} or child.name in keep_names:
             continue
         if child.is_symlink() or child.is_file():
             child.unlink()
         elif child.is_dir():
             shutil.rmtree(child)
+
+
+def prune_checkpoints(checkpoints_dir: Path, keep_checkpoint_dir: Path | None) -> None:
+    prune_checkpoints_keep(checkpoints_dir, keep_checkpoint_dirs=[keep_checkpoint_dir])
 
 
 def save_checkpoint(

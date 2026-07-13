@@ -34,10 +34,26 @@ from lerobot.utils.import_utils import _transformers_available, require_package
 from ..pretrained import PreTrainedPolicy
 from .configuration_eo1 import EO1Config
 
-if TYPE_CHECKING or _transformers_available:
+
+def _torch_compilable_check_fallback(
+    cond: Any, msg: Any, error_type: type[Exception] = ValueError
+) -> None:
+    if not cond:
+        raise error_type(msg() if callable(msg) else msg)
+
+
+if TYPE_CHECKING:
     from transformers.activations import ACT2FN
     from transformers.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
     from transformers.utils import torch_compilable_check
+elif _transformers_available:
+    from transformers.activations import ACT2FN
+    from transformers.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
+
+    try:
+        from transformers.utils import torch_compilable_check
+    except ImportError:
+        torch_compilable_check = _torch_compilable_check_fallback
 else:
     ACT2FN = None
     Qwen2_5_VLForConditionalGeneration = None

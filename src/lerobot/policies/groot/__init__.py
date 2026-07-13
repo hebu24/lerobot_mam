@@ -15,7 +15,17 @@
 # limitations under the License.
 
 from .configuration_groot import GrootConfig
-from .modeling_groot import GrootPolicy
-from .processor_groot import make_groot_pre_post_processors
+
+
+def __getattr__(name: str):
+    if name == "GrootPolicy":
+        from .modeling_groot import GrootPolicy
+
+        return GrootPolicy
+    if name == "make_groot_pre_post_processors":
+        from .processor_groot import make_groot_pre_post_processors
+
+        return make_groot_pre_post_processors
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = ["GrootConfig", "GrootPolicy", "make_groot_pre_post_processors"]

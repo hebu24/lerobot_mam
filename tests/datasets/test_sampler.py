@@ -114,6 +114,27 @@ def test_shuffle():
     assert set(sampler) == {0, 1, 2, 3, 4, 5}
 
 
+def test_balance_episodes_repeats_shorter_episode_without_changing_default():
+    default_sampler = EpisodeAwareSampler([0, 2], [2, 7], shuffle=False)
+    assert list(default_sampler) == [0, 1, 2, 3, 4, 5, 6]
+    assert len(default_sampler) == 7
+
+    balanced_sampler = EpisodeAwareSampler([0, 2], [2, 7], shuffle=False, balance_episodes=True)
+    assert list(balanced_sampler) == [0, 1, 0, 1, 0, 2, 3, 4, 5, 6]
+    assert len(balanced_sampler) == 10
+
+
+def test_balance_episodes_shuffle_preserves_equal_counts_and_coverage():
+    torch.manual_seed(0)
+    sampler = EpisodeAwareSampler([0, 3], [3, 8], shuffle=True, balance_episodes=True)
+    sampled_indices = list(sampler)
+
+    assert len(sampled_indices) == 10
+    assert sum(index < 3 for index in sampled_indices) == 5
+    assert sum(index >= 3 for index in sampled_indices) == 5
+    assert set(sampled_indices) == set(range(8))
+
+
 def test_negative_drop_first_frames_raises():
     with pytest.raises(ValueError, match="drop_n_first_frames must be >= 0"):
         EpisodeAwareSampler([0], [10], drop_n_first_frames=-1)

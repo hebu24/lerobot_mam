@@ -67,6 +67,11 @@ class WandBConfig:
 @dataclass
 class EvalConfig:
     n_episodes: int = 50
+    # Optional fixed evaluation dataset. For LIBERO, only episode metadata is
+    # loaded; each task is reset to the recorded init states from this split.
+    dataset_repo_id: str | None = None
+    dataset_root: str | None = None
+    dataset_episodes: list[int] | None = None
     # `batch_size` specifies the number of environments to use in a gym.vector.VectorEnv.
     # Set to 0 for auto-tuning based on available CPU cores and n_episodes.
     batch_size: int = 0
@@ -75,6 +80,11 @@ class EvalConfig:
     use_async_envs: bool = True
 
     def __post_init__(self) -> None:
+        if self.dataset_episodes is not None:
+            if any(episode < 0 for episode in self.dataset_episodes):
+                raise ValueError("eval.dataset_episodes must contain non-negative indices.")
+            if len(self.dataset_episodes) != len(set(self.dataset_episodes)):
+                raise ValueError("eval.dataset_episodes must not contain duplicates.")
         if self.batch_size == 0:
             self.batch_size = self._auto_batch_size()
         if self.batch_size > self.n_episodes:

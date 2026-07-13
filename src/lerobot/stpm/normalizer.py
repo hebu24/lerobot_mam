@@ -11,7 +11,7 @@ class StateNormalizer:
         self.mean = mean
         self.std = std.clamp_min(1e-6)
 
-    def to(self, device: torch.device | str) -> "StateNormalizer":
+    def to(self, device: torch.device | str) -> StateNormalizer:
         self.mean = self.mean.to(device)
         self.std = self.std.to(device)
         return self

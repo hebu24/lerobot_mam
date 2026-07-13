@@ -37,14 +37,17 @@ class LiberoProcessorStep(ObservationProcessorStep):
         gripper, and joint information.
     -   Extracts and concatenates:
         - End-effector position (3D)
-        - End-effector quaternion converted to axis-angle (3D)
-        - Gripper joint positions (2D)
+        - End-effector quaternion (4D)
+        - Arm joint positions (7D)
     -   Maps the concatenated state to `"observation.state"`.
 
     **Image Processing:**
-    -   Rotates images by 180 degrees by flipping both height and width dimensions.
-    -   This accounts for the HuggingFaceVLA/libero camera orientation convention.
+    -   Optionally rotates images by 180 degrees by flipping both height and width dimensions.
+    -   Some legacy HuggingFaceVLA/LIBERO assets used the flipped convention, but LeRobot-converted
+        LIBERO HDF5 datasets are stored in the raw simulator orientation.
     """
+
+    flip_images: bool = False
 
     def _process_observation(self, observation):
         """
@@ -55,8 +58,9 @@ class LiberoProcessorStep(ObservationProcessorStep):
             if key.startswith(f"{OBS_IMAGES}."):
                 img = processed_obs[key]
 
-                # Flip both H and W
-                img = torch.flip(img, dims=[2, 3])
+                if self.flip_images:
+                    # Flip both H and W for legacy datasets/checkpoints that were trained this way.
+                    img = torch.flip(img, dims=[2, 3])
 
                 processed_obs[key] = img
         # Process robot_state into a flat state vector
@@ -67,15 +71,17 @@ class LiberoProcessorStep(ObservationProcessorStep):
             # Extract components
             eef_pos = robot_state["eef"]["pos"]  # (B, 3,)
             eef_quat = robot_state["eef"]["quat"]  # (B, 4,)
-            gripper_qpos = robot_state["gripper"]["qpos"]  # (B, 2,)
+            joints_pos = robot_state["joints"]["pos"]  # (B, 7,)
 
-            # Convert quaternion to axis-angle
-            eef_axisangle = self._quat2axisangle(eef_quat)  # (B, 3)
-            # Concatenate into a single state vector
-            state = torch.cat((eef_pos, eef_axisangle, gripper_qpos), dim=-1)
+            if eef_pos.shape[-1] != 3 or eef_quat.shape[-1] != 4 or joints_pos.shape[-1] != 7:
+                raise ValueError(
+                    "Expected LIBERO state components eef_pos(3), eef_quat(4), joints_pos(7); "
+                    f"got {tuple(eef_pos.shape)}, {tuple(eef_quat.shape)}, {tuple(joints_pos.shape)}."
+                )
 
-            # ensure float32
-            state = state.float()
+            eef_quat = eef_quat.to(dtype=torch.float32)
+            eef_quat = eef_quat / eef_quat.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            state = torch.cat((eef_pos, eef_quat, joints_pos), dim=-1).float()
             if state.dim() == 1:
                 state = state.unsqueeze(0)
 
@@ -101,7 +107,7 @@ class LiberoProcessorStep(ObservationProcessorStep):
         # add our new flattened state
         state_feats[OBS_STATE] = PolicyFeature(
             type=FeatureType.STATE,
-            shape=(8,),  # [eef_pos(3), axis_angle(3), gripper(2)]
+            shape=(14,),  # [eef_pos(3), quat(4), joint_pos(7)]
         )
 
         new_features[FeatureType.STATE] = state_feats

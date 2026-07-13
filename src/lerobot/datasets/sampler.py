@@ -30,6 +30,7 @@ class EpisodeAwareSampler:
         drop_n_first_frames: int = 0,
         drop_n_last_frames: int = 0,
         shuffle: bool = False,
+        balance_episodes: bool = False,
     ):
         """Sampler that optionally incorporates episode boundary information.
 
@@ -41,6 +42,10 @@ class EpisodeAwareSampler:
             drop_n_first_frames: Number of frames to drop from the start of each episode.
             drop_n_last_frames: Number of frames to drop from the end of each episode.
             shuffle: Whether to shuffle the indices.
+            balance_episodes: Whether to give every retained episode the same number of samples. Shorter
+                episodes are repeated up to the length of the longest retained episode. This is useful when
+                episode-level metrics should weight episodes equally; it defaults to ``False`` so normal
+                transition-balanced training is unchanged.
         """
         if drop_n_first_frames < 0:
             raise ValueError(f"drop_n_first_frames must be >= 0, got {drop_n_first_frames}")
@@ -48,6 +53,7 @@ class EpisodeAwareSampler:
             raise ValueError(f"drop_n_last_frames must be >= 0, got {drop_n_last_frames}")
 
         indices = []
+        episode_indices: list[list[int]] = []
         for episode_idx, (start_index, end_index) in enumerate(
             zip(dataset_from_indices, dataset_to_indices, strict=True)
         ):
@@ -63,7 +69,11 @@ class EpisodeAwareSampler:
                         drop_n_last_frames,
                     )
                     continue
-                indices.extend(range(start_index + drop_n_first_frames, end_index - drop_n_last_frames))
+                retained_indices = list(
+                    range(start_index + drop_n_first_frames, end_index - drop_n_last_frames)
+                )
+                episode_indices.append(retained_indices)
+                indices.extend(retained_indices)
 
         if not indices:
             raise ValueError(
@@ -72,9 +82,36 @@ class EpisodeAwareSampler:
             )
 
         self.indices = indices
+        self.episode_indices = episode_indices
         self.shuffle = shuffle
+        self.balance_episodes = balance_episodes
+        self._balanced_episode_length = max(len(indices) for indices in episode_indices)
+
+    def _repeat_episode_indices(self, indices: list[int]) -> list[int]:
+        """Repeat one episode to the balanced length, reshuffling each pass when requested."""
+        repeated: list[int] = []
+        while len(repeated) < self._balanced_episode_length:
+            if self.shuffle:
+                order = torch.randperm(len(indices)).tolist()
+                repeated.extend(indices[i] for i in order)
+            else:
+                repeated.extend(indices)
+        return repeated[: self._balanced_episode_length]
 
     def __iter__(self) -> Iterator[int]:
+        if self.balance_episodes:
+            indices = [
+                index
+                for episode_indices in self.episode_indices
+                for index in self._repeat_episode_indices(episode_indices)
+            ]
+            if self.shuffle:
+                for i in torch.randperm(len(indices)):
+                    yield indices[i]
+            else:
+                yield from indices
+            return
+
         if self.shuffle:
             for i in torch.randperm(len(self.indices)):
                 yield self.indices[i]
@@ -83,4 +120,6 @@ class EpisodeAwareSampler:
                 yield i
 
     def __len__(self) -> int:
+        if self.balance_episodes:
+            return self._balanced_episode_length * len(self.episode_indices)
         return len(self.indices)

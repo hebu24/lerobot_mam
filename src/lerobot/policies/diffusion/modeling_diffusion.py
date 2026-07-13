@@ -23,7 +23,7 @@ TODO(alexander-soare):
 import math
 from collections import deque
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import einops
 import numpy as np
@@ -50,6 +50,8 @@ from ..utils import (
     populate_queues,
 )
 from .configuration_diffusion import DiffusionConfig
+
+TASK_KEY = "task"
 
 
 class DiffusionPolicy(PreTrainedPolicy):
@@ -103,8 +105,10 @@ class DiffusionPolicy(PreTrainedPolicy):
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         # stack n latest observations from the queue
-        batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
-        actions = self.diffusion.generate_actions(batch, noise=noise)
+        queued = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
+        if self.config.use_language_conditioning and TASK_KEY in batch:
+            queued[TASK_KEY] = batch[TASK_KEY]
+        actions = self.diffusion.generate_actions(queued, noise=noise)
 
         return actions
 
@@ -186,6 +190,89 @@ def _make_noise_scheduler(name: str, **kwargs: dict):
         raise ValueError(f"Unsupported noise scheduler type {name}")
 
 
+def _normalize_task_batch(tasks: Any, batch_size: int) -> list[str]:
+    if tasks is None:
+        return [""] * batch_size
+    if isinstance(tasks, str):
+        return [tasks] * batch_size
+    if isinstance(tasks, tuple):
+        tasks = list(tasks)
+    if isinstance(tasks, list):
+        if len(tasks) == 0:
+            return [""] * batch_size
+        if len(tasks) == 1 and batch_size != 1:
+            tasks = tasks * batch_size
+        if len(tasks) != batch_size:
+            raise ValueError(f"Expected {batch_size} task strings, got {len(tasks)}.")
+        return [str(task) for task in tasks]
+    return [str(tasks)] * batch_size
+
+
+class TinyTransformerTextEncoder(nn.Module):
+    """LPB-style trainable text encoder fed by CLIP tokenizer ids."""
+
+    def __init__(self, config: DiffusionConfig):
+        super().__init__()
+        self.seq_len = config.language_seq_len
+        self.embedding = nn.Embedding(
+            config.language_vocab_size,
+            config.language_embed_dim,
+            padding_idx=0,
+        )
+        self.pos_embedding = nn.Parameter(torch.randn(1, config.language_seq_len, config.language_embed_dim))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.language_embed_dim,
+            nhead=config.language_num_heads,
+            dim_feedforward=config.language_embed_dim * 2,
+            dropout=config.language_dropout,
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=config.language_num_layers)
+        self.output_proj = nn.Linear(config.language_embed_dim, config.language_output_dim)
+
+    def forward(self, text_tokens: dict[str, Tensor]) -> Tensor:
+        input_ids = text_tokens["input_ids"]
+        attention_mask = text_tokens["attention_mask"]
+        if input_ids.shape[1] != self.seq_len:
+            raise ValueError(f"Expected token length {self.seq_len}, got {input_ids.shape[1]}.")
+
+        x = self.embedding(input_ids)
+        x = x + self.pos_embedding
+        x = self.transformer(x, src_key_padding_mask=(attention_mask == 0))
+        mask = attention_mask.to(dtype=x.dtype).unsqueeze(-1)
+        pooled = (x * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+        return self.output_proj(pooled)
+
+
+class DiffusionLanguageEncoder(nn.Module):
+    """Tokenize task strings and encode them with LPB's TinyTransformerTextEncoder."""
+
+    def __init__(self, config: DiffusionConfig):
+        super().__init__()
+        require_package("transformers", extra="transformers-dep")
+        from transformers import AutoTokenizer
+
+        self.seq_len = config.language_seq_len
+        self.tokenizer = AutoTokenizer.from_pretrained(config.language_tokenizer_name, use_fast=False)
+        self.text_model = TinyTransformerTextEncoder(config)
+
+    def forward(self, tasks: Any, batch_size: int, *, device: torch.device, dtype: torch.dtype) -> Tensor:
+        task_strings = _normalize_task_batch(tasks, batch_size)
+        text_tokens = self.tokenizer(
+            task_strings,
+            padding="max_length",
+            max_length=self.seq_len,
+            truncation=True,
+            return_tensors="pt",
+        )
+        text_tokens = {
+            key: value.to(device=device)
+            for key, value in text_tokens.items()
+            if key in {"input_ids", "attention_mask"}
+        }
+        return self.text_model(text_tokens).to(device=device, dtype=dtype)
+
+
 class DiffusionModel(nn.Module):
     def __init__(self, config: DiffusionConfig):
         super().__init__()
@@ -205,7 +292,12 @@ class DiffusionModel(nn.Module):
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
 
-        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
+        self.language_encoder = DiffusionLanguageEncoder(config) if config.use_language_conditioning else None
+        unet_global_cond_dim = global_cond_dim * config.n_obs_steps
+        if self.language_encoder is not None:
+            unet_global_cond_dim += config.language_output_dim
+
+        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=unet_global_cond_dim)
 
         if config.compile_model:
             # Compile the U-Net. "reduce-overhead" is preferred for the small-batch repetitive loops
@@ -300,8 +392,17 @@ class DiffusionModel(nn.Module):
         if self.config.env_state_feature:
             global_cond_feats.append(batch[OBS_ENV_STATE])
 
-        # Concatenate features then flatten to (B, global_cond_dim).
-        return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
+        # Concatenate observation features, flatten them, then append one task embedding per batch item.
+        global_cond = torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
+        if self.language_encoder is not None:
+            language_cond = self.language_encoder(
+                batch.get(TASK_KEY),
+                batch_size,
+                device=global_cond.device,
+                dtype=global_cond.dtype,
+            )
+            global_cond = torch.cat((global_cond, language_cond), dim=-1)
+        return global_cond
 
     def generate_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """

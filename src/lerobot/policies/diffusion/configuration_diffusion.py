@@ -93,6 +93,8 @@ class DiffusionConfig(PreTrainedConfig):
         clip_sample_range: The magnitude of the clipping range as described above.
         num_inference_steps: Number of reverse diffusion steps to use at inference time (steps are evenly
             spaced). If not provided, this defaults to be the same as `num_train_timesteps`.
+        use_language_conditioning: Whether to append LPB-style TinyTransformer task-language features to the
+            flattened observation conditioning.
         do_mask_loss_for_padding: Whether to mask the loss when there are copy-padded actions. See
             `LeRobotDataset` and `load_previous_and_future_frames` for more information. Note, this defaults
             to False as the original Diffusion Policy implementation does the same.
@@ -100,8 +102,8 @@ class DiffusionConfig(PreTrainedConfig):
 
     # Inputs / output structure.
     n_obs_steps: int = 2
-    horizon: int = 64
-    n_action_steps: int = 32
+    horizon: int = 32
+    n_action_steps: int = 15
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -113,7 +115,7 @@ class DiffusionConfig(PreTrainedConfig):
 
     # The original implementation doesn't sample frames for the last 7 steps,
     # which avoids excessive padding and leads to improved training results.
-    drop_n_last_frames: int = 7  # horizon - n_action_steps - n_obs_steps + 1
+    drop_n_last_frames: int = 7
 
     # Architecture / modeling.
     # Vision backbone.
@@ -132,6 +134,16 @@ class DiffusionConfig(PreTrainedConfig):
     n_groups: int = 8
     diffusion_step_embed_dim: int = 128
     use_film_scale_modulation: bool = True
+    # LPB-style language conditioning.
+    use_language_conditioning: bool = False
+    language_tokenizer_name: str = "openai/clip-vit-base-patch32"
+    language_seq_len: int = 30
+    language_vocab_size: int = 49408
+    language_embed_dim: int = 64
+    language_output_dim: int = 32
+    language_num_layers: int = 1
+    language_num_heads: int = 2
+    language_dropout: float = 0.1
     # Noise scheduler.
     noise_scheduler_type: str = "DDPM"
     num_train_timesteps: int = 100
@@ -203,6 +215,27 @@ class DiffusionConfig(PreTrainedConfig):
                 self.crop_shape = None
         if self.crop_shape is not None and (self.crop_shape[0] <= 0 or self.crop_shape[1] <= 0):
             raise ValueError(f"`crop_shape` must have positive dimensions. Got {self.crop_shape}.")
+
+        if self.use_language_conditioning:
+            if self.language_seq_len <= 0:
+                raise ValueError(f"`language_seq_len` must be positive. Got {self.language_seq_len}.")
+            if self.language_vocab_size <= 0:
+                raise ValueError(f"`language_vocab_size` must be positive. Got {self.language_vocab_size}.")
+            if self.language_embed_dim <= 0:
+                raise ValueError(f"`language_embed_dim` must be positive. Got {self.language_embed_dim}.")
+            if self.language_output_dim <= 0:
+                raise ValueError(f"`language_output_dim` must be positive. Got {self.language_output_dim}.")
+            if self.language_num_layers <= 0:
+                raise ValueError(
+                    f"`language_num_layers` must be positive. Got {self.language_num_layers}."
+                )
+            if self.language_num_heads <= 0:
+                raise ValueError(f"`language_num_heads` must be positive. Got {self.language_num_heads}.")
+            if self.language_embed_dim % self.language_num_heads != 0:
+                raise ValueError(
+                    "`language_embed_dim` must be divisible by `language_num_heads`. "
+                    f"Got {self.language_embed_dim=} and {self.language_num_heads=}."
+                )
 
         # Check that the horizon size and U-Net downsampling is compatible.
         # U-Net downsamples by 2 with each stage.

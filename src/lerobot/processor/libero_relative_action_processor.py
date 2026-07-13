@@ -24,12 +24,21 @@ from torch import Tensor
 
 from lerobot.configs import PipelineFeatureType, PolicyFeature
 from lerobot.types import EnvTransition, TransitionKey
-from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.constants import OBS_STATE
 
 from .pipeline import ProcessorStep, ProcessorStepRegistry
 
 LIBERO_DELTA_POS_SCALE = 0.05
 LIBERO_DELTA_ROT_SCALE = 0.5
+
+# The LIBERO state quaternion describes the Panda ``right_hand`` body, while
+# OSC_POSE controls the gripper ``grip_site``. The latter is rotated -90 degrees
+# around the body's z axis in the Panda gripper MJCF.
+LIBERO_EEF_BODY_TO_CONTROLLER_ROTATION = (
+    (0.0, 1.0, 0.0),
+    (-1.0, 0.0, 0.0),
+    (0.0, 0.0, 1.0),
+)
 
 
 def _to_tensor(value: Tensor | np.ndarray, *, like: Tensor | None = None) -> Tensor:
@@ -92,21 +101,52 @@ def axis_angle_to_matrix(axis_angle: Tensor | np.ndarray) -> Tensor | np.ndarray
 
 
 def _matrix_to_quaternion(matrix: Tensor) -> Tensor:
+    if matrix.shape[-2:] != (3, 3):
+        raise ValueError(f"Expected rotation matrices with shape (..., 3, 3), got {tuple(matrix.shape)}.")
+
     m = matrix
     m00, m01, m02 = m[..., 0, 0], m[..., 0, 1], m[..., 0, 2]
     m10, m11, m12 = m[..., 1, 0], m[..., 1, 1], m[..., 1, 2]
     m20, m21, m22 = m[..., 2, 0], m[..., 2, 1], m[..., 2, 2]
 
-    qw = 0.5 * torch.sqrt((1 + m00 + m11 + m22).clamp_min(0))
-    qx = 0.5 * torch.sqrt((1 + m00 - m11 - m22).clamp_min(0))
-    qy = 0.5 * torch.sqrt((1 - m00 + m11 - m22).clamp_min(0))
-    qz = 0.5 * torch.sqrt((1 - m00 - m11 + m22).clamp_min(0))
-
-    qx = torch.copysign(qx, m21 - m12)
-    qy = torch.copysign(qy, m02 - m20)
-    qz = torch.copysign(qz, m10 - m01)
-    quat = torch.stack((qx, qy, qz, qw), dim=-1)
+    # Build one quaternion candidate for each possible largest component, then
+    # select the best-conditioned candidate. Independent copysign recovery is
+    # ambiguous when the angle is near pi because all antisymmetric terms can
+    # be close to zero.
+    q_abs = torch.sqrt(
+        torch.stack(
+            (
+                1 + m00 + m11 + m22,
+                1 + m00 - m11 - m22,
+                1 - m00 + m11 - m22,
+                1 - m00 - m11 + m22,
+            ),
+            dim=-1,
+        ).clamp_min(0)
+    )
+    quat_by_wxyz = torch.stack(
+        (
+            torch.stack((q_abs[..., 0].square(), m21 - m12, m02 - m20, m10 - m01), dim=-1),
+            torch.stack((m21 - m12, q_abs[..., 1].square(), m10 + m01, m02 + m20), dim=-1),
+            torch.stack((m02 - m20, m10 + m01, q_abs[..., 2].square(), m12 + m21), dim=-1),
+            torch.stack((m10 - m01, m20 + m02, m21 + m12, q_abs[..., 3].square()), dim=-1),
+        ),
+        dim=-2,
+    )
+    candidates = quat_by_wxyz / (2.0 * q_abs.clamp_min(0.1).unsqueeze(-1))
+    best = q_abs.argmax(dim=-1)
+    best = best[..., None, None].expand(*best.shape, 1, 4)
+    quat_wxyz = candidates.gather(dim=-2, index=best).squeeze(-2)
+    quat = quat_wxyz[..., (1, 2, 3, 0)]
     return quat / quat.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def eef_body_quaternion_to_controller_matrix(quat: Tensor | np.ndarray) -> Tensor | np.ndarray:
+    """Convert a LIBERO EEF body quaternion (xyzw) to the OSC controller frame."""
+    quaternion = _to_tensor(quat)
+    body_matrix = _quaternion_to_matrix(quaternion)
+    body_to_controller = body_matrix.new_tensor(LIBERO_EEF_BODY_TO_CONTROLLER_ROTATION)
+    return _maybe_numpy(body_matrix @ body_to_controller, quat)
 
 
 def matrix_to_axis_angle(matrix: Tensor | np.ndarray) -> Tensor | np.ndarray:
@@ -141,6 +181,18 @@ def _broadcast_anchor_vector(actions: Tensor, anchor: Tensor) -> Tensor:
     raise ValueError(
         f"Cannot broadcast anchor with shape {tuple(anchor.shape)} to actions with shape {tuple(actions.shape)}"
     )
+
+
+def _anchor_rotation_matrix(anchor: Tensor) -> Tensor:
+    if anchor.shape[-1] >= 14:
+        controller_matrix = eef_body_quaternion_to_controller_matrix(anchor[..., 3:7])
+        if not isinstance(controller_matrix, Tensor):
+            raise TypeError("Tensor anchor unexpectedly produced a NumPy controller matrix.")
+        return controller_matrix
+    start_mat = axis_angle_to_matrix(anchor[..., 3:6])
+    if not isinstance(start_mat, Tensor):
+        start_mat = torch.as_tensor(start_mat, device=anchor.device, dtype=anchor.dtype)
+    return start_mat
 
 
 def delta_to_absolute_action(
@@ -181,11 +233,9 @@ def absolute_to_chunk_relative(
     rel_pos = actions[..., :3] - anchor_pos
 
     abs_mat = axis_angle_to_matrix(actions[..., 3:6])
-    start_mat = axis_angle_to_matrix(anchor[..., 3:6])
+    start_mat = _anchor_rotation_matrix(anchor)
     if not isinstance(abs_mat, Tensor):
         abs_mat = torch.as_tensor(abs_mat, device=actions.device, dtype=actions.dtype)
-    if not isinstance(start_mat, Tensor):
-        start_mat = torch.as_tensor(start_mat, device=actions.device, dtype=actions.dtype)
     start_mat = _broadcast_anchor_matrix(abs_mat, start_mat)
     rel_axis_angle = matrix_to_axis_angle(abs_mat @ start_mat.transpose(-1, -2))
     if not isinstance(rel_axis_angle, Tensor):
@@ -211,11 +261,9 @@ def chunk_relative_to_absolute(
     abs_pos = actions[..., :3] + anchor_pos
 
     rel_mat = axis_angle_to_matrix(actions[..., 3:6])
-    start_mat = axis_angle_to_matrix(anchor[..., 3:6])
+    start_mat = _anchor_rotation_matrix(anchor)
     if not isinstance(rel_mat, Tensor):
         rel_mat = torch.as_tensor(rel_mat, device=actions.device, dtype=actions.dtype)
-    if not isinstance(start_mat, Tensor):
-        start_mat = torch.as_tensor(start_mat, device=actions.device, dtype=actions.dtype)
     start_mat = _broadcast_anchor_matrix(rel_mat, start_mat)
     abs_axis_angle = matrix_to_axis_angle(rel_mat @ start_mat)
     if not isinstance(abs_axis_angle, Tensor):

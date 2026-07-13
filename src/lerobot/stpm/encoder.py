@@ -47,8 +47,17 @@ class STPMEncoder(nn.Module):
         ).to(self.device)
         ckpt = torch.load(ckpt_path, map_location=self.device)
         self.reward_model.load_state_dict(ckpt["model"])
+        state_norm_path = Path(self.cfg["state_norm_path"])
+        if not state_norm_path.is_absolute():
+            config_relative = self.config_path.parent / state_norm_path
+            if config_relative.exists():
+                state_norm_path = config_relative
+            else:
+                sibling = self.config_path.parent / state_norm_path.name
+                if sibling.exists():
+                    state_norm_path = sibling
         self.state_normalizer = load_state_normalizer(
-            self.cfg["state_norm_path"],
+            state_norm_path,
             self.device,
             state_dim=self.state_dim,
         )
@@ -76,9 +85,7 @@ class STPMEncoder(nn.Module):
             actual_hw = (int(rgbd.shape[-2]), int(rgbd.shape[-1]))
             for camera_name, camera_hw in zip(self.camera_names, expected_hw, strict=True):
                 if camera_hw != actual_hw:
-                    raise ValueError(
-                        f"Camera '{camera_name}' expected image HW={camera_hw}, got {actual_hw}"
-                    )
+                    raise ValueError(f"Camera '{camera_name}' expected image HW={camera_hw}, got {actual_hw}")
         if tasks is None:
             task_list = [self.task_description] * b
         elif isinstance(tasks, str):
@@ -87,8 +94,7 @@ class STPMEncoder(nn.Module):
             task_list = list(tasks)
         if self.task_description and any(str(task) != self.task_description for task in task_list):
             raise ValueError(
-                "STPM task description mismatch: "
-                f"expected {self.task_description!r}, got {task_list}"
+                f"STPM task description mismatch: expected {self.task_description!r}, got {task_list}"
             )
         rgb = rgbd[:, :, :, :3].to(self.device)
         flat = rgb.permute(2, 0, 1, 3, 4, 5).reshape(n * b * t, 3, rgb.shape[-2], rgb.shape[-1])
