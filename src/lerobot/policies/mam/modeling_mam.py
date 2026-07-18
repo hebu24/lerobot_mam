@@ -17,6 +17,7 @@ from lerobot.policies.diffusion.modeling_diffusion import (
 )
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import populate_queues
+from lerobot.processor.libero_relative_action_processor import slice_current_action_window
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from lerobot.utils.import_utils import require_package
 
@@ -472,6 +473,11 @@ class MamPolicy(PreTrainedPolicy):
         batch = self.update_observation_queue(batch)
         if len(self._queues[ACTION]) == 0:
             actions = self.predict_action_chunk(batch, noise=noise)
+            actions = slice_current_action_window(
+                actions,
+                n_obs_steps=self.config.n_obs_steps,
+                n_action_steps=self.config.n_action_steps,
+            )
             self._queues[ACTION].extend(actions.transpose(0, 1))
         return self._queues[ACTION].popleft()
 

@@ -17,6 +17,7 @@
 import json
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from lerobot.scripts.lerobot_train import (
@@ -107,6 +108,80 @@ def test_mam_relative_stats_replace_raw_overfit_action_stats(monkeypatch):
             "num_workers": 3,
         }
     ]
+
+
+def test_normal_v3_training_reuses_certified_relative_stats(tmp_path, monkeypatch):
+    root = tmp_path / "dataset"
+    (root / "meta").mkdir(parents=True)
+    (root / "meta" / "libero_pipeline.json").write_text(
+        json.dumps(
+            {
+                "relative_action_stats": True,
+                "relative_action_stats_action_delta_indices": [-1, 0, 1],
+            }
+        )
+    )
+    action_stats = {
+        key: torch.zeros(7) for key in ("mean", "std", "min", "max", "q01", "q99")
+    }
+    dataset = SimpleNamespace(
+        root=root,
+        hf_dataset=object(),
+        meta=SimpleNamespace(
+            root=root,
+            features={ACTION: {"dtype": "float32"}, OBS_STATE: {"dtype": "float32"}},
+            stats={ACTION: action_stats},
+        ),
+    )
+    cfg = SimpleNamespace(
+        overfit_test=False,
+        num_workers=0,
+        trainable_config=SimpleNamespace(
+            type="diffusion",
+            action_delta_indices=[-1, 0, 1],
+            use_relative_actions=True,
+        ),
+    )
+    monkeypatch.setattr(
+        "lerobot.datasets.compute_stats.compute_libero_relative_action_stats",
+        lambda **_: pytest.fail("certified stats must not be recomputed"),
+    )
+
+    apply_diffusion_relative_action_stats(cfg, dataset)
+
+    assert dataset.meta.stats[ACTION] is action_stats
+
+
+def test_certified_relative_stats_reject_policy_horizon_mismatch(tmp_path):
+    root = tmp_path / "dataset"
+    (root / "meta").mkdir(parents=True)
+    (root / "meta" / "libero_pipeline.json").write_text(
+        json.dumps(
+            {
+                "relative_action_stats": True,
+                "relative_action_stats_action_delta_indices": [-1, 0, 1],
+            }
+        )
+    )
+    dataset = SimpleNamespace(
+        root=root,
+        meta=SimpleNamespace(
+            root=root,
+            features={ACTION: {}, OBS_STATE: {}},
+            stats={ACTION: {}},
+        ),
+    )
+    cfg = SimpleNamespace(
+        overfit_test=False,
+        trainable_config=SimpleNamespace(
+            type="diffusion",
+            action_delta_indices=[-1, 0, 1, 2],
+            use_relative_actions=True,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="do not match the policy horizon"):
+        apply_diffusion_relative_action_stats(cfg, dataset)
 
 
 def test_resume_trims_future_logs_and_restores_best_eval(tmp_path):

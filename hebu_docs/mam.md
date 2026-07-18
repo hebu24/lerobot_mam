@@ -12,7 +12,8 @@
 
 ```text
 官方 delta action
-  -> 在原 demo XML/状态中 replay，保存 absolute OSC controller goal
+  -> 在原 demo XML/状态中计算 absolute OSC controller goal
+  -> 用 absolute controller 闭环 replay，并重新物化同一 rollout 的 RGB/state/action
   -> 按最新 14D state 建立整段 action chunk 的 anchor
   -> position: p_rel = p_abs - p_anchor
   -> rotation: R_rel = R_abs @ R_anchor.T
@@ -26,6 +27,7 @@
 ```
 
 - 14D state 的 quaternion 描述 Panda `right_hand` body，而 OSC 控制 `grip_site`。anchor rotation 已统一右乘 `Rz(-pi/2)` 转到 controller frame。
+- relative 训练数据必须同时声明 `observation_materialization=closed_loop_absolute_controller` 和 `relative_action_ready=true`。只替换 action 列、仍保留 delta-controller observation 的旧 v3 数据禁止训练。
 - relative stats 按训练时真实的 action delta indices 重算，并在 overfit subset 之后重算，禁止沿用 absolute stats。
 - rollout 只在 action queue 为空时预测并转换整段 chunk，不能逐步重新 anchor。
 - 固定评估从独立 eval dataset metadata 读取每个 task 的原始 `libero/init_state`。DP 的 `eval.n_episodes=5` 表示每 task 5 个。
@@ -62,7 +64,7 @@ absolute action + 完整 absolute MAS + 独立 binary mask + progress
 bash scripts/run_diffusion_libero10_v3_overfit.sh 3
 ```
 
-也可用 `K=5 bash scripts/run_diffusion_libero10_v3_overfit.sh`。该入口固定 `policy.use_relative_actions=true` 和 `env.control_mode=absolute`，且启动前校验 v3 manifest、数据 schema、source identity 以及 CUDA。
+也可用 `K=5 bash scripts/run_diffusion_libero10_v3_overfit.sh`。该入口固定 `policy.use_relative_actions=true` 和 `env.control_mode=absolute`，默认训练 20000 steps；启动前会校验 v3 manifest、数据 schema、source identity、CUDA，并对所有选中 trajectory 运行 `1/4/n_action_steps/full` 的真实 runtime oracle。
 
 ### 3. 正式数据重建命令
 
@@ -79,7 +81,7 @@ export MPLCONFIGDIR=/tmp/matplotlib-cache
 
 #### 3.2 原始 HDF5 转完整 LeRobot delta 数据
 
-正式训练不要设置 `--max-episodes-per-task`。
+正式训练不要设置 `--max-episodes-per-task`，也不要设置 `--use-videos`。闭环重物化必须原子替换两路图像，不能沿用 delta rollout 的旧视频。
 
 ```bash
 uv run python scripts/convert_libero10_hdf5_to_lerobot.py \
@@ -89,13 +91,12 @@ uv run python scripts/convert_libero10_hdf5_to_lerobot.py \
   --suite=libero_10 \
   --height=128 \
   --width=128 \
-  --use-videos \
   --overwrite
 ```
 
 #### 3.3 delta 转 absolute controller goal
 
-正式数据必须通过 `--source-hdf5-dir` 读取每条 demo 自带的 XML/状态，生成精确的 absolute controller goal。
+正式数据必须通过 `--source-hdf5-dir` 读取每条 demo 自带的 XML/状态，生成精确的 absolute controller goal，并在 absolute controller 下闭环重放、重新物化 RGB/state。只有转换完整结束后 manifest 才会写入 `relative_action_ready=true`；旧 action-only 输出必须用 `--overwrite` 重建。
 
 ```bash
 uv run python scripts/convert_libero_delta_to_absolute.py \
@@ -108,10 +109,12 @@ uv run python scripts/convert_libero_delta_to_absolute.py \
   --observation-width=128 \
   --source-hdf5-dir=outputs/source/libero_official/libero_10 \
   --source-action-strategy=controller-goal \
+  --auto-repair-failed-replays \
+  --allow-unrepairable-episodes \
   --overwrite
 ```
 
-#### 3.4 生成严格 45/5 的 MAM train/eval split
+#### 3.4 生成每个 task 固定 5 条 eval 的完整 MAM train/eval split
 
 ```bash
 uv run python scripts/convert_libero_absolute_to_mam.py \
@@ -125,10 +128,11 @@ uv run python scripts/convert_libero_absolute_to_mam.py \
   --retain-ratio=0.2 \
   --n-obs-steps=2 \
   --horizon=32 \
+  --allow-source-exclusions \
   --overwrite
 ```
 
-实际输出为 `libero10_mam_v3_train` 和 `libero10_mam_v3_eval`。使用多个 mask type 时，episode 数会乘以 mask type 数量，但 train/eval 的 source episode 仍严格隔离。
+实际输出为 `libero10_mam_v3_train` 和 `libero10_mam_v3_eval`。无法通过真实闭环回放的 source episode 会被显式排除；当前 v3 全量审计保留 485 条，按 task 固定抽取 5 条 eval，得到 435 条 train 和 50 条 eval。使用多个 mask type 时，episode 数会乘以 mask type 数量，但 train/eval 的 source episode 仍严格隔离。
 
 #### 3.5 数据硬审计
 
@@ -142,13 +146,24 @@ uv run python scripts/audit_libero10_mam_dataset.py \
   --eval-repo-id=local/libero10_mam_v3_eval \
   --source-root=outputs/datasets/libero10_absolute_v3 \
   --source-repo-id=local/libero10_absolute_v3 \
-  --train-per-task=45 \
   --eval-per-task=5 \
   --n-obs-steps=2 \
-  --horizon=32
+  --horizon=32 \
+  --allow-source-exclusions
 ```
 
 审计覆盖 14D state、7D action、双 128x128 RGB、完整 MAS、binary mask、progress、relative stats、SE(3) roundtrip、task 计数和 source split 泄漏。
+
+随后必须在真实 eval runtime 中运行 relative-action oracle。下面命令按实际 DP 配置对完整 eval split 执行 `chunk=15`；任何失败都会返回非零退出码，禁止开始训练。
+
+```bash
+uv run python scripts/audit_libero_chunk_relative_oracle.py \
+  --dataset-root=outputs/datasets/libero10_mam_v3_eval \
+  --max-episodes=50 \
+  --chunk-sizes=15 \
+  --post-hold-steps=0 \
+  --output-json=outputs/audit/libero10_mam_v3_eval_chunk15_oracle.json
+```
 
 ### 4. 训练 v2 STPM
 

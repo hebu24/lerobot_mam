@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from types import SimpleNamespace
 
 import numpy as np
@@ -22,6 +23,10 @@ from torch import Tensor, nn
 
 import lerobot.scripts.lerobot_eval as eval_module
 from lerobot.policies import PreTrainedPolicy
+from lerobot.processor.libero_relative_action_processor import (
+    absolute_to_chunk_relative,
+    axis_angle_to_matrix,
+)
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.random_utils import set_seed
 
@@ -53,7 +58,7 @@ class _StubPolicy(PreTrainedPolicy):
 class _RelativeChunkPolicy(_StubPolicy):
     def __init__(self) -> None:
         super().__init__()
-        self.config = SimpleNamespace(use_relative_actions=True)
+        self.config = SimpleNamespace(use_relative_actions=True, n_obs_steps=1, n_action_steps=2)
         self.prediction_calls = 0
 
     def reset(self) -> None:
@@ -111,6 +116,54 @@ class _TwoStepEnv:
             np.asarray([False]),
             {"is_success": np.asarray([False])},
         )
+
+
+class _ClosedLoopFourStepEnv(_TwoStepEnv):
+    def reset(self, seed=None):
+        self.steps = 0
+        self.actions.clear()
+        self.position = np.asarray((0.4, -0.2, 0.7), dtype=np.float32)
+        return self._observation(tuple(self.position)), {}
+
+    def call(self, name):
+        if name == "_max_episode_steps":
+            return [4]
+        return super().call(name)
+
+    def step(self, action):
+        action = np.asarray(action).copy()
+        self.actions.append(action)
+        self.steps += 1
+        self.position = action[0, :3].astype(np.float32, copy=True)
+        terminated = np.asarray([self.steps >= 4])
+        return (
+            self._observation(tuple(self.position)),
+            np.asarray([0.0], dtype=np.float32),
+            terminated,
+            np.asarray([False]),
+            {"is_success": np.asarray([False])},
+        )
+
+
+class _MaterializedRelativeChunkPolicy(_StubPolicy):
+    def __init__(self, relative_chunks: list[Tensor], *, n_obs_steps: int = 1, n_action_steps: int = 2) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(
+            use_relative_actions=True, n_obs_steps=n_obs_steps, n_action_steps=n_action_steps
+        )
+        self.relative_chunks = relative_chunks
+        self.prediction_calls = 0
+
+    def reset(self) -> None:
+        self.prediction_calls = 0
+
+    def update_observation_queue(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        return batch
+
+    def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
+        chunk = self.relative_chunks[self.prediction_calls]
+        self.prediction_calls += 1
+        return chunk
 
 
 def test_eval_policy_seeds_policy_rng_and_restores_caller_state(monkeypatch):
@@ -200,3 +253,75 @@ def test_relative_rollout_converts_one_chunk_to_absolute_once(monkeypatch):
     torch.testing.assert_close(executed[:, 6], torch.tensor([1.0, -1.0]))
     assert not torch.allclose(executed[0, 3:6], torch.zeros(3))
     assert OBS_STATE not in result
+
+
+def test_relative_rollout_matches_closed_loop_materialized_actions_across_chunks(monkeypatch):
+    """One live anchor is used per queue fill, then refreshed for the next chunk."""
+    monkeypatch.setattr(eval_module, "check_env_attributes_and_types", lambda env: None)
+    env = _ClosedLoopFourStepEnv()
+
+    recorded_states = torch.zeros(4, 14, dtype=torch.float32)
+    recorded_states[:, :3] = torch.tensor(
+        [[0.4, -0.2, 0.7], [0.5, -0.2, 0.7], [0.6, -0.2, 0.7], [0.7, -0.2, 0.7]]
+    )
+    recorded_states[:, 6] = 1.0
+    absolute_actions = torch.zeros(4, 7, dtype=torch.float32)
+    absolute_actions[:, :3] = torch.tensor(
+        [[0.5, -0.2, 0.7], [0.6, -0.2, 0.7], [0.7, -0.2, 0.7], [0.8, -0.2, 0.7]]
+    )
+    absolute_actions[:, 3:6] = torch.tensor((math.pi / 2, 0.0, 0.0))
+    absolute_actions[:, 6] = torch.tensor([1.0, -1.0, 1.0, -1.0])
+    relative_chunks = [
+        absolute_to_chunk_relative(absolute_actions[start : start + 2], recorded_states[start]).unsqueeze(0)
+        for start in (0, 2)
+    ]
+    policy = _MaterializedRelativeChunkPolicy(relative_chunks)
+
+    result = eval_module.rollout(
+        env=env,
+        policy=policy,
+        env_preprocessor=lambda value: value,
+        env_postprocessor=lambda value: value,
+        preprocessor=lambda value: value,
+        postprocessor=lambda value: value,
+    )
+
+    executed = result[ACTION][0]
+    assert policy.prediction_calls == 2
+    torch.testing.assert_close(executed[:, :3], absolute_actions[:, :3], atol=1e-6, rtol=0)
+    torch.testing.assert_close(executed[:, 6], absolute_actions[:, 6], atol=0, rtol=0)
+    torch.testing.assert_close(
+        axis_angle_to_matrix(executed[:, 3:6]),
+        axis_angle_to_matrix(absolute_actions[:, 3:6]),
+        atol=1e-6,
+        rtol=0,
+    )
+
+
+def test_relative_rollout_executes_current_window_not_past_action(monkeypatch):
+    monkeypatch.setattr(eval_module, "check_env_attributes_and_types", lambda env: None)
+    env = _TwoStepEnv()
+
+    recorded_state = torch.zeros(14, dtype=torch.float32)
+    recorded_state[:3] = torch.tensor((0.4, -0.2, 0.7))
+    recorded_state[6] = 1.0
+    past_current_future = torch.zeros(3, 7, dtype=torch.float32)
+    past_current_future[:, :3] = torch.tensor(
+        [[-9.0, -9.0, -9.0], [0.5, -0.2, 0.7], [0.6, -0.2, 0.7]]
+    )
+    past_current_future[:, 6] = torch.tensor([-1.0, 1.0, -1.0])
+    relative_chunk = absolute_to_chunk_relative(past_current_future, recorded_state).unsqueeze(0)
+    policy = _MaterializedRelativeChunkPolicy([relative_chunk], n_obs_steps=2, n_action_steps=2)
+
+    result = eval_module.rollout(
+        env=env,
+        policy=policy,
+        env_preprocessor=lambda value: value,
+        env_postprocessor=lambda value: value,
+        preprocessor=lambda value: value,
+        postprocessor=lambda value: value,
+    )
+
+    executed = result[ACTION][0]
+    torch.testing.assert_close(executed[:, :3], past_current_future[1:, :3], atol=1e-6, rtol=0)
+    torch.testing.assert_close(executed[:, 6], past_current_future[1:, 6], atol=0, rtol=0)

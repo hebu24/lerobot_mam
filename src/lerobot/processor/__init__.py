@@ -66,6 +66,7 @@ from .libero_relative_action_processor import (
     absolute_to_chunk_relative,
     chunk_relative_to_absolute,
     delta_to_absolute_action,
+    slice_current_action_window,
 )
 from .newline_task_processor import NewLineTaskProcessorStep
 from .normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep, hotswap_stats
@@ -180,6 +181,7 @@ __all__ = [
     "absolute_to_chunk_relative",
     "chunk_relative_to_absolute",
     "delta_to_absolute_action",
+    "slice_current_action_window",
     "UnnormalizerProcessorStep",
     "VanillaObservationProcessorStep",
 ]

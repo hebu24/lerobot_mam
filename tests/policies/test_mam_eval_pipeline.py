@@ -14,6 +14,7 @@ from lerobot.policies.mam.eval_mam import (
     configure_mam_eval_init_state_ids,
     eval_mam_policy,
     eval_mam_policy_all,
+    load_mam_eval_episodes,
     make_stpm_encoder,
 )
 from lerobot.scripts.lerobot_eval import _prepare_mam_eval_episodes
@@ -122,6 +123,26 @@ def test_standalone_eval_prepares_mam_before_environment_creation(monkeypatch):
     assert calls == [{"repo_id": "local/eval", "root": "/tmp/eval", "episodes": [9]}]
     assert cfg.env.task_ids == [0]
     assert cfg.env.init_state_ids_by_task == {"libero_10/0": [0]}
+
+
+def test_mam_eval_loader_rejects_uncertified_libero_dataset(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "lerobot.policies.mam.eval_mam.LeRobotDatasetMetadata",
+        lambda *args, **kwargs: SimpleNamespace(robot_type="libero", root=tmp_path),
+    )
+
+    with pytest.raises(FileNotFoundError, match="not certified"):
+        load_mam_eval_episodes("local/legacy", root=tmp_path)
+
+
+def test_mam_eval_loader_rejects_non_libero_robot_type(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "lerobot.policies.mam.eval_mam.LeRobotDatasetMetadata",
+        lambda *args, **kwargs: SimpleNamespace(robot_type="unknown", root=tmp_path),
+    )
+
+    with pytest.raises(ValueError, match="robot_type='libero'"):
+        load_mam_eval_episodes("local/mislabeled", root=tmp_path)
 
 
 def test_eval_all_consumes_only_the_same_selected_episode_prefix(monkeypatch):

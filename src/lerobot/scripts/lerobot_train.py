@@ -41,6 +41,7 @@ from lerobot.common.train_utils import (
     load_training_state,
     prune_checkpoints_keep,
     save_checkpoint,
+    save_policy_checkpoint,
     update_best_checkpoint,
     update_last_checkpoint,
 )
@@ -436,6 +437,36 @@ def apply_diffusion_relative_action_stats(cfg: TrainPipelineConfig, dataset: Any
             "Diffusion use_relative_actions=True requires action and observation.state features."
         )
 
+    # Normal v3 datasets already contain independently audited chunk-relative
+    # action stats. Recomputing them at every launch is wasteful and, before the
+    # numeric-column projection in compute_stats.py, also decoded the full image
+    # dataset. Strict overfit runs still recompute on their selected trajectory.
+    dataset_root = getattr(dataset, "root", None) or getattr(dataset.meta, "root", None)
+    if not getattr(cfg, "overfit_test", False) and dataset_root is not None:
+        from lerobot.datasets.libero_pipeline import read_libero_pipeline_manifest
+
+        try:
+            manifest = read_libero_pipeline_manifest(dataset_root)
+        except FileNotFoundError:
+            manifest = {}
+        expected_indices = [int(value) for value in active_cfg.action_delta_indices]
+        certified_indices = manifest.get("relative_action_stats_action_delta_indices")
+        if manifest.get("relative_action_stats") is True and certified_indices is not None:
+            certified_indices = [int(value) for value in certified_indices]
+            if certified_indices != expected_indices:
+                raise ValueError(
+                    "Dataset relative action stats do not match the policy horizon: "
+                    f"dataset={certified_indices}, policy={expected_indices}."
+                )
+            action_stats = (dataset.meta.stats or {}).get(ACTION)
+            required_stats = {"mean", "std", "min", "max", "q01", "q99"}
+            if action_stats is None or not required_stats.issubset(action_stats):
+                raise ValueError(
+                    "Dataset manifest certifies relative action stats but meta/stats.json is incomplete."
+                )
+            logging.info("Using precomputed audited LIBERO chunk-relative action stats.")
+            return
+
     from lerobot.datasets.compute_stats import compute_libero_relative_action_stats
 
     dataset.meta.stats = dataset.meta.stats or {}
@@ -447,39 +478,107 @@ def apply_diffusion_relative_action_stats(cfg: TrainPipelineConfig, dataset: Any
     logging.info("Using LIBERO chunk-relative action stats for %s normalization.", policy_type)
 
 
-def validate_libero_v3_training_dataset(cfg: TrainPipelineConfig, dataset: Any) -> None:
-    """Certify the dataset boundary for LIBERO chunk-relative Diffusion training."""
-    active_cfg = cfg.trainable_config
-    if getattr(active_cfg, "type", None) != "diffusion" or not getattr(
-        active_cfg, "use_relative_actions", False
+def _validate_libero_split_provenance(
+    train_manifest: dict[str, Any],
+    eval_manifest: dict[str, Any],
+) -> None:
+    """Require normal train/eval splits from one source with no trajectory leakage."""
+    train_source_root = train_manifest.get("source_root")
+    eval_source_root = eval_manifest.get("source_root")
+    train_source_repo = train_manifest.get("source_repo_id")
+    eval_source_repo = eval_manifest.get("source_repo_id")
+    if (
+        not train_source_root
+        or not eval_source_root
+        or Path(train_source_root).resolve() != Path(eval_source_root).resolve()
+        or not train_source_repo
+        or train_source_repo != eval_source_repo
     ):
+        raise ValueError("LIBERO v3 train/eval manifests must reference the same absolute source dataset.")
+
+    train_source_ids = {int(value) for value in train_manifest.get("source_episode_ids", [])}
+    eval_source_ids = {int(value) for value in eval_manifest.get("source_episode_ids", [])}
+    if not train_source_ids or not eval_source_ids:
+        raise ValueError("LIBERO v3 train/eval manifests must list non-empty source_episode_ids.")
+    overlap = sorted(train_source_ids & eval_source_ids)
+    if overlap:
+        raise ValueError(f"LIBERO v3 train/eval source trajectory leakage: {overlap}.")
+
+
+def validate_libero_v3_training_dataset(cfg: TrainPipelineConfig, dataset: Any) -> None:
+    """Certify the dataset boundary for LIBERO chunk-relative DP/MAM training."""
+    active_cfg = cfg.trainable_config
+    policy_type = getattr(active_cfg, "type", None)
+    if policy_type not in {"diffusion", "mam"} or not getattr(active_cfg, "use_relative_actions", False):
         return
-    if getattr(dataset.meta, "robot_type", None) != "libero":
+    robot_type = getattr(dataset.meta, "robot_type", None)
+    env_type = getattr(cfg.env, "type", None) if cfg.env is not None else None
+    if robot_type != "libero":
+        if env_type in {"libero", "libero_plus"}:
+            raise ValueError(
+                f"LIBERO v3 relative-action training requires dataset robot_type='libero', got {robot_type!r}."
+            )
         return
 
     from lerobot.datasets.libero_pipeline import (
-        LIBERO_ABSOLUTE_ACTION,
         LIBERO_CHUNK_RELATIVE_ACTION,
-        require_libero_v3_action_dataset,
+        require_libero_v3_relative_ready_dataset,
     )
 
     train_root_value = getattr(dataset, "root", None) or cfg.dataset.root
     if train_root_value is None:
         raise ValueError("LIBERO v3 relative-action training requires an explicit dataset.root.")
     train_root = Path(train_root_value)
-    train_manifest = require_libero_v3_action_dataset(
-        train_root,
-        action_representation=LIBERO_ABSOLUTE_ACTION,
-    )
+    train_manifest = require_libero_v3_relative_ready_dataset(train_root)
     if (
         train_manifest.get("stage") != "absolute_to_mam"
         or train_manifest.get("dataset_split") != "train"
         or train_manifest.get("policy_action_representation") != LIBERO_CHUNK_RELATIVE_ACTION
     ):
         raise ValueError(
-            "LIBERO v3 relative-action training requires an absolute_to_mam/train dataset "
+            "LIBERO v3 relative-action DP/MAM training requires an absolute_to_mam/train dataset "
             "with chunk-relative SE(3) policy actions."
         )
+
+    # MAM uses policy-specific eval dataset fields instead of cfg.eval.
+    if policy_type == "mam":
+        eval_repo_id = getattr(active_cfg, "mam_eval_dataset_repo_id", None)
+        eval_root_value = getattr(active_cfg, "mam_eval_dataset_root", None)
+        eval_episodes = getattr(active_cfg, "mam_eval_episodes", None)
+        if cfg.overfit_test:
+            same_root = (
+                eval_root_value is not None
+                and Path(eval_root_value).resolve() == train_root.resolve()
+            )
+            if (
+                eval_repo_id != cfg.dataset.repo_id
+                or not same_root
+                or list(eval_episodes or []) != list(cfg.dataset.episodes or [])
+            ):
+                raise ValueError(
+                    "LIBERO v3 MAM overfit requires its eval repo/root/episodes to be exactly "
+                    "identical to the selected training trajectories."
+                )
+            return
+        if cfg.env is not None and cfg.eval_freq > 0:
+            if eval_repo_id is None or eval_root_value is None:
+                raise ValueError(
+                    "Normal LIBERO v3 MAM online evaluation requires explicit "
+                    "policy.mam_eval_dataset_repo_id/root."
+                )
+            eval_manifest = require_libero_v3_relative_ready_dataset(eval_root_value)
+            if (
+                eval_manifest.get("stage") != "absolute_to_mam"
+                or eval_manifest.get("dataset_split") != "eval"
+                or eval_manifest.get("policy_action_representation")
+                != LIBERO_CHUNK_RELATIVE_ACTION
+            ):
+                raise ValueError(
+                    "Normal LIBERO v3 MAM evaluation requires an absolute_to_mam/eval dataset "
+                    "with chunk-relative SE(3) policy actions."
+                )
+            _validate_libero_split_provenance(train_manifest, eval_manifest)
+        return
 
     eval_repo_id = getattr(cfg.eval, "dataset_repo_id", None)
     eval_root_value = getattr(cfg.eval, "dataset_root", None)
@@ -510,10 +609,7 @@ def validate_libero_v3_training_dataset(cfg: TrainPipelineConfig, dataset: Any) 
         return
     if eval_root_value is None:
         raise ValueError("LIBERO v3 fixed evaluation requires an explicit eval.dataset_root.")
-    eval_manifest = require_libero_v3_action_dataset(
-        eval_root_value,
-        action_representation=LIBERO_ABSOLUTE_ACTION,
-    )
+    eval_manifest = require_libero_v3_relative_ready_dataset(eval_root_value)
     if (
         eval_manifest.get("stage") != "absolute_to_mam"
         or eval_manifest.get("dataset_split") != "eval"
@@ -523,6 +619,7 @@ def validate_libero_v3_training_dataset(cfg: TrainPipelineConfig, dataset: Any) 
             "Normal LIBERO v3 evaluation requires an absolute_to_mam/eval dataset "
             "with chunk-relative SE(3) policy actions."
         )
+    _validate_libero_split_provenance(train_manifest, eval_manifest)
 
 
 def apply_overfit_subset_stats(cfg: TrainPipelineConfig, dataset: Any) -> None:
@@ -1075,6 +1172,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     best_eval_score: tuple[float, float] | None = None
     best_checkpoint_dir: Path | None = None
+    last_checkpoint_dir: Path | None = cfg.checkpoint_path if cfg.resume else None
     if is_main_process:
         train_log_path = cfg.output_dir / "logs" / "train_metrics.jsonl"
         eval_log_path = cfg.output_dir / "logs" / "eval_metrics.jsonl"
@@ -1175,10 +1273,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     postprocessor=postprocessor,
                 )
                 update_last_checkpoint(checkpoint_dir)
+                last_checkpoint_dir = checkpoint_dir
                 if cfg.env is not None and cfg.eval_freq > 0:
                     prune_checkpoints_keep(
                         checkpoint_dir.parent,
-                        keep_checkpoint_dirs=[best_checkpoint_dir, checkpoint_dir],
+                        keep_checkpoint_dirs=[best_checkpoint_dir, last_checkpoint_dir],
                     )
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
@@ -1256,29 +1355,42 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                             best_eval_score[0],
                             best_eval_score[1],
                         )
-                    # Persist before publishing the eval record: the incremental
-                    # runner uses that record as its signal to stop a successful run.
-                    save_checkpoint(
-                        checkpoint_dir=checkpoint_dir,
-                        step=step,
-                        cfg=cfg,
-                        policy=accelerator.unwrap_model(policy),
-                        optimizer=optimizer,
-                        scheduler=lr_scheduler,
-                        preprocessor=preprocessor,
-                        postprocessor=postprocessor,
-                    )
-                    update_last_checkpoint(checkpoint_dir)
+                    # Keep eval and resume checkpoints separate: full checkpoints
+                    # carry a large optimizer state, while best-only eval points
+                    # only need policy artifacts for later inference.
+                    should_save_full_checkpoint = is_saving_step or last_checkpoint_dir is None
+                    if should_save_full_checkpoint:
+                        save_checkpoint(
+                            checkpoint_dir=checkpoint_dir,
+                            step=step,
+                            cfg=cfg,
+                            policy=accelerator.unwrap_model(policy),
+                            optimizer=optimizer,
+                            scheduler=lr_scheduler,
+                            preprocessor=preprocessor,
+                            postprocessor=postprocessor,
+                        )
+                        update_last_checkpoint(checkpoint_dir)
+                        last_checkpoint_dir = checkpoint_dir
+                    elif is_new_best:
+                        save_policy_checkpoint(
+                            checkpoint_dir=checkpoint_dir,
+                            cfg=cfg,
+                            policy=accelerator.unwrap_model(policy),
+                            preprocessor=preprocessor,
+                            postprocessor=postprocessor,
+                        )
                     if is_new_best:
                         update_best_checkpoint(checkpoint_dir)
                         best_eval_score = eval_score
                         best_checkpoint_dir = checkpoint_dir
                         if wandb_logger:
                             wandb_logger.log_policy(checkpoint_dir)
-                    prune_checkpoints_keep(
-                        checkpoint_dir.parent,
-                        keep_checkpoint_dirs=[best_checkpoint_dir, checkpoint_dir],
-                    )
+                    if should_save_full_checkpoint or is_new_best:
+                        prune_checkpoints_keep(
+                            checkpoint_dir.parent,
+                            keep_checkpoint_dirs=[best_checkpoint_dir, last_checkpoint_dir],
+                        )
 
                 _append_jsonl(
                     eval_log_path,

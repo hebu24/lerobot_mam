@@ -88,6 +88,11 @@ def parse_args() -> argparse.Namespace:
         help="Use direct LIBERO env without camera observations, or the full LeRobot env wrapper.",
     )
     parser.add_argument("--episodes", default=None, help="Comma-separated episode ids to replay.")
+    parser.add_argument(
+        "--source-episodes",
+        default=None,
+        help="Comma-separated original source episode ids to replay across one or more splits.",
+    )
     parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument("--seed", type=int, default=1000)
     parser.add_argument("--num-steps-wait", type=int, default=0)
@@ -215,6 +220,9 @@ def _read_all_demo_refs(args: argparse.Namespace) -> list[DemoRef]:
     selected_episode_ids = _parse_episode_ids(args.episodes)
     if selected_episode_ids is not None:
         refs = [ref for ref in refs if ref.episode_index in selected_episode_ids]
+    selected_source_episode_ids = _parse_episode_ids(args.source_episodes)
+    if selected_source_episode_ids is not None:
+        refs = [ref for ref in refs if ref.source_episode_id in selected_source_episode_ids]
     refs.sort(
         key=lambda ref: (
             ref.source_episode_id is None,
@@ -318,6 +326,7 @@ def _manifest(args: argparse.Namespace, refs: list[DemoRef]) -> dict[str, Any]:
         "control_mode": args.control_mode,
         "backend": args.backend,
         "episodes": args.episodes,
+        "source_episodes": args.source_episodes,
         "seed": args.seed,
         "num_steps_wait": args.num_steps_wait,
         "post_noop_steps": args.post_noop_steps,

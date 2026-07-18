@@ -107,7 +107,25 @@ def save_checkpoint(
     preprocessor: PolicyProcessorPipeline | None = None,
     postprocessor: PolicyProcessorPipeline | None = None,
 ) -> None:
-    """This function creates the following directory structure:
+    """Save a full resumable checkpoint: policy, processors, optimizer, scheduler, RNG, and step."""
+    save_policy_checkpoint(
+        checkpoint_dir=checkpoint_dir,
+        cfg=cfg,
+        policy=policy,
+        preprocessor=preprocessor,
+        postprocessor=postprocessor,
+    )
+    save_training_state(checkpoint_dir, step, optimizer, scheduler)
+
+
+def save_policy_checkpoint(
+    checkpoint_dir: Path,
+    cfg: TrainPipelineConfig,
+    policy: PreTrainedPolicy,
+    preprocessor: PolicyProcessorPipeline | None = None,
+    postprocessor: PolicyProcessorPipeline | None = None,
+) -> None:
+    """Save policy and processor artifacts without optimizer/scheduler training state.
 
     005000/  #  training step at checkpoint
     ├── pretrained_model/
@@ -116,19 +134,10 @@ def save_checkpoint(
     │   ├── train_config.json  # train config
     │   ├── processor.json  # processor config (if preprocessor provided)
     │   └── step_*.safetensors  # processor state files (if any)
-    └── training_state/
-        ├── optimizer_param_groups.json  #  optimizer param groups
-        ├── optimizer_state.safetensors  # optimizer state
-        ├── rng_state.safetensors  # rng states
-        ├── scheduler_state.json  # scheduler state
-        └── training_step.json  # training step
 
     Args:
         cfg (TrainPipelineConfig): The training config used for this run.
-        step (int): The training step at that checkpoint.
         policy (PreTrainedPolicy): The policy to save.
-        optimizer (Optimizer | None, optional): The optimizer to save the state from. Defaults to None.
-        scheduler (LRScheduler | None, optional): The scheduler to save the state from. Defaults to None.
         preprocessor: The preprocessor/pipeline to save. Defaults to None.
         postprocessor: The postprocessor/pipeline to save. Defaults to None.
     """
@@ -143,7 +152,6 @@ def save_checkpoint(
         preprocessor.save_pretrained(pretrained_dir)
     if postprocessor is not None:
         postprocessor.save_pretrained(pretrained_dir)
-    save_training_state(checkpoint_dir, step, optimizer, scheduler)
 
 
 def save_training_state(

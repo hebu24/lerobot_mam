@@ -2,16 +2,25 @@
 from __future__ import annotations
 
 import argparse
+import gc
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
-from lerobot.datasets import LeRobotDataset
-from lerobot.datasets.compute_stats import compute_libero_relative_action_stats
+from lerobot.datasets import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.datasets.compute_stats import (
+    RunningQuantileStats,
+    _compute_libero_relative_chunk_batch,
+    _get_valid_anchor_indices,
+    compute_libero_relative_action_stats,
+)
 from lerobot.datasets.libero_pipeline import (
-    LIBERO_ABSOLUTE_ACTION,
     LIBERO_CHUNK_RELATIVE_ACTION,
-    require_libero_v3_action_dataset,
+    LIBERO_CLOSED_LOOP_ABSOLUTE_MATERIALIZATION,
+    LIBERO_PIPELINE_VERSION,
+    read_libero_pipeline_manifest,
+    require_libero_v3_relative_ready_dataset,
 )
 from lerobot.processor.libero_relative_action_processor import (
     absolute_to_chunk_relative,
@@ -39,6 +48,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--horizon", type=int, default=32)
     parser.add_argument("--roundtrip-samples", type=int, default=2048)
     parser.add_argument("--skip-stats-recompute", action="store_true")
+    parser.add_argument(
+        "--stats-only",
+        action="store_true",
+        help="Only recompute relative stats, loading train and eval sequentially to cap memory.",
+    )
+    parser.add_argument(
+        "--allow-source-exclusions",
+        action="store_true",
+        help="Audit final splits against an explicit valid/excluded source replay manifest.",
+    )
     return parser.parse_args()
 
 
@@ -161,6 +180,57 @@ def _check_relative_stats(
             raise AssertionError(f"{root}: action stats {key} are not chunk-relative; max error={error:.6g}")
 
 
+def _check_relative_stats_from_parquet(
+    root: Path,
+    repo_id: str,
+    action_delta_indices: list[int],
+) -> None:
+    """Recompute the exact training statistic without materializing HF image columns."""
+    action_parts: list[np.ndarray] = []
+    state_parts: list[np.ndarray] = []
+    episode_parts: list[np.ndarray] = []
+    parquet_files = sorted((root / "data").glob("chunk-*/*.parquet"))
+    if not parquet_files:
+        raise AssertionError(f"{root}: no data parquet files.")
+    for parquet_path in parquet_files:
+        frame = pd.read_parquet(parquet_path, columns=[ACTION, OBS_STATE, "episode_index"])
+        action_parts.append(np.stack(frame[ACTION].to_numpy()).astype(np.float32, copy=False))
+        state_parts.append(np.stack(frame[OBS_STATE].to_numpy()).astype(np.float32, copy=False))
+        episode_parts.append(frame["episode_index"].to_numpy(dtype=np.int64, copy=False))
+
+    all_actions = np.concatenate(action_parts, axis=0)
+    all_states = np.concatenate(state_parts, axis=0)
+    episode_indices = np.concatenate(episode_parts, axis=0)
+    del action_parts, state_parts, episode_parts
+
+    offsets = np.asarray(action_delta_indices, dtype=np.int64)
+    valid_anchors = _get_valid_anchor_indices(episode_indices, offsets)
+    if len(valid_anchors) == 0:
+        raise AssertionError(f"{root}: no valid anchors for relative stats.")
+    running_stats = RunningQuantileStats()
+    for start in range(0, len(valid_anchors), 50_000):
+        relative = _compute_libero_relative_chunk_batch(
+            valid_anchors[start : start + 50_000],
+            all_actions,
+            all_states,
+            offsets,
+        )
+        running_stats.update(relative)
+        del relative
+    expected = running_stats.get_statistics()
+    actual = (LeRobotDatasetMetadata(repo_id, root=root).stats or {}).get(ACTION)
+    if actual is None:
+        raise AssertionError(f"{root}: missing action stats.")
+    for key in ("min", "max", "mean", "std", "q01", "q99"):
+        lhs = np.asarray(actual[key], dtype=np.float64)
+        rhs = np.asarray(expected[key], dtype=np.float64)
+        if not np.allclose(lhs, rhs, rtol=1e-5, atol=1e-6):
+            error = float(np.max(np.abs(lhs - rhs)))
+            raise AssertionError(
+                f"{root}: parquet-streamed relative stats {key} mismatch; max error={error:.6g}"
+            )
+
+
 def _check_roundtrip(
     dataset: LeRobotDataset,
     root: Path,
@@ -197,14 +267,8 @@ def _check_roundtrip(
 
 def main() -> None:
     args = parse_args()
-    train_manifest = require_libero_v3_action_dataset(
-        args.train_root,
-        action_representation=LIBERO_ABSOLUTE_ACTION,
-    )
-    eval_manifest = require_libero_v3_action_dataset(
-        args.eval_root,
-        action_representation=LIBERO_ABSOLUTE_ACTION,
-    )
+    train_manifest = require_libero_v3_relative_ready_dataset(args.train_root)
+    eval_manifest = require_libero_v3_relative_ready_dataset(args.eval_root)
     for root, manifest, expected_split in (
         (args.train_root, train_manifest, "train"),
         (args.eval_root, eval_manifest, "eval"),
@@ -216,17 +280,54 @@ def main() -> None:
         if manifest.get("policy_action_representation") != LIBERO_CHUNK_RELATIVE_ACTION:
             raise AssertionError(f"{root}: missing chunk-relative policy action declaration.")
 
+    action_delta_indices = list(range(1 - args.n_obs_steps, 1 - args.n_obs_steps + args.horizon))
+    if args.stats_only:
+        for root, repo_id in (
+            (args.train_root, args.train_repo_id),
+            (args.eval_root, args.eval_repo_id),
+        ):
+            _check_relative_stats_from_parquet(
+                root,
+                _repo_id(root, repo_id),
+                action_delta_indices,
+            )
+            gc.collect()
+        print("PASS: independently recomputed train/eval chunk-relative action stats.")
+        return
+
     train = LeRobotDataset(_repo_id(args.train_root, args.train_repo_id), root=args.train_root)
     eval_dataset = LeRobotDataset(_repo_id(args.eval_root, args.eval_repo_id), root=args.eval_root)
     source = None
+    source_valid_episode_ids: set[int] | None = None
+    source_excluded_episode_ids: set[int] = set()
     if args.source_root is not None:
-        require_libero_v3_action_dataset(
-            args.source_root,
-            action_representation=LIBERO_ABSOLUTE_ACTION,
-        )
+        source_manifest = read_libero_pipeline_manifest(args.source_root)
+        if source_manifest.get("relative_action_ready") is True:
+            require_libero_v3_relative_ready_dataset(args.source_root)
+        elif args.allow_source_exclusions:
+            source_valid_episode_ids = {
+                int(value) for value in source_manifest.get("valid_absolute_episode_ids", [])
+            }
+            source_excluded_episode_ids = {
+                int(value) for value in source_manifest.get("unrepairable_episode_ids", [])
+            }
+            if (
+                source_manifest.get("pipeline_version") != LIBERO_PIPELINE_VERSION
+                or source_manifest.get("stage") != "delta_to_absolute"
+                or source_manifest.get("conversion_complete") is not True
+                or source_manifest.get("audit_complete") is not True
+                or source_manifest.get("observation_materialization")
+                != LIBERO_CLOSED_LOOP_ABSOLUTE_MATERIALIZATION
+                or not source_valid_episode_ids
+                or not source_excluded_episode_ids
+                or source_valid_episode_ids & source_excluded_episode_ids
+            ):
+                raise AssertionError(
+                    "Excluded source must be a completed v3 replay audit with disjoint valid/excluded ids."
+                )
+        else:
+            require_libero_v3_relative_ready_dataset(args.source_root)
         source = LeRobotDataset(_repo_id(args.source_root, args.source_repo_id), root=args.source_root)
-    action_delta_indices = list(range(1 - args.n_obs_steps, 1 - args.n_obs_steps + args.horizon))
-
     for dataset, root in ((train, args.train_root), (eval_dataset, args.eval_root)):
         _check_schema(dataset, root)
         _check_mam_columns(dataset, root)
@@ -241,16 +342,49 @@ def main() -> None:
     expected_tasks = set(range(10))
     if set(train_counts) != expected_tasks or set(eval_counts) != expected_tasks:
         raise AssertionError(f"Expected task ids 0..9, got train={train_counts}, eval={eval_counts}")
-    if any(count != args.train_per_task for count in train_counts.values()):
-        raise AssertionError(f"Train task counts mismatch: {train_counts}")
     if any(count != args.eval_per_task for count in eval_counts.values()):
         raise AssertionError(f"Eval task counts mismatch: {eval_counts}")
     overlap = sorted(train_sources & eval_sources)
     if overlap:
         raise AssertionError(f"Train/eval source episode leakage: {overlap[:20]}")
+    if source_valid_episode_ids is None:
+        if any(count != args.train_per_task for count in train_counts.values()):
+            raise AssertionError(f"Train task counts mismatch: {train_counts}")
+    else:
+        assert source is not None
+        source_episode_ids = {
+            int(row["episode_index"]) for row in source.meta.episodes
+        }
+        if source_valid_episode_ids | source_excluded_episode_ids != source_episode_ids:
+            raise AssertionError("Source valid/excluded ids do not exactly cover source metadata.")
+        selected_sources = train_sources | eval_sources
+        if selected_sources != source_valid_episode_ids:
+            missing = sorted(source_valid_episode_ids - selected_sources)
+            unexpected = sorted(selected_sources - source_valid_episode_ids)
+            raise AssertionError(
+                f"Final split does not exactly cover valid source ids: missing={missing}, unexpected={unexpected}"
+            )
+        source_task_by_episode = {
+            int(row["episode_index"]): int(
+                _episode_value(row, ("libero/task_id", "task_id"))
+            )
+            for row in source.meta.episodes
+        }
+        valid_counts: dict[int, int] = {}
+        for episode_id in source_valid_episode_ids:
+            task_id = source_task_by_episode[episode_id]
+            valid_counts[task_id] = valid_counts.get(task_id, 0) + 1
+        expected_train_counts = {
+            task_id: valid_counts[task_id] - args.eval_per_task for task_id in expected_tasks
+        }
+        if train_counts != expected_train_counts:
+            raise AssertionError(
+                f"Train task counts do not cover all valid non-eval sources: "
+                f"expected={expected_train_counts}, actual={train_counts}"
+            )
 
     print(
-        "PASS: v3 manifest, schema, complete MAS, split, init_state fidelity, "
+        "PASS: closed-loop relative-ready v3 manifest, schema, complete MAS, split, init_state fidelity, "
         "relative stats, and SE(3) roundtrip; "
         f"train={train_counts}, eval={eval_counts}"
     )

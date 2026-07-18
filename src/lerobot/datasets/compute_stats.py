@@ -740,9 +740,18 @@ def compute_relative_action_stats(
     relative_mask = np.array(mask_step._build_mask(action_dim), dtype=np.float32)
 
     logging.info("Loading action/state data for relative action stats...")
-    all_actions = np.array(hf_dataset[ACTION], dtype=np.float32)
-    all_states = np.array(hf_dataset[OBS_STATE], dtype=np.float32)
-    episode_indices = np.array(hf_dataset["episode_index"])
+    # Selecting the numeric columns first is essential for image datasets. Accessing
+    # ``hf_dataset[ACTION]`` on the full table makes datasets decode every image in
+    # the same record batch even though only actions are requested, which turns a
+    # small numeric stats pass into a multi-GB operation.
+    stats_dataset = (
+        hf_dataset.select_columns([ACTION, OBS_STATE, "episode_index"])
+        if hasattr(hf_dataset, "select_columns")
+        else hf_dataset
+    )
+    all_actions = np.array(stats_dataset[ACTION], dtype=np.float32)
+    all_states = np.array(stats_dataset[OBS_STATE], dtype=np.float32)
+    episode_indices = np.array(stats_dataset["episode_index"])
 
     valid_starts = _get_valid_chunk_starts(episode_indices, chunk_size)
     if len(valid_starts) == 0:
@@ -815,9 +824,14 @@ def compute_libero_relative_action_stats(
         raise ValueError(f"action_delta_indices must be a non-empty 1-D list, got {action_delta_indices}.")
 
     logging.info("Loading action/state data for LIBERO relative action stats...")
-    all_actions = np.array(hf_dataset[ACTION], dtype=np.float32)
-    all_states = np.array(hf_dataset[OBS_STATE], dtype=np.float32)
-    episode_indices = np.array(hf_dataset["episode_index"])
+    stats_dataset = (
+        hf_dataset.select_columns([ACTION, OBS_STATE, "episode_index"])
+        if hasattr(hf_dataset, "select_columns")
+        else hf_dataset
+    )
+    all_actions = np.array(stats_dataset[ACTION], dtype=np.float32)
+    all_states = np.array(stats_dataset[OBS_STATE], dtype=np.float32)
+    episode_indices = np.array(stats_dataset["episode_index"])
 
     valid_anchors = _get_valid_anchor_indices(episode_indices, action_delta_indices_np)
     if len(valid_anchors) == 0:

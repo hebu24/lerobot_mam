@@ -32,6 +32,7 @@ import torch.nn.functional as F  # noqa: N812
 import torchvision
 from torch import Tensor, nn
 
+from lerobot.processor.libero_relative_action_processor import slice_current_action_window
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from lerobot.utils.import_utils import _diffusers_available, require_package
 
@@ -157,6 +158,11 @@ class DiffusionPolicy(PreTrainedPolicy):
 
         if len(self._queues[ACTION]) == 0:
             actions = self.predict_action_chunk(batch, noise=noise)
+            actions = slice_current_action_window(
+                actions,
+                n_obs_steps=self.config.n_obs_steps,
+                n_action_steps=self.config.n_action_steps,
+            )
             self._queues[ACTION].extend(actions.transpose(0, 1))
 
         action = self._queues[ACTION].popleft()

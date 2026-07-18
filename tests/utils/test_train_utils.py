@@ -23,6 +23,7 @@ from lerobot.common.train_utils import (
     load_training_state,
     load_training_step,
     save_checkpoint,
+    save_policy_checkpoint,
     save_training_state,
     save_training_step,
     update_last_checkpoint,
@@ -94,6 +95,18 @@ def test_save_checkpoint_peft(mock_save_training_state, tmp_path, optimizer):
     cfg.save_pretrained.assert_called_once()
     policy.config.save_pretrained.assert_called_once()
     mock_save_training_state.assert_called_once()
+
+
+def test_save_policy_checkpoint_does_not_save_training_state(tmp_path):
+    policy = Mock()
+    cfg = Mock()
+    cfg.peft = None
+
+    save_policy_checkpoint(tmp_path, cfg, policy)
+
+    policy.save_pretrained.assert_called_once()
+    cfg.save_pretrained.assert_called_once()
+    assert not (tmp_path / TRAINING_STATE_DIR).exists()
 
 
 def test_save_training_state(tmp_path, optimizer, scheduler):

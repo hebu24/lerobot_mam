@@ -15,9 +15,8 @@ import numpy as np
 
 from lerobot.datasets import LeRobotDatasetMetadata
 from lerobot.datasets.libero_pipeline import (
-    LIBERO_ABSOLUTE_ACTION,
     LIBERO_CHUNK_RELATIVE_ACTION,
-    require_libero_v3_action_dataset,
+    require_libero_v3_relative_ready_dataset,
 )
 from lerobot.utils.constants import ACTION, OBS_STATE
 
@@ -135,10 +134,7 @@ def main() -> None:
     args = parse_args()
     if args.k < 1 or args.k > 10:
         raise ValueError(f"K must be in [1, 10], got {args.k}.")
-    manifest = require_libero_v3_action_dataset(
-        args.dataset_root,
-        action_representation=LIBERO_ABSOLUTE_ACTION,
-    )
+    manifest = require_libero_v3_relative_ready_dataset(args.dataset_root)
     if manifest.get("stage") != "absolute_to_mam" or manifest.get("dataset_split") != "train":
         raise ValueError("Overfit input must be the train split produced by absolute_to_mam.")
     if manifest.get("policy_action_representation") != LIBERO_CHUNK_RELATIVE_ACTION:
@@ -154,7 +150,7 @@ def main() -> None:
     )
     episode_ids = [item["episode_index"] for item in selections]
     plan = {
-        "version": 1,
+        "version": 2,
         "pipeline_version": manifest["pipeline_version"],
         "dataset_root": str(args.dataset_root.resolve()),
         "dataset_repo_id": args.dataset_repo_id,
@@ -165,6 +161,8 @@ def main() -> None:
         "eval_episode_ids": episode_ids,
         "same_train_eval_trajectories": True,
         "policy_action_representation": LIBERO_CHUNK_RELATIVE_ACTION,
+        "observation_materialization": manifest["observation_materialization"],
+        "relative_action_ready": True,
         "environment_control_mode": "absolute",
         "selections": selections,
     }

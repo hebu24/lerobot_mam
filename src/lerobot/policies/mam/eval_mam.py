@@ -15,10 +15,17 @@ from torch import Tensor
 from tqdm import trange
 
 from lerobot.datasets import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.datasets.libero_pipeline import (
+    LIBERO_CHUNK_RELATIVE_ACTION,
+    require_libero_v3_relative_ready_dataset,
+)
 from lerobot.envs import preprocess_observation
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import PolicyProcessorPipeline
-from lerobot.processor.libero_relative_action_processor import chunk_relative_to_absolute
+from lerobot.processor.libero_relative_action_processor import (
+    chunk_relative_to_absolute,
+    slice_current_action_window,
+)
 from lerobot.scripts.lerobot_eval import _compile_episode_data
 from lerobot.stpm import STPMEncoder
 from lerobot.types import PolicyAction
@@ -99,6 +106,20 @@ def load_mam_eval_episodes(
     """Load only the MAM control columns needed by online eval."""
 
     meta = LeRobotDatasetMetadata(repo_id, root=root)
+    if meta.robot_type != "libero":
+        raise ValueError(
+            "LIBERO MAM evaluation requires dataset robot_type='libero', "
+            f"got {meta.robot_type!r}."
+        )
+    manifest = require_libero_v3_relative_ready_dataset(meta.root)
+    if (
+        manifest.get("stage") != "absolute_to_mam"
+        or manifest.get("dataset_split") not in {"train", "eval"}
+        or manifest.get("policy_action_representation") != LIBERO_CHUNK_RELATIVE_ACTION
+    ):
+        raise ValueError(
+            "LIBERO MAM evaluation requires a closed-loop relative-ready absolute_to_mam dataset."
+        )
     missing = [
         key
         for key in (MAM_MAS_ACTION_ABSOLUTE, MAM_MAS_ACTION_MASK, MAM_PROGRESS)
@@ -493,6 +514,11 @@ def rollout_mam(
                 )
                 if not isinstance(absolute_chunk, Tensor):
                     absolute_chunk = torch.as_tensor(absolute_chunk)
+                absolute_chunk = slice_current_action_window(
+                    absolute_chunk,
+                    n_obs_steps=policy.config.n_obs_steps,
+                    n_action_steps=policy.config.n_action_steps,
+                )
                 absolute_action_queue.extend(absolute_chunk.transpose(0, 1))
             action = absolute_action_queue.popleft()
 

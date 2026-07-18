@@ -273,6 +273,42 @@ def chunk_relative_to_absolute(
     return _maybe_numpy(absolute, relative_actions)
 
 
+def slice_current_action_window(
+    action_chunk: Tensor,
+    *,
+    n_obs_steps: int,
+    n_action_steps: int,
+) -> Tensor:
+    """Return the executable window from a model-predicted action chunk.
+
+    Diffusion-style chunks are indexed from the oldest observation. When
+    ``n_obs_steps > 1``, the first generated action(s) correspond to past
+    observation frames and must not be sent to the environment. The current
+    environment step starts at ``n_obs_steps - 1``.
+
+    Some policy implementations already apply this slice inside
+    ``predict_action_chunk`` / ``generate_actions`` and therefore return exactly
+    ``n_action_steps`` actions. In that case, the chunk is already executable.
+    """
+    if action_chunk.ndim < 3:
+        raise ValueError(f"Expected action chunk with shape (batch, horizon, action_dim), got {action_chunk.shape}.")
+    if n_obs_steps < 1:
+        raise ValueError(f"n_obs_steps must be >= 1, got {n_obs_steps}.")
+    if n_action_steps < 1:
+        raise ValueError(f"n_action_steps must be >= 1, got {n_action_steps}.")
+    if action_chunk.shape[1] == n_action_steps:
+        return action_chunk
+
+    start = n_obs_steps - 1
+    end = start + n_action_steps
+    if end > action_chunk.shape[1]:
+        raise ValueError(
+            "Executable action window exceeds predicted chunk horizon: "
+            f"{start=}, {end=}, horizon={action_chunk.shape[1]}."
+        )
+    return action_chunk[:, start:end]
+
+
 @ProcessorStepRegistry.register("libero_chunk_relative_actions_processor")
 @dataclass
 class LiberoChunkRelativeActionsProcessorStep(ProcessorStep):

@@ -21,12 +21,16 @@ import torch
 
 from lerobot.processor.libero_relative_action_processor import (
     LIBERO_EEF_BODY_TO_CONTROLLER_ROTATION,
+    LiberoChunkRelativeActionsProcessorStep,
     absolute_to_chunk_relative,
     axis_angle_to_matrix,
     chunk_relative_to_absolute,
     eef_body_quaternion_to_controller_matrix,
     matrix_to_axis_angle,
+    slice_current_action_window,
 )
+from lerobot.types import TransitionKey
+from lerobot.utils.constants import OBS_STATE
 
 
 def _quaternion_to_matrix(quaternion: torch.Tensor) -> torch.Tensor:
@@ -106,6 +110,66 @@ def test_14d_state_anchor_uses_controller_frame_for_relative_actions() -> None:
         atol=1e-12,
         rtol=0,
     )
+
+
+def test_batched_chunk_relative_roundtrip_preserves_se3_and_gripper() -> None:
+    generator = torch.Generator().manual_seed(31415)
+    batch_size, horizon = 4, 17
+    anchors = torch.randn(batch_size, 14, generator=generator, dtype=torch.float64)
+    anchors[:, :3] *= 0.2
+    anchors[:, 3:7] /= anchors[:, 3:7].norm(dim=-1, keepdim=True)
+
+    actions = torch.randn(batch_size, horizon, 7, generator=generator, dtype=torch.float64)
+    actions[..., :3] = anchors[:, None, :3] + actions[..., :3] * 0.05
+    actions[..., 3:6] *= 0.4
+    actions[..., 6] = torch.where(actions[..., 6] >= 0, 1.0, -1.0)
+
+    relative = absolute_to_chunk_relative(actions, anchors)
+    reconstructed = chunk_relative_to_absolute(relative, anchors)
+
+    torch.testing.assert_close(reconstructed[..., :3], actions[..., :3], atol=1e-12, rtol=0)
+    torch.testing.assert_close(reconstructed[..., 6], actions[..., 6], atol=0, rtol=0)
+    torch.testing.assert_close(
+        axis_angle_to_matrix(reconstructed[..., 3:6]),
+        axis_angle_to_matrix(actions[..., 3:6]),
+        atol=1e-12,
+        rtol=0,
+    )
+
+
+def test_training_processor_anchors_action_chunk_to_latest_observation() -> None:
+    state_history = torch.zeros(1, 2, 14, dtype=torch.float32)
+    state_history[:, 0, :3] = torch.tensor((9.0, 8.0, 7.0))
+    state_history[:, 1, :3] = torch.tensor((0.4, -0.2, 0.7))
+    state_history[:, :, 6] = 1.0
+    relative = torch.tensor(
+        [[[0.1, 0.0, 0.0, 0.0, 0.0, 0.1, 1.0], [0.2, -0.1, 0.0, 0.1, 0.0, 0.0, -1.0]]]
+    )
+    absolute = chunk_relative_to_absolute(relative, state_history[:, -1])
+    transition = {
+        TransitionKey.OBSERVATION: {OBS_STATE: state_history},
+        TransitionKey.ACTION: absolute,
+    }
+
+    processed = LiberoChunkRelativeActionsProcessorStep(enabled=True)(transition)
+
+    torch.testing.assert_close(processed[TransitionKey.ACTION], relative, atol=1e-6, rtol=0)
+
+
+def test_slice_current_action_window_drops_actions_for_past_observations() -> None:
+    action_chunk = torch.arange(1 * 5 * 2, dtype=torch.float32).reshape(1, 5, 2)
+
+    executable = slice_current_action_window(action_chunk, n_obs_steps=2, n_action_steps=3)
+
+    torch.testing.assert_close(executable, action_chunk[:, 1:4])
+
+
+def test_slice_current_action_window_accepts_already_sliced_chunk() -> None:
+    action_chunk = torch.arange(1 * 3 * 2, dtype=torch.float32).reshape(1, 3, 2)
+
+    executable = slice_current_action_window(action_chunk, n_obs_steps=2, n_action_steps=3)
+
+    torch.testing.assert_close(executable, action_chunk)
 
 
 def test_eef_body_controller_conversion_preserves_numpy_type() -> None:

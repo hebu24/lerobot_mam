@@ -12,6 +12,7 @@ LIBERO_DELTA_ACTION = "osc_pose_delta"
 LIBERO_ABSOLUTE_ACTION = "osc_pose_absolute_goal"
 LIBERO_CHUNK_RELATIVE_ACTION = "chunk_relative_se3"
 LIBERO_STATE_14D = "eef_pos_quat_xyzw_joint_pos_14d"
+LIBERO_CLOSED_LOOP_ABSOLUTE_MATERIALIZATION = "closed_loop_absolute_controller"
 
 
 def read_libero_pipeline_manifest(root: str | Path) -> dict[str, Any]:
@@ -57,5 +58,39 @@ def require_libero_v3_action_dataset(
         raise ValueError(
             f"{Path(root)} is not a complete LIBERO-10 {LIBERO_PIPELINE_VERSION} "
             f"{action_representation} dataset: {', '.join(errors)}"
+        )
+    return manifest
+
+
+def require_libero_v3_relative_ready_dataset(root: str | Path) -> dict[str, Any]:
+    """Require observations and absolute actions from the same closed-loop rollout.
+
+    A legacy v3 ``delta_to_absolute`` artifact only replaced the action column while
+    retaining observations recorded under the delta controller.  Such a dataset is
+    valid for action replay diagnostics, but its state/action pairs are not valid
+    anchors for chunk-relative policy training.  The two manifest capabilities
+    checked here are written only after closed-loop absolute-controller
+    rematerialization has completed.
+    """
+    manifest = require_libero_v3_action_dataset(
+        root,
+        action_representation=LIBERO_ABSOLUTE_ACTION,
+    )
+    errors: list[str] = []
+    if (
+        manifest.get("observation_materialization")
+        != LIBERO_CLOSED_LOOP_ABSOLUTE_MATERIALIZATION
+    ):
+        errors.append(
+            "observation_materialization="
+            f"{manifest.get('observation_materialization')!r}"
+        )
+    if manifest.get("relative_action_ready") is not True:
+        errors.append(f"relative_action_ready={manifest.get('relative_action_ready')!r}")
+    if errors:
+        raise ValueError(
+            f"{Path(root)} is not certified for LIBERO v3 chunk-relative training: "
+            f"{', '.join(errors)}. Rebuild it by closed-loop absolute-controller "
+            "rematerialization; action-only v3 conversion is insufficient."
         )
     return manifest

@@ -85,7 +85,10 @@ from lerobot.envs import (
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.policies.mam.configuration_mam import MamConfig
 from lerobot.processor import PolicyProcessorPipeline
-from lerobot.processor.libero_relative_action_processor import chunk_relative_to_absolute
+from lerobot.processor.libero_relative_action_processor import (
+    chunk_relative_to_absolute,
+    slice_current_action_window,
+)
 from lerobot.types import PolicyAction
 from lerobot.utils.constants import ACTION, DONE, OBS_STATE, OBS_STR, REWARD
 from lerobot.utils.device_utils import get_safe_torch_device
@@ -339,6 +342,11 @@ def rollout(
                     absolute_chunk = chunk_relative_to_absolute(relative_chunk, anchor_state)
                     if not isinstance(absolute_chunk, Tensor):
                         absolute_chunk = torch.as_tensor(absolute_chunk)
+                    absolute_chunk = slice_current_action_window(
+                        absolute_chunk,
+                        n_obs_steps=policy.config.n_obs_steps,
+                        n_action_steps=policy.config.n_action_steps,
+                    )
                     chunk_absolute_action_queue.extend(absolute_chunk.transpose(0, 1))
                 action = chunk_absolute_action_queue.popleft()
             else:

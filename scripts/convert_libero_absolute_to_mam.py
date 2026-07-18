@@ -16,9 +16,11 @@ from lerobot.datasets.io_utils import write_stats
 from lerobot.datasets.libero_pipeline import (
     LIBERO_ABSOLUTE_ACTION,
     LIBERO_CHUNK_RELATIVE_ACTION,
+    LIBERO_CLOSED_LOOP_ABSOLUTE_MATERIALIZATION,
     LIBERO_PIPELINE_VERSION,
     LIBERO_STATE_14D,
-    require_libero_v3_action_dataset,
+    read_libero_pipeline_manifest,
+    require_libero_v3_relative_ready_dataset,
     write_libero_pipeline_manifest,
 )
 from lerobot.utils.constants import ACTION, DEFAULT_FEATURES
@@ -38,6 +40,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-repo-id", type=str, required=True)
     parser.add_argument("--eval-ratio", type=float, default=0.1)
     parser.add_argument("--eval-per-task", type=int, default=None)
+    parser.add_argument(
+        "--eval-episode-ids",
+        type=str,
+        default=None,
+        help="Explicit comma-separated source episode ids for a replay-certified eval split.",
+    )
     parser.add_argument(
         "--task-stratified-eval-ratio",
         action="store_true",
@@ -60,6 +68,14 @@ def parse_args() -> argparse.Namespace:
         "--skip-relative-action-stats",
         action="store_true",
         help="Skip the expensive HF-datasets reload used to compute relative action stats.",
+    )
+    parser.add_argument(
+        "--allow-source-exclusions",
+        action="store_true",
+        help=(
+            "Allow a completed v3 replay audit source with explicit unrepairable_episode_ids. "
+            "Only valid_absolute_episode_ids are eligible for the train/eval split."
+        ),
     )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -132,10 +148,51 @@ def _round_robin_task_episode_ids(task_episode_ids: dict[int, list[int]]) -> lis
     return ordered
 
 
+def _selected_explicit_eval_ids(
+    source: LeRobotDataset,
+    text: str,
+    *,
+    eval_per_task: int | None,
+    eligible_episode_ids: set[int] | None,
+) -> tuple[list[int], list[int]]:
+    values = [int(item.strip()) for item in text.split(",") if item.strip()]
+    if not values or len(values) != len(set(values)):
+        raise ValueError("--eval-episode-ids must contain unique episode ids.")
+    eligible = (
+        set(eligible_episode_ids)
+        if eligible_episode_ids is not None
+        else {int(row["episode_index"]) for row in source.meta.episodes}
+    )
+    eval_set = set(values)
+    if not eval_set <= eligible:
+        raise ValueError(
+            f"--eval-episode-ids contains ineligible ids: {sorted(eval_set - eligible)}"
+        )
+
+    columns = _column_names(source)
+    task_key = next((key for key in ("libero/task_id", "task_id") if key in columns), None)
+    if task_key is None:
+        raise ValueError("Explicit eval split requires task id episode metadata.")
+    groups: dict[int, list[int]] = {}
+    for row in source.meta.episodes:
+        episode_id = int(row["episode_index"])
+        if episode_id in eval_set:
+            groups.setdefault(int(row[task_key]), []).append(episode_id)
+    if eval_per_task is not None:
+        counts = {task_id: len(ids) for task_id, ids in groups.items()}
+        expected = {task_id: int(eval_per_task) for task_id in range(10)}
+        if counts != expected:
+            raise ValueError(
+                f"Explicit eval split must contain {eval_per_task} episode(s) per task: {counts}"
+            )
+    return sorted(eligible - eval_set), _round_robin_task_episode_ids(groups)
+
+
 def _selected_episode_ids_by_task(
     source: LeRobotDataset,
     eval_per_task: int,
     seed: int,
+    eligible_episode_ids: set[int] | None = None,
 ) -> tuple[list[int], list[int]]:
     if eval_per_task <= 0:
         raise ValueError(f"eval_per_task must be positive, got {eval_per_task}.")
@@ -151,7 +208,10 @@ def _selected_episode_ids_by_task(
 
     groups: dict[int, list[int]] = {}
     for row in source.meta.episodes:
-        groups.setdefault(int(row[task_key]), []).append(int(row["episode_index"]))
+        episode_index = int(row["episode_index"])
+        if eligible_episode_ids is not None and episode_index not in eligible_episode_ids:
+            continue
+        groups.setdefault(int(row[task_key]), []).append(episode_index)
     if not groups:
         raise ValueError("No episodes found for task-balanced split.")
 
@@ -416,6 +476,13 @@ def _write_split(
             "action_representation": LIBERO_ABSOLUTE_ACTION,
             "policy_action_representation": LIBERO_CHUNK_RELATIVE_ACTION,
             "relative_action_stats": not args.skip_relative_action_stats,
+            "relative_action_stats_n_obs_steps": int(args.n_obs_steps),
+            "relative_action_stats_horizon": int(args.horizon),
+            "relative_action_stats_action_delta_indices": list(
+                range(1 - args.n_obs_steps, 1 - args.n_obs_steps + args.horizon)
+            ),
+            "observation_materialization": LIBERO_CLOSED_LOOP_ABSOLUTE_MATERIALIZATION,
+            "relative_action_ready": True,
             "state_representation": LIBERO_STATE_14D,
             "source_root": str(args.input_root.resolve()),
             "source_repo_id": args.input_repo_id or _repo_id_from_root(args.input_root),
@@ -427,19 +494,63 @@ def _write_split(
 
 def main() -> None:
     args = parse_args()
-    input_manifest = require_libero_v3_action_dataset(
-        args.input_root,
-        action_representation=LIBERO_ABSOLUTE_ACTION,
-    )
+    input_manifest = read_libero_pipeline_manifest(args.input_root)
+    excluded_episode_ids: set[int] = set()
+    valid_absolute_episode_ids: set[int] | None = None
+    if input_manifest.get("relative_action_ready") is True:
+        input_manifest = require_libero_v3_relative_ready_dataset(args.input_root)
+    elif getattr(args, "allow_source_exclusions", False):
+        excluded_episode_ids = {
+            int(value) for value in input_manifest.get("unrepairable_episode_ids", [])
+        }
+        valid_absolute_episode_ids = {
+            int(value) for value in input_manifest.get("valid_absolute_episode_ids", [])
+        }
+        if (
+            input_manifest.get("pipeline_version") != LIBERO_PIPELINE_VERSION
+            or input_manifest.get("stage") != "delta_to_absolute"
+            or input_manifest.get("conversion_complete") is not True
+            or input_manifest.get("audit_complete") is not True
+            or input_manifest.get("observation_materialization")
+            != LIBERO_CLOSED_LOOP_ABSOLUTE_MATERIALIZATION
+            or not excluded_episode_ids
+            or not valid_absolute_episode_ids
+            or excluded_episode_ids & valid_absolute_episode_ids
+        ):
+            raise ValueError(
+                "--allow-source-exclusions requires a completed v3 delta_to_absolute replay audit "
+                "with disjoint non-empty valid_absolute_episode_ids and unrepairable_episode_ids."
+            )
+    else:
+        input_manifest = require_libero_v3_relative_ready_dataset(args.input_root)
     if input_manifest.get("stage") != "delta_to_absolute":
         raise ValueError(
-            "MAM conversion input must be the immutable delta_to_absolute v3 dataset, "
+            "MAM conversion input must be the closed-loop-rematerialized delta_to_absolute v3 dataset, "
             f"got stage={input_manifest.get('stage')!r}."
         )
     mask_types = _resolve_mask_types(args)
     input_repo_id = args.input_repo_id or _repo_id_from_root(args.input_root)
     source = LeRobotDataset(input_repo_id, root=args.input_root, return_uint8=True)
-    if args.eval_per_task is None:
+    source_episode_ids = {
+        int(row["episode_index"]) for row in source.meta.episodes
+    }
+    if valid_absolute_episode_ids is not None:
+        if valid_absolute_episode_ids | excluded_episode_ids != source_episode_ids:
+            raise ValueError(
+                "Replay-audit valid/excluded episode ids do not exactly cover source metadata."
+            )
+        if args.eval_per_task is None:
+            raise ValueError(
+                "An excluded replay-audit source requires --eval-per-task for a task-balanced split."
+            )
+    if args.eval_episode_ids is not None:
+        train_ids, eval_ids = _selected_explicit_eval_ids(
+            source,
+            args.eval_episode_ids,
+            eval_per_task=args.eval_per_task,
+            eligible_episode_ids=valid_absolute_episode_ids,
+        )
+    elif args.eval_per_task is None:
         if args.task_stratified_eval_ratio:
             train_ids, eval_ids = _selected_episode_ids_by_task_ratio(
                 source,
@@ -453,7 +564,12 @@ def main() -> None:
                 args.split_seed,
             )
     else:
-        train_ids, eval_ids = _selected_episode_ids_by_task(source, args.eval_per_task, args.split_seed)
+        train_ids, eval_ids = _selected_episode_ids_by_task(
+            source,
+            args.eval_per_task,
+            args.split_seed,
+            eligible_episode_ids=valid_absolute_episode_ids,
+        )
 
     train_root = args.output_root.with_name(f"{args.output_root.name}_train")
     eval_root = args.output_root.with_name(f"{args.output_root.name}_eval")
@@ -469,11 +585,13 @@ def main() -> None:
         "split_seed": args.split_seed,
         "eval_ratio": args.eval_ratio,
         "eval_per_task": args.eval_per_task,
+        "explicit_eval_episode_ids": args.eval_episode_ids,
         "mask_types": mask_types,
         "train_episode_ids": train_ids,
         "eval_episode_ids": eval_ids,
         "train_expanded_episode_count": len(train_ids) * len(mask_types),
         "eval_expanded_episode_count": len(eval_ids) * len(mask_types),
+        "source_excluded_episode_ids": sorted(excluded_episode_ids),
     }
     args.output_root.parent.mkdir(parents=True, exist_ok=True)
     (args.output_root.with_name(f"{args.output_root.name}_split.json")).write_text(
