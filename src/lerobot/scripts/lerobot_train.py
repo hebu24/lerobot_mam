@@ -39,6 +39,8 @@ from lerobot.common.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_state,
+    prepare_checkpoint_dir_for_save,
+    prune_checkpoint_training_state_if_not_last,
     prune_checkpoints_keep,
     save_checkpoint,
     save_policy_checkpoint,
@@ -1262,6 +1264,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             if is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")
                 checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+                prune_checkpoint_training_state_if_not_last(best_checkpoint_dir, last_checkpoint_dir)
                 save_checkpoint(
                     checkpoint_dir=checkpoint_dir,
                     step=step,
@@ -1274,6 +1277,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 )
                 update_last_checkpoint(checkpoint_dir)
                 last_checkpoint_dir = checkpoint_dir
+                prune_checkpoint_training_state_if_not_last(best_checkpoint_dir, last_checkpoint_dir)
                 if cfg.env is not None and cfg.eval_freq > 0:
                     prune_checkpoints_keep(
                         checkpoint_dir.parent,
@@ -1360,6 +1364,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     # only need policy artifacts for later inference.
                     should_save_full_checkpoint = is_saving_step or last_checkpoint_dir is None
                     if should_save_full_checkpoint:
+                        prune_checkpoint_training_state_if_not_last(best_checkpoint_dir, last_checkpoint_dir)
                         save_checkpoint(
                             checkpoint_dir=checkpoint_dir,
                             step=step,
@@ -1372,7 +1377,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                         )
                         update_last_checkpoint(checkpoint_dir)
                         last_checkpoint_dir = checkpoint_dir
+                        prune_checkpoint_training_state_if_not_last(best_checkpoint_dir, last_checkpoint_dir)
                     elif is_new_best:
+                        prepare_checkpoint_dir_for_save(checkpoint_dir)
                         save_policy_checkpoint(
                             checkpoint_dir=checkpoint_dir,
                             cfg=cfg,

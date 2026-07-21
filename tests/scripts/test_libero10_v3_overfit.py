@@ -22,7 +22,7 @@ from scripts.convert_libero_absolute_to_mam import _as_float_list
 from scripts.prepare_libero10_v3_overfit import select_overfit_episodes
 
 
-def _row(task: int, episode: int, source: int, slot: int = 0):
+def _row(task: int, episode: int, source: int, slot: int = 0, mask_type: str = "random_mask"):
     return {
         "episode_index": episode,
         "libero/task_id": task,
@@ -31,6 +31,7 @@ def _row(task: int, episode: int, source: int, slot: int = 0):
         "libero/init_state": [0.1, float(source)],
         "libero/source_file": f"task{task}.hdf5",
         "libero/source_demo": f"demo_{source}",
+        "mask_type": mask_type,
         "mask_type_slot": slot,
     }
 
@@ -58,6 +59,43 @@ def test_v3_selection_requires_exact_trajectory_metadata():
 
     with pytest.raises(ValueError, match="lacks exact v3 trajectory metadata"):
         select_overfit_episodes([row], task_ids=[0], demo_rank=0)
+
+
+def test_v3_selection_supports_multiple_demos_per_task():
+    rows = [
+        _row(0, 4, 11, 1),
+        _row(0, 3, 11, 0),
+        _row(0, 7, 20, 0),
+        _row(1, 8, 5, 0),
+        _row(1, 10, 6, 0),
+    ]
+
+    selected = select_overfit_episodes(
+        rows,
+        task_ids=[0, 1],
+        demo_rank=0,
+        demos_per_task=2,
+    )
+
+    assert [item["episode_index"] for item in selected] == [3, 7, 8, 10]
+    assert [item["source_episode_id"] for item in selected] == [11, 20, 5, 6]
+
+
+def test_v3_selection_filters_requested_mask_type():
+    rows = [
+        _row(0, 3, 11, slot=0, mask_type="random_mask"),
+        _row(0, 4, 11, slot=1, mask_type="3D_points"),
+    ]
+
+    selected = select_overfit_episodes(
+        rows,
+        task_ids=[0],
+        demo_rank=0,
+        mask_type="3D_points",
+    )
+
+    assert selected[0]["episode_index"] == 4
+    assert selected[0]["mask_type"] == "3D_points"
 
 
 def test_mam_conversion_preserves_float64_init_state():

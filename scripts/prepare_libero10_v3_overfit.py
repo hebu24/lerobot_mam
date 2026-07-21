@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-"""Select and certify the exact LIBERO-10 v3 trajectories used for DP overfit."""
+"""Select and certify exact LIBERO-10 v3 trajectories for policy overfit tests."""
 
 from __future__ import annotations
 
@@ -43,14 +43,22 @@ def select_overfit_episodes(
     *,
     task_ids: list[int],
     demo_rank: int,
+    demos_per_task: int = 1,
+    mask_type: str | None = None,
 ) -> list[dict[str, Any]]:
     if demo_rank < 0:
         raise ValueError(f"demo_rank must be non-negative, got {demo_rank}.")
+    if demos_per_task <= 0:
+        raise ValueError(f"demos_per_task must be positive, got {demos_per_task}.")
+    if mask_type is not None and not mask_type.strip():
+        raise ValueError("mask_type must be non-empty when provided.")
 
     by_task_source: dict[int, dict[int, list[Any]]] = {task_id: {} for task_id in task_ids}
     for row in rows:
         task_id = int(_row_value(row, "libero/task_id", -1))
         if task_id not in by_task_source:
+            continue
+        if mask_type is not None and str(_row_value(row, "mask_type", "")) != mask_type:
             continue
         source_id = _row_value(row, "libero/source_episode_id")
         if source_id is None:
@@ -63,43 +71,45 @@ def select_overfit_episodes(
     for task_id in task_ids:
         source_groups = by_task_source[task_id]
         source_ids = sorted(source_groups)
-        if demo_rank >= len(source_ids):
+        demo_stop = demo_rank + demos_per_task
+        if demo_stop > len(source_ids):
             raise ValueError(
                 f"Task {task_id} has {len(source_ids)} unique source trajectories; "
-                f"demo_rank={demo_rank} is unavailable."
+                f"cannot select demos [{demo_rank}, {demo_stop})."
             )
-        source_id = source_ids[demo_rank]
-        candidates = sorted(
-            source_groups[source_id],
-            key=lambda row: (
-                int(_row_value(row, "mask_type_slot", 0)),
-                int(row["episode_index"]),
-            ),
-        )
-        row = candidates[0]
-        init_state = _row_value(row, "libero/init_state")
-        source_file = _row_value(row, "libero/source_file")
-        source_demo = _row_value(row, "libero/source_demo")
-        suite = str(_row_value(row, "libero/suite", ""))
-        if suite != "libero_10" or init_state is None or source_file is None or source_demo is None:
-            raise ValueError(
-                f"Episode {int(row['episode_index'])} lacks exact v3 trajectory metadata "
-                "(suite/raw init_state/source_file/source_demo)."
+        for source_id in source_ids[demo_rank:demo_stop]:
+            candidates = sorted(
+                source_groups[source_id],
+                key=lambda row: (
+                    int(_row_value(row, "mask_type_slot", 0)),
+                    int(row["episode_index"]),
+                ),
             )
-        state = np.asarray(init_state, dtype="<f8").reshape(-1)
-        if state.size == 0 or not np.isfinite(state).all():
-            raise ValueError(f"Episode {int(row['episode_index'])} has an invalid raw init_state.")
-        selections.append(
-            {
-                "task_id": task_id,
-                "episode_index": int(row["episode_index"]),
-                "source_episode_id": source_id,
-                "source_file": str(source_file),
-                "source_demo": str(source_demo),
-                "init_state_sha256": hashlib.sha256(state.tobytes()).hexdigest(),
-                "mask_type_slot": int(_row_value(row, "mask_type_slot", 0)),
-            }
-        )
+            row = candidates[0]
+            init_state = _row_value(row, "libero/init_state")
+            source_file = _row_value(row, "libero/source_file")
+            source_demo = _row_value(row, "libero/source_demo")
+            suite = str(_row_value(row, "libero/suite", ""))
+            if suite != "libero_10" or init_state is None or source_file is None or source_demo is None:
+                raise ValueError(
+                    f"Episode {int(row['episode_index'])} lacks exact v3 trajectory metadata "
+                    "(suite/raw init_state/source_file/source_demo)."
+                )
+            state = np.asarray(init_state, dtype="<f8").reshape(-1)
+            if state.size == 0 or not np.isfinite(state).all():
+                raise ValueError(f"Episode {int(row['episode_index'])} has an invalid raw init_state.")
+            selections.append(
+                {
+                    "task_id": task_id,
+                    "episode_index": int(row["episode_index"]),
+                    "source_episode_id": source_id,
+                    "source_file": str(source_file),
+                    "source_demo": str(source_demo),
+                    "init_state_sha256": hashlib.sha256(state.tobytes()).hexdigest(),
+                    "mask_type": str(_row_value(row, "mask_type", "")),
+                    "mask_type_slot": int(_row_value(row, "mask_type_slot", 0)),
+                }
+            )
     return selections
 
 
@@ -126,6 +136,8 @@ def parse_args() -> argparse.Namespace:
         "--task-ids", default=None, help="Optional comma-separated task ids; length must equal K."
     )
     parser.add_argument("--demo-rank", type=int, default=0)
+    parser.add_argument("--demos-per-task", type=int, default=1)
+    parser.add_argument("--mask-type", default="random_mask")
     parser.add_argument("--output-plan", type=Path, default=None)
     return parser.parse_args()
 
@@ -139,6 +151,12 @@ def main() -> None:
         raise ValueError("Overfit input must be the train split produced by absolute_to_mam.")
     if manifest.get("policy_action_representation") != LIBERO_CHUNK_RELATIVE_ACTION:
         raise ValueError("Dataset manifest does not declare chunk-relative SE(3) policy actions.")
+    available_mask_types = [str(item) for item in manifest.get("mask_types", [])]
+    if args.mask_type not in available_mask_types:
+        raise ValueError(
+            f"Requested mask type {args.mask_type!r} is unavailable; "
+            f"dataset contains {available_mask_types}."
+        )
 
     metadata = LeRobotDatasetMetadata(args.dataset_repo_id, root=args.dataset_root)
     _validate_schema(metadata)
@@ -147,15 +165,19 @@ def main() -> None:
         metadata.episodes,
         task_ids=task_ids,
         demo_rank=args.demo_rank,
+        demos_per_task=args.demos_per_task,
+        mask_type=args.mask_type,
     )
     episode_ids = [item["episode_index"] for item in selections]
     plan = {
-        "version": 2,
+        "version": 3,
         "pipeline_version": manifest["pipeline_version"],
         "dataset_root": str(args.dataset_root.resolve()),
         "dataset_repo_id": args.dataset_repo_id,
         "k": args.k,
         "demo_rank": args.demo_rank,
+        "demos_per_task": args.demos_per_task,
+        "mask_type": args.mask_type,
         "task_ids": task_ids,
         "train_episode_ids": episode_ids,
         "eval_episode_ids": episode_ids,

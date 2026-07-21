@@ -97,6 +97,34 @@ def prune_checkpoints(checkpoints_dir: Path, keep_checkpoint_dir: Path | None) -
     prune_checkpoints_keep(checkpoints_dir, keep_checkpoint_dirs=[keep_checkpoint_dir])
 
 
+def prune_checkpoint_training_state(checkpoint_dir: Path | None) -> None:
+    if checkpoint_dir is None:
+        return
+
+    training_state_dir = checkpoint_dir / TRAINING_STATE_DIR
+    if training_state_dir.exists():
+        shutil.rmtree(training_state_dir)
+
+
+def prune_checkpoint_training_state_if_not_last(
+    checkpoint_dir: Path | None, last_checkpoint_dir: Path | None
+) -> None:
+    if checkpoint_dir is None or last_checkpoint_dir is None:
+        return
+    if checkpoint_dir.resolve(strict=False) == last_checkpoint_dir.resolve(strict=False):
+        return
+
+    prune_checkpoint_training_state(checkpoint_dir)
+
+
+def prepare_checkpoint_dir_for_save(checkpoint_dir: Path) -> None:
+    if checkpoint_dir.exists():
+        if checkpoint_dir.is_symlink() or checkpoint_dir.is_file():
+            checkpoint_dir.unlink()
+        elif checkpoint_dir.is_dir():
+            shutil.rmtree(checkpoint_dir)
+
+
 def save_checkpoint(
     checkpoint_dir: Path,
     step: int,
@@ -108,6 +136,7 @@ def save_checkpoint(
     postprocessor: PolicyProcessorPipeline | None = None,
 ) -> None:
     """Save a full resumable checkpoint: policy, processors, optimizer, scheduler, RNG, and step."""
+    prepare_checkpoint_dir_for_save(checkpoint_dir)
     save_policy_checkpoint(
         checkpoint_dir=checkpoint_dir,
         cfg=cfg,

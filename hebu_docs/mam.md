@@ -222,7 +222,7 @@ bash scripts/train_diffusion_libero_put_bowl_on_plate_multigpu.sh \
 ### 6. 正式 MAM 训练与固定 split 评估
 
 ```bash
-STPM_PATHS='{"libero_10/0":"outputs/train/stpm_libero10_v2_task0","libero_10/1":"outputs/train/stpm_libero10_v2_task1","libero_10/2":"outputs/train/stpm_libero10_v2_task2","libero_10/3":"outputs/train/stpm_libero10_v2_task3","libero_10/4":"outputs/train/stpm_libero10_v2_task4","libero_10/5":"outputs/train/stpm_libero10_v2_task5","libero_10/6":"outputs/train/stpm_libero10_v2_task6","libero_10/7":"outputs/train/stpm_libero10_v2_task7","libero_10/8":"outputs/train/stpm_libero10_v2_task8","libero_10/9":"outputs/train/stpm_libero10_v2_task9"}' \
+STPM_PATHS='{"libero_10/0":"outputs/train/stpm_libero10_v2_task0","bash scripts/run_mam_libero10_v3_overfit.sh 1libero_10/1":"outputs/train/stpm_libero10_v2_task1","libero_10/2":"outputs/train/stpm_libero10_v2_task2","libero_10/3":"outputs/train/stpm_libero10_v2_task3","libero_10/4":"outputs/train/stpm_libero10_v2_task4","libero_10/5":"outputs/train/stpm_libero10_v2_task5","libero_10/6":"outputs/train/stpm_libero10_v2_task6","libero_10/7":"outputs/train/stpm_libero10_v2_task7","libero_10/8":"outputs/train/stpm_libero10_v2_task8","libero_10/9":"outputs/train/stpm_libero10_v2_task9"}' \
 CUDA_VISIBLE_DEVICES=0 \
 NUM_GPUS=1 \
 POLICY_DEVICE=cuda \

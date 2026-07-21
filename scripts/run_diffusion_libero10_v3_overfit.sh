@@ -27,7 +27,7 @@ DATASET_REPO_ID="${DATASET_REPO_ID:-local/libero10_mam_v3_sample_train}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/train/diffusion_libero10_v3_overfit_k${K}}"
 PLAN_PATH="${PLAN_PATH:-${OUTPUT_DIR}.selection.json}"
 
-STEPS="${STEPS:-30000}"
+STEPS="${STEPS:-20000}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"

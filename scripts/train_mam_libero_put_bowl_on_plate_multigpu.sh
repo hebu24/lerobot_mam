@@ -58,14 +58,21 @@ train_args=(
   --job_name="${JOB_NAME}"
   --batch_size="${BATCH_SIZE}"
   --num_workers="${NUM_WORKERS}"
-  --prefetch_factor="${PREFETCH_FACTOR}"
-  --persistent_workers="${PERSISTENT_WORKERS}"
   --steps="${STEPS}"
   --save_freq="${SAVE_FREQ}"
   --eval_freq="${EVAL_FREQ}"
   --log_freq="${LOG_FREQ}"
   --wandb.enable="${WANDB_ENABLE}"
 )
+
+if [[ "${NUM_WORKERS}" -gt 0 ]]; then
+  train_args+=(
+    --prefetch_factor="${PREFETCH_FACTOR}"
+    --persistent_workers="${PERSISTENT_WORKERS}"
+  )
+else
+  train_args+=(--persistent_workers=false)
+fi
 
 if [[ -n "${OUTPUT_DIR:-}" ]]; then
   train_args+=(--output_dir="${OUTPUT_DIR}")
