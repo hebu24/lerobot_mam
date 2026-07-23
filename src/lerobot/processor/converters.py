@@ -328,6 +328,15 @@ def policy_action_to_transition(action: PolicyAction) -> EnvTransition:
     return create_transition(action=action)
 
 
+def policy_action_with_context_to_transition(data: PolicyAction | dict[str, Any]) -> EnvTransition:
+    """Convert an action or an action-plus-observation context to a transition."""
+    if isinstance(data, PolicyAction):
+        return policy_action_to_transition(data)
+    if isinstance(data, dict):
+        return batch_to_transition(data)
+    raise ValueError(f"Expected a PolicyAction or context dictionary, got {type(data)}")
+
+
 def batch_to_transition(batch: dict[str, Any]) -> EnvTransition:
     """
     Convert a batch dictionary from a dataset/dataloader into an `EnvTransition`.

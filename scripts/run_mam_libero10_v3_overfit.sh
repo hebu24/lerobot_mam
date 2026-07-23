@@ -203,7 +203,7 @@ export ENV_OBSERVATION_HEIGHT=128
 export ENV_OBSERVATION_WIDTH=128
 export OUTPUT_DIR
 export JOB_NAME="${JOB_NAME:-mam_libero10_v3_overfit_mode${MODE}_tasks${TASK_TAG}_${TOTAL_DEMOS}demos}"
-export STEPS="${STEPS:-20000}"
+export STEPS="${STEPS:-40000}"
 export SAVE_FREQ="${SAVE_FREQ:-1000}"
 export LOG_FREQ="${LOG_FREQ:-200}"
 export BATCH_SIZE="${BATCH_SIZE:-32}"

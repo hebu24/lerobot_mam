@@ -20,12 +20,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from lerobot.scripts.lerobot_train import (
-    _restore_resume_eval_state,
-    _trim_jsonl_after_step,
-    apply_diffusion_relative_action_stats,
-    apply_overfit_subset_stats,
-)
+from lerobot.common.train_utils import restore_resume_eval_state, trim_jsonl_after_step
+from lerobot.datasets.libero_training import apply_diffusion_relative_action_stats
+from lerobot.datasets.training import apply_overfit_subset_stats
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 
@@ -121,9 +118,7 @@ def test_normal_v3_training_reuses_certified_relative_stats(tmp_path, monkeypatc
             }
         )
     )
-    action_stats = {
-        key: torch.zeros(7) for key in ("mean", "std", "min", "max", "q01", "q99")
-    }
+    action_stats = {key: torch.zeros(7) for key in ("mean", "std", "min", "max", "q01", "q99")}
     dataset = SimpleNamespace(
         root=root,
         hf_dataset=object(),
@@ -197,8 +192,8 @@ def test_resume_trims_future_logs_and_restores_best_eval(tmp_path):
     ]
     eval_path.write_text("".join(f"{json.dumps(record)}\n" for record in records))
 
-    kept = _trim_jsonl_after_step(eval_path, max_step=100)
-    score, checkpoint_dir = _restore_resume_eval_state(
+    kept = trim_jsonl_after_step(eval_path, max_step=100)
+    score, checkpoint_dir = restore_resume_eval_state(
         kept,
         output_dir=output_dir,
         total_steps=1000,

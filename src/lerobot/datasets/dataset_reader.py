@@ -261,6 +261,26 @@ class DatasetReader:
             futures = [pool.submit(_decode_single, k, ts) for k, ts in items]
             return dict(f.result() for f in futures)
 
+    def _resolve_task_description(self, task_idx: int, ep_idx: int) -> str:
+        """Resolve frame language while tolerating stale per-frame task indices.
+
+        ``task_index`` is normally authoritative because an episode may contain
+        multiple task strings. For the common one-task-per-episode layout,
+        ``meta/episodes`` gives us an independent consistency check. Prefer that
+        single episode task when it disagrees with ``tasks.parquet`` so language
+        conditioning remains aligned with the episode/init-state metadata.
+        """
+        indexed_task = str(self._meta.tasks.iloc[task_idx].name)
+        episode = self._meta.episodes[ep_idx]
+        try:
+            episode_tasks = episode["tasks"]
+        except (KeyError, TypeError):
+            return indexed_task
+        if not isinstance(episode_tasks, (list, tuple)) or len(episode_tasks) != 1:
+            return indexed_task
+        episode_task = str(episode_tasks[0]).strip()
+        return episode_task or indexed_task
+
     def get_item(self, idx) -> dict:
         """Core __getitem__ logic. Assumes hf_dataset is loaded.
 
@@ -293,6 +313,6 @@ class DatasetReader:
 
         # Add task as a string
         task_idx = item["task_index"].item()
-        item["task"] = self._meta.tasks.iloc[task_idx].name
+        item["task"] = self._resolve_task_description(task_idx, ep_idx)
 
         return item

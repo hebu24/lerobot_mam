@@ -26,7 +26,7 @@ from lerobot.configs import PipelineFeatureType, PolicyFeature
 from lerobot.types import EnvTransition, TransitionKey
 from lerobot.utils.constants import OBS_STATE
 
-from .pipeline import ProcessorStep, ProcessorStepRegistry
+from .pipeline import PolicyProcessorPipeline, ProcessorStep, ProcessorStepRegistry
 
 LIBERO_DELTA_POS_SCALE = 0.05
 LIBERO_DELTA_ROT_SCALE = 0.5
@@ -291,7 +291,9 @@ def slice_current_action_window(
     ``n_action_steps`` actions. In that case, the chunk is already executable.
     """
     if action_chunk.ndim < 3:
-        raise ValueError(f"Expected action chunk with shape (batch, horizon, action_dim), got {action_chunk.shape}.")
+        raise ValueError(
+            f"Expected action chunk with shape (batch, horizon, action_dim), got {action_chunk.shape}."
+        )
     if n_obs_steps < 1:
         raise ValueError(f"n_obs_steps must be >= 1, got {n_obs_steps}.")
     if n_action_steps < 1:
@@ -337,3 +339,93 @@ class LiberoChunkRelativeActionsProcessorStep(ProcessorStep):
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
         return features
+
+
+@ProcessorStepRegistry.register("libero_chunk_relative_actions_postprocessor")
+@dataclass
+class LiberoChunkRelativeActionsPostprocessorStep(ProcessorStep):
+    """Decode a LIBERO chunk-relative policy output into executable absolute goals."""
+
+    enabled: bool = False
+    n_obs_steps: int = 1
+    n_action_steps: int = 1
+
+    @property
+    def requires_transition_context(self) -> bool:
+        return self.enabled
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        action = transition.get(TransitionKey.ACTION)
+        if not self.enabled or action is None:
+            return transition
+
+        observation = transition.get(TransitionKey.OBSERVATION)
+        state = observation.get(OBS_STATE) if observation else None
+        if state is None:
+            raise ValueError(
+                "LIBERO chunk-relative action postprocessing requires observation.state "
+                "from the chunk generation step."
+            )
+
+        anchor_state = state[:, -1] if state.ndim >= 3 else state
+        absolute_action = chunk_relative_to_absolute(action, anchor_state)
+        if not isinstance(absolute_action, Tensor):
+            absolute_action = torch.as_tensor(absolute_action, device=action.device, dtype=action.dtype)
+        if absolute_action.ndim >= 3:
+            absolute_action = slice_current_action_window(
+                absolute_action,
+                n_obs_steps=self.n_obs_steps,
+                n_action_steps=self.n_action_steps,
+            )
+        elif absolute_action.ndim != 2:
+            raise ValueError(
+                "Expected LIBERO actions with shape (batch, action_dim) or "
+                f"(batch, horizon, action_dim), got {tuple(absolute_action.shape)}."
+            )
+
+        new_transition = transition.copy()
+        new_transition[TransitionKey.ACTION] = absolute_action
+        return new_transition
+
+    def get_config(self) -> dict[str, object]:
+        return {
+            "enabled": self.enabled,
+            "n_obs_steps": self.n_obs_steps,
+            "n_action_steps": self.n_action_steps,
+        }
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
+def ensure_libero_chunk_relative_actions_postprocessor(
+    postprocessor: PolicyProcessorPipeline,
+    *,
+    enabled: bool,
+    n_obs_steps: int,
+    n_action_steps: int,
+) -> None:
+    """Add the context-aware decoder when loading a legacy processor checkpoint."""
+    if not enabled or any(
+        isinstance(step, LiberoChunkRelativeActionsPostprocessorStep) for step in postprocessor.steps
+    ):
+        return
+
+    decoder = LiberoChunkRelativeActionsPostprocessorStep(
+        enabled=True,
+        n_obs_steps=n_obs_steps,
+        n_action_steps=n_action_steps,
+    )
+    steps = list(postprocessor.steps)
+    insert_at = next(
+        (
+            index
+            for index, step in enumerate(steps)
+            if getattr(step.__class__, "_registry_name", None) == "device_processor"
+        ),
+        len(steps),
+    )
+    steps.insert(insert_at, decoder)
+    postprocessor.steps = steps

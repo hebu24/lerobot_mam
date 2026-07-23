@@ -13,10 +13,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
+import logging
 import shutil
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
+import torch
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
@@ -38,6 +42,100 @@ from lerobot.utils.constants import (
 )
 from lerobot.utils.io_utils import load_json, write_json
 from lerobot.utils.random_utils import load_rng_state, save_rng_state
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return value.detach().cpu().item()
+        return value.detach().cpu().tolist()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "__fspath__"):
+        return str(value)
+    if hasattr(value, "tolist"):
+        return _json_safe(value.tolist())
+    if hasattr(value, "item"):
+        return _json_safe(value.item())
+    return str(value)
+
+
+def append_jsonl(path: Path, record: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(_json_safe(record), ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def trim_jsonl_after_step(path: Path, max_step: int) -> list[dict[str, Any]]:
+    """Drop stale records written after the checkpoint used for resume."""
+    if not path.exists():
+        return []
+
+    kept_lines: list[str] = []
+    kept_records: list[dict[str, Any]] = []
+    dropped = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+            record_step = int(record["step"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            dropped += 1
+            continue
+        if record_step <= max_step:
+            kept_lines.append(line)
+            kept_records.append(record)
+        else:
+            dropped += 1
+
+    if dropped:
+        tmp_path = path.with_suffix(f"{path.suffix}.resume_tmp")
+        tmp_path.write_text("\n".join(kept_lines) + ("\n" if kept_lines else ""), encoding="utf-8")
+        tmp_path.replace(path)
+        logging.info("Resume trimmed %d stale/malformed record(s) from %s", dropped, path)
+    return kept_records
+
+
+def restore_resume_eval_state(
+    eval_records: list[dict[str, Any]],
+    *,
+    output_dir: Path,
+    total_steps: int,
+    checkpoint_path: Path | None,
+) -> tuple[tuple[float, float] | None, Path | None]:
+    """Restore best-eval bookkeeping when resuming a run."""
+    scored_records: list[tuple[tuple[float, float], int]] = []
+    for record in eval_records:
+        overall = record.get("metrics", {}).get("overall", {})
+        try:
+            score = (float(overall["pc_success"]), float(overall.get("avg_sum_reward", 0.0)))
+            scored_records.append((score, int(record["step"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not scored_records:
+        return None, None
+
+    best_score, best_step = max(scored_records, key=lambda item: item[0])
+    best_checkpoint_dir = get_step_checkpoint_dir(output_dir, total_steps, best_step)
+    if not best_checkpoint_dir.exists():
+        best_link = output_dir / "checkpoints" / "best"
+        if best_link.exists():
+            best_checkpoint_dir = best_link.resolve()
+        elif checkpoint_path is not None and checkpoint_path.exists():
+            best_checkpoint_dir = checkpoint_path
+        else:
+            logging.warning(
+                "Resume recovered best eval score %s at step %d, but no corresponding checkpoint exists.",
+                best_score,
+                best_step,
+            )
+            best_checkpoint_dir = None
+    return best_score, best_checkpoint_dir
 
 
 def get_step_identifier(step: int, total_steps: int) -> str:
@@ -83,7 +181,9 @@ def prune_checkpoints_keep(checkpoints_dir: Path, keep_checkpoint_dirs: Iterable
     if not checkpoints_dir.exists():
         return
 
-    keep_names = {checkpoint_dir.name for checkpoint_dir in keep_checkpoint_dirs if checkpoint_dir is not None}
+    keep_names = {
+        checkpoint_dir.name for checkpoint_dir in keep_checkpoint_dirs if checkpoint_dir is not None
+    }
     for child in checkpoints_dir.iterdir():
         if child.name in {LAST_CHECKPOINT_LINK, "best"} or child.name in keep_names:
             continue

@@ -124,6 +124,20 @@ def test_mam_processor_normalizes_relative_actions_before_masking():
     assert not torch.allclose(masked_relative, premasked_relative * mas_mask)
 
 
+def test_mam_postprocessor_decodes_relative_chunk_with_explicit_anchor():
+    cfg = _make_config()
+    _, postprocessor = make_mam_pre_post_processors(cfg, _make_stats())
+    anchor = torch.tensor([[0.2, -0.1, 0.3, 0.4, -0.3, 0.2]], dtype=torch.float32)
+    relative = torch.randn(1, cfg.n_action_steps, 7) * 0.01
+    relative[..., 6] = 1.0
+    expected_absolute = chunk_relative_to_absolute(relative, anchor)
+
+    absolute = postprocessor({ACTION: relative, OBS_STATE: anchor})
+
+    assert postprocessor.requires_transition_context is True
+    torch.testing.assert_close(absolute, expected_absolute, atol=1e-6, rtol=1e-6)
+
+
 def test_mam_long_encoder_preserves_observation_axis_and_pools_time_axis():
     encoder = MamLongWindowEncoder(step_dim=8, out_dim=5)
     pool_input_shapes = []

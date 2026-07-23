@@ -19,7 +19,6 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 """
 
 import dataclasses
-import json
 import logging
 import time
 from contextlib import nullcontext
@@ -36,14 +35,17 @@ from torch.optim import Optimizer
 from tqdm import tqdm
 
 from lerobot.common.train_utils import (
+    append_jsonl,
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_state,
     prepare_checkpoint_dir_for_save,
     prune_checkpoint_training_state_if_not_last,
     prune_checkpoints_keep,
+    restore_resume_eval_state,
     save_checkpoint,
     save_policy_checkpoint,
+    trim_jsonl_after_step,
     update_best_checkpoint,
     update_last_checkpoint,
 )
@@ -51,12 +53,22 @@ from lerobot.common.wandb_utils import WandBLogger
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets import EpisodeAwareSampler, make_dataset
+from lerobot.datasets.training import (
+    get_sampler_episode_boundaries,
+    prepare_dataset_for_training,
+    prepare_training_config,
+)
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.optim.factory import make_optimizer_and_scheduler
-from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
+from lerobot.policies import (
+    PreTrainedPolicy,
+    make_policy,
+    make_pre_post_processors,
+    prepare_policy_evaluation,
+    run_policy_evaluation,
+)
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
-from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
@@ -68,666 +80,7 @@ from lerobot.utils.utils import (
     inside_slurm,
 )
 
-from .lerobot_eval import (
-    configure_fixed_libero_eval_from_dataset,
-    eval_policy_all,
-    validate_libero_action_semantics,
-)
-
-LIBERO_INIT_STATE_ID_KEYS = (
-    "libero/init_state_id",
-    "init_state_id",
-)
-LIBERO_INIT_STATE_VALUE_KEYS = (
-    "libero/init_state",
-    "init_state",
-)
-LIBERO_TASK_ID_KEYS = (
-    "libero/task_id",
-    "task_id",
-)
-LIBERO_SUITE_KEYS = (
-    "libero/suite",
-    "suite",
-)
-
-
-def _json_safe(value: Any) -> Any:
-    if isinstance(value, torch.Tensor):
-        if value.numel() == 1:
-            return value.detach().cpu().item()
-        return value.detach().cpu().tolist()
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    if isinstance(value, dict):
-        return {str(k): _json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(v) for v in value]
-    if hasattr(value, "__fspath__"):
-        return str(value)
-    if hasattr(value, "tolist"):
-        return _json_safe(value.tolist())
-    if hasattr(value, "item"):
-        return _json_safe(value.item())
-    return str(value)
-
-
-def _append_jsonl(path: Any, record: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(_json_safe(record), ensure_ascii=False, sort_keys=True) + "\n")
-
-
-def _trim_jsonl_after_step(path: Path, max_step: int) -> list[dict[str, Any]]:
-    """Drop stale records written after the checkpoint used for resume."""
-    if not path.exists():
-        return []
-
-    kept_lines: list[str] = []
-    kept_records: list[dict[str, Any]] = []
-    dropped = 0
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            record = json.loads(line)
-            record_step = int(record["step"])
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            dropped += 1
-            continue
-        if record_step <= max_step:
-            kept_lines.append(line)
-            kept_records.append(record)
-        else:
-            dropped += 1
-
-    if dropped:
-        tmp_path = path.with_suffix(f"{path.suffix}.resume_tmp")
-        tmp_path.write_text("\n".join(kept_lines) + ("\n" if kept_lines else ""), encoding="utf-8")
-        tmp_path.replace(path)
-        logging.info("Resume trimmed %d stale/malformed record(s) from %s", dropped, path)
-    return kept_records
-
-
-def _restore_resume_eval_state(
-    eval_records: list[dict[str, Any]],
-    *,
-    output_dir: Path,
-    total_steps: int,
-    checkpoint_path: Path | None,
-) -> tuple[tuple[float, float] | None, Path | None]:
-    """Restore best-eval bookkeeping instead of treating resume as a fresh run."""
-    scored_records: list[tuple[tuple[float, float], int]] = []
-    for record in eval_records:
-        overall = record.get("metrics", {}).get("overall", {})
-        try:
-            score = (float(overall["pc_success"]), float(overall.get("avg_sum_reward", 0.0)))
-            scored_records.append((score, int(record["step"])))
-        except (KeyError, TypeError, ValueError):
-            continue
-    if not scored_records:
-        return None, None
-
-    best_score, best_step = max(scored_records, key=lambda item: item[0])
-    best_checkpoint_dir = get_step_checkpoint_dir(output_dir, total_steps, best_step)
-    if not best_checkpoint_dir.exists():
-        best_link = output_dir / "checkpoints" / "best"
-        if best_link.exists():
-            best_checkpoint_dir = best_link.resolve()
-        elif checkpoint_path is not None and checkpoint_path.exists():
-            best_checkpoint_dir = checkpoint_path
-        else:
-            logging.warning(
-                "Resume recovered best eval score %s at step %d, but no corresponding checkpoint exists.",
-                best_score,
-                best_step,
-            )
-            best_checkpoint_dir = None
-    return best_score, best_checkpoint_dir
-
-
-def apply_overfit_test_config(cfg: TrainPipelineConfig) -> None:
-    """Restrict training/eval to the first fixed demos for pipeline debugging."""
-    if not cfg.overfit_test:
-        return
-    if cfg.overfit_per_task:
-        cfg.eval.n_episodes = cfg.num_overfit_per_task
-        cfg.eval.batch_size = (
-            min(cfg.eval.batch_size, cfg.num_overfit_per_task)
-            if cfg.eval.batch_size
-            else cfg.num_overfit_per_task
-        )
-        logging.info(
-            "Task-aware overfit test enabled: selecting %d episode(s) per task.",
-            cfg.num_overfit_per_task,
-        )
-        return
-
-    overfit_episodes = (
-        list(cfg.dataset.episodes) if cfg.dataset.episodes is not None else list(range(cfg.num_overfit))
-    )
-    if not overfit_episodes:
-        raise ValueError("overfit_test=True requires at least one selected episode.")
-    cfg.dataset.episodes = overfit_episodes
-    cfg.eval.n_episodes = len(overfit_episodes)
-    cfg.eval.batch_size = (
-        min(cfg.eval.batch_size, len(overfit_episodes)) if cfg.eval.batch_size else len(overfit_episodes)
-    )
-    logging.info(
-        "Overfit test enabled: training episodes=%s, eval.n_episodes=%d, eval.batch_size=%d",
-        overfit_episodes,
-        cfg.eval.n_episodes,
-        cfg.eval.batch_size,
-    )
-
-
-def _metadata_column_names(episodes: Any) -> set[str]:
-    return set(getattr(episodes, "column_names", []) or [])
-
-
-def _first_existing_column(columns: set[str], candidates: tuple[str, ...]) -> str | None:
-    return next((key for key in candidates if key in columns), None)
-
-
-def _row_get(row: Any, key: str | None, default: Any = None) -> Any:
-    if key is None:
-        return default
-    try:
-        return row[key]
-    except (KeyError, TypeError):
-        return default
-
-
-def _as_float_list(value: Any) -> list[float] | None:
-    if value is None:
-        return None
-    if isinstance(value, torch.Tensor):
-        value = value.detach().cpu().tolist()
-    elif hasattr(value, "tolist"):
-        value = value.tolist()
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except json.JSONDecodeError:
-            return None
-    if not isinstance(value, (list, tuple)) or len(value) == 0:
-        return None
-    return [float(item) for item in value]
-
-
-def apply_overfit_per_task_episode_selection(cfg: TrainPipelineConfig) -> None:
-    """Select fixed demos by LIBERO task before constructing the training dataset."""
-    if not cfg.overfit_test or not cfg.overfit_per_task:
-        return
-
-    from lerobot.datasets import LeRobotDatasetMetadata
-
-    meta = LeRobotDatasetMetadata(cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision)
-    columns = _metadata_column_names(meta.episodes)
-    task_id_key = _first_existing_column(columns, LIBERO_TASK_ID_KEYS)
-    if task_id_key is None:
-        raise ValueError(
-            f"overfit_per_task=True requires episode metadata with one of: {', '.join(LIBERO_TASK_ID_KEYS)}"
-        )
-    suite_key = _first_existing_column(columns, LIBERO_SUITE_KEYS)
-
-    candidates = set(cfg.dataset.episodes) if cfg.dataset.episodes is not None else None
-    rows_by_task: dict[int, list[tuple[int, str]]] = {}
-    for row in meta.episodes:
-        episode_index = int(row["episode_index"])
-        if candidates is not None and episode_index not in candidates:
-            continue
-        task_id = int(row[task_id_key])
-        suite = str(_row_get(row, suite_key, getattr(cfg.env, "task", "")))
-        rows_by_task.setdefault(task_id, []).append((episode_index, suite))
-
-    if not rows_by_task:
-        raise ValueError("overfit_per_task=True did not match any dataset episodes.")
-
-    selected: list[int] = []
-    suites: set[str] = set()
-    for task_id in sorted(rows_by_task):
-        rows = sorted(rows_by_task[task_id], key=lambda item: item[0])
-        if len(rows) < cfg.num_overfit_per_task:
-            raise ValueError(
-                f"Task {task_id} has only {len(rows)} episode(s), cannot select {cfg.num_overfit_per_task}."
-            )
-        chosen = rows[: cfg.num_overfit_per_task]
-        selected.extend(ep for ep, _ in chosen)
-        suites.update(suite for _, suite in chosen if suite)
-
-    cfg.dataset.episodes = selected
-    if cfg.env is not None and getattr(cfg.env, "type", None) in {"libero", "libero_plus"}:
-        if hasattr(cfg.env, "task_ids"):
-            cfg.env.task_ids = sorted(rows_by_task)
-        if len(suites) == 1 and hasattr(cfg.env, "task"):
-            cfg.env.task = next(iter(suites))
-    logging.info("Task-aware overfit selected dataset episodes=%s", selected)
-
-
-def apply_overfit_eval_init_state_ids(cfg: TrainPipelineConfig, dataset: Any) -> None:
-    """Read fixed LIBERO init states from the selected training demos and pass them to eval envs."""
-    if not cfg.overfit_test or cfg.env is None:
-        return
-    if getattr(cfg.env, "type", None) not in {"libero", "libero_plus"}:
-        return
-    if not hasattr(cfg.env, "init_state_ids") and not hasattr(cfg.env, "init_state_values"):
-        logging.warning(
-            "overfit_test=True but env has no fixed init-state fields; skip fixed init-state wiring."
-        )
-        return
-
-    overfit_episodes = cfg.dataset.episodes or list(range(cfg.num_overfit))
-    episode_rows = {int(row["episode_index"]): row for row in dataset.meta.episodes}
-    missing = [ep for ep in overfit_episodes if ep not in episode_rows]
-    if missing:
-        raise ValueError(f"Overfit episodes missing from dataset metadata: {missing}")
-
-    column_names = _metadata_column_names(dataset.meta.episodes)
-    init_state_value_key = _first_existing_column(column_names, LIBERO_INIT_STATE_VALUE_KEYS)
-    init_state_key = _first_existing_column(column_names, LIBERO_INIT_STATE_ID_KEYS)
-    if init_state_value_key is None and init_state_key is None:
-        logging.warning(
-            "Dataset episode metadata has no LIBERO init-state column (%s) or init-state id column (%s). "
-            "Falling back to episode_index as init_state_id.",
-            ", ".join(LIBERO_INIT_STATE_VALUE_KEYS),
-            ", ".join(LIBERO_INIT_STATE_ID_KEYS),
-        )
-
-    if cfg.overfit_per_task:
-        task_id_key = _first_existing_column(column_names, LIBERO_TASK_ID_KEYS)
-        if task_id_key is None:
-            raise ValueError(
-                "overfit_per_task=True requires episode metadata with one of: "
-                f"{', '.join(LIBERO_TASK_ID_KEYS)}"
-            )
-        suite_key = _first_existing_column(column_names, LIBERO_SUITE_KEYS)
-        rows_by_task: dict[int, list[Any]] = {}
-        for episode_index in overfit_episodes:
-            row = episode_rows[int(episode_index)]
-            rows_by_task.setdefault(int(row[task_id_key]), []).append(row)
-
-        init_state_values_by_task: dict[str, list[list[float]]] = {}
-        init_state_ids_by_task: dict[str, list[int]] = {}
-        task_ids: set[int] = set()
-        eval_episode_ids_by_task: dict[int, list[int]] = {}
-        for task_id in sorted(rows_by_task):
-            rows = sorted(rows_by_task[task_id], key=lambda item: int(item["episode_index"]))
-            if len(rows) < cfg.num_overfit_per_task:
-                raise ValueError(
-                    f"Task {task_id} has only {len(rows)} selected training episode(s) for eval; "
-                    f"need {cfg.num_overfit_per_task}."
-                )
-            chosen = rows[: cfg.num_overfit_per_task]
-            eval_episode_ids_by_task[task_id] = [int(row["episode_index"]) for row in chosen]
-            for row in chosen:
-                suite = str(_row_get(row, suite_key, getattr(cfg.env, "task", "libero_10")))
-                task_key = f"{suite}/{task_id}"
-                if init_state_value_key is not None and hasattr(cfg.env, "init_state_values_by_task"):
-                    init_state_value = _as_float_list(_row_get(row, init_state_value_key))
-                    if init_state_value is None:
-                        raise ValueError(
-                            f"Episode {int(row['episode_index'])} has invalid {init_state_value_key}."
-                        )
-                    init_state_values_by_task.setdefault(task_key, []).append(init_state_value)
-                else:
-                    init_state_id = (
-                        int(row[init_state_key]) if init_state_key is not None else int(row["episode_index"])
-                    )
-                    init_state_ids_by_task.setdefault(task_key, []).append(init_state_id)
-            task_ids.add(task_id)
-        cfg.env.task_ids = sorted(task_ids)
-        if init_state_values_by_task:
-            cfg.env.init_state_values_by_task = init_state_values_by_task
-            if hasattr(cfg.env, "init_state_ids_by_task"):
-                cfg.env.init_state_ids_by_task = None
-            if hasattr(cfg.env, "num_steps_wait"):
-                cfg.env.num_steps_wait = 0
-            logging.info(
-                "Overfit eval fixed LIBERO raw init_state_values_by_task for %d task(s).",
-                len(init_state_values_by_task),
-            )
-        elif hasattr(cfg.env, "init_state_ids_by_task"):
-            cfg.env.init_state_ids_by_task = init_state_ids_by_task
-            logging.info("Overfit eval fixed LIBERO init_state_ids_by_task=%s", init_state_ids_by_task)
-        logging.info(
-            "Task-aware overfit eval uses selected training dataset episodes by task=%s",
-            eval_episode_ids_by_task,
-        )
-        return
-
-    if init_state_value_key is not None and hasattr(cfg.env, "init_state_values"):
-        init_state_values = []
-        for ep in overfit_episodes:
-            init_state_value = _as_float_list(_row_get(episode_rows[ep], init_state_value_key))
-            if init_state_value is None:
-                raise ValueError(f"Episode {ep} has invalid {init_state_value_key}.")
-            init_state_values.append(init_state_value)
-        cfg.env.init_state_values = init_state_values
-        if hasattr(cfg.env, "init_state_ids"):
-            cfg.env.init_state_ids = None
-        if hasattr(cfg.env, "num_steps_wait"):
-            cfg.env.num_steps_wait = 0
-        logging.info(
-            "Overfit eval fixed LIBERO raw init_state_values from %d selected demo(s).",
-            len(init_state_values),
-        )
-        return
-
-    init_state_ids = [
-        (
-            int(episode_rows[ep][init_state_key])
-            if init_state_key is not None
-            else int(episode_rows[ep]["episode_index"])
-        )
-        for ep in overfit_episodes
-    ]
-    cfg.env.init_state_ids = init_state_ids
-    logging.info("Overfit eval fixed LIBERO init_state_ids=%s", init_state_ids)
-
-
-def apply_diffusion_relative_action_stats(cfg: TrainPipelineConfig, dataset: Any) -> None:
-    """Use stats from the same chunk-relative action space consumed by DP/MAM."""
-    active_cfg = cfg.trainable_config
-    policy_type = getattr(active_cfg, "type", None)
-    if policy_type not in {"diffusion", "mam"}:
-        return
-    if policy_type == "diffusion" and not getattr(active_cfg, "use_relative_actions", False):
-        return
-    if ACTION not in dataset.meta.features or OBS_STATE not in dataset.meta.features:
-        raise ValueError(
-            "Diffusion use_relative_actions=True requires action and observation.state features."
-        )
-
-    # Normal v3 datasets already contain independently audited chunk-relative
-    # action stats. Recomputing them at every launch is wasteful and, before the
-    # numeric-column projection in compute_stats.py, also decoded the full image
-    # dataset. Strict overfit runs still recompute on their selected trajectory.
-    dataset_root = getattr(dataset, "root", None) or getattr(dataset.meta, "root", None)
-    if not getattr(cfg, "overfit_test", False) and dataset_root is not None:
-        from lerobot.datasets.libero_pipeline import read_libero_pipeline_manifest
-
-        try:
-            manifest = read_libero_pipeline_manifest(dataset_root)
-        except FileNotFoundError:
-            manifest = {}
-        expected_indices = [int(value) for value in active_cfg.action_delta_indices]
-        certified_indices = manifest.get("relative_action_stats_action_delta_indices")
-        if manifest.get("relative_action_stats") is True and certified_indices is not None:
-            certified_indices = [int(value) for value in certified_indices]
-            if certified_indices != expected_indices:
-                raise ValueError(
-                    "Dataset relative action stats do not match the policy horizon: "
-                    f"dataset={certified_indices}, policy={expected_indices}."
-                )
-            action_stats = (dataset.meta.stats or {}).get(ACTION)
-            required_stats = {"mean", "std", "min", "max", "q01", "q99"}
-            if action_stats is None or not required_stats.issubset(action_stats):
-                raise ValueError(
-                    "Dataset manifest certifies relative action stats but meta/stats.json is incomplete."
-                )
-            logging.info("Using precomputed audited LIBERO chunk-relative action stats.")
-            return
-
-    from lerobot.datasets.compute_stats import compute_libero_relative_action_stats
-
-    dataset.meta.stats = dataset.meta.stats or {}
-    dataset.meta.stats[ACTION] = compute_libero_relative_action_stats(
-        hf_dataset=dataset.hf_dataset,
-        action_delta_indices=active_cfg.action_delta_indices,
-        num_workers=cfg.num_workers,
-    )
-    logging.info("Using LIBERO chunk-relative action stats for %s normalization.", policy_type)
-
-
-def _validate_libero_split_provenance(
-    train_manifest: dict[str, Any],
-    eval_manifest: dict[str, Any],
-) -> None:
-    """Require normal train/eval splits from one source with no trajectory leakage."""
-    train_source_root = train_manifest.get("source_root")
-    eval_source_root = eval_manifest.get("source_root")
-    train_source_repo = train_manifest.get("source_repo_id")
-    eval_source_repo = eval_manifest.get("source_repo_id")
-    if (
-        not train_source_root
-        or not eval_source_root
-        or Path(train_source_root).resolve() != Path(eval_source_root).resolve()
-        or not train_source_repo
-        or train_source_repo != eval_source_repo
-    ):
-        raise ValueError("LIBERO v3 train/eval manifests must reference the same absolute source dataset.")
-
-    train_source_ids = {int(value) for value in train_manifest.get("source_episode_ids", [])}
-    eval_source_ids = {int(value) for value in eval_manifest.get("source_episode_ids", [])}
-    if not train_source_ids or not eval_source_ids:
-        raise ValueError("LIBERO v3 train/eval manifests must list non-empty source_episode_ids.")
-    overlap = sorted(train_source_ids & eval_source_ids)
-    if overlap:
-        raise ValueError(f"LIBERO v3 train/eval source trajectory leakage: {overlap}.")
-
-
-def validate_libero_v3_training_dataset(cfg: TrainPipelineConfig, dataset: Any) -> None:
-    """Certify the dataset boundary for LIBERO chunk-relative DP/MAM training."""
-    active_cfg = cfg.trainable_config
-    policy_type = getattr(active_cfg, "type", None)
-    if policy_type not in {"diffusion", "mam"} or not getattr(active_cfg, "use_relative_actions", False):
-        return
-    robot_type = getattr(dataset.meta, "robot_type", None)
-    env_type = getattr(cfg.env, "type", None) if cfg.env is not None else None
-    if robot_type != "libero":
-        if env_type in {"libero", "libero_plus"}:
-            raise ValueError(
-                f"LIBERO v3 relative-action training requires dataset robot_type='libero', got {robot_type!r}."
-            )
-        return
-
-    from lerobot.datasets.libero_pipeline import (
-        LIBERO_CHUNK_RELATIVE_ACTION,
-        require_libero_v3_relative_ready_dataset,
-    )
-
-    train_root_value = getattr(dataset, "root", None) or cfg.dataset.root
-    if train_root_value is None:
-        raise ValueError("LIBERO v3 relative-action training requires an explicit dataset.root.")
-    train_root = Path(train_root_value)
-    train_manifest = require_libero_v3_relative_ready_dataset(train_root)
-    if (
-        train_manifest.get("stage") != "absolute_to_mam"
-        or train_manifest.get("dataset_split") != "train"
-        or train_manifest.get("policy_action_representation") != LIBERO_CHUNK_RELATIVE_ACTION
-    ):
-        raise ValueError(
-            "LIBERO v3 relative-action DP/MAM training requires an absolute_to_mam/train dataset "
-            "with chunk-relative SE(3) policy actions."
-        )
-
-    # MAM uses policy-specific eval dataset fields instead of cfg.eval.
-    if policy_type == "mam":
-        eval_repo_id = getattr(active_cfg, "mam_eval_dataset_repo_id", None)
-        eval_root_value = getattr(active_cfg, "mam_eval_dataset_root", None)
-        eval_episodes = getattr(active_cfg, "mam_eval_episodes", None)
-        if cfg.overfit_test:
-            same_root = (
-                eval_root_value is not None
-                and Path(eval_root_value).resolve() == train_root.resolve()
-            )
-            if (
-                eval_repo_id != cfg.dataset.repo_id
-                or not same_root
-                or list(eval_episodes or []) != list(cfg.dataset.episodes or [])
-            ):
-                raise ValueError(
-                    "LIBERO v3 MAM overfit requires its eval repo/root/episodes to be exactly "
-                    "identical to the selected training trajectories."
-                )
-            return
-        if cfg.env is not None and cfg.eval_freq > 0:
-            if eval_repo_id is None or eval_root_value is None:
-                raise ValueError(
-                    "Normal LIBERO v3 MAM online evaluation requires explicit "
-                    "policy.mam_eval_dataset_repo_id/root."
-                )
-            eval_manifest = require_libero_v3_relative_ready_dataset(eval_root_value)
-            if (
-                eval_manifest.get("stage") != "absolute_to_mam"
-                or eval_manifest.get("dataset_split") != "eval"
-                or eval_manifest.get("policy_action_representation")
-                != LIBERO_CHUNK_RELATIVE_ACTION
-            ):
-                raise ValueError(
-                    "Normal LIBERO v3 MAM evaluation requires an absolute_to_mam/eval dataset "
-                    "with chunk-relative SE(3) policy actions."
-                )
-            _validate_libero_split_provenance(train_manifest, eval_manifest)
-        return
-
-    eval_repo_id = getattr(cfg.eval, "dataset_repo_id", None)
-    eval_root_value = getattr(cfg.eval, "dataset_root", None)
-    eval_episodes = getattr(cfg.eval, "dataset_episodes", None)
-    if cfg.overfit_test:
-        same_root = eval_root_value is not None and Path(eval_root_value).resolve() == train_root.resolve()
-        if (
-            eval_repo_id != cfg.dataset.repo_id
-            or not same_root
-            or list(eval_episodes or []) != list(cfg.dataset.episodes or [])
-        ):
-            raise ValueError(
-                "LIBERO v3 overfit requires eval repo/root/episodes to be exactly identical "
-                "to the selected training trajectories."
-            )
-        return
-
-    if (
-        cfg.env is not None
-        and cfg.eval_freq > 0
-        and getattr(cfg.env, "type", None) == "libero"
-        and (eval_repo_id is None or eval_root_value is None)
-    ):
-        raise ValueError(
-            "Normal LIBERO v3 online evaluation requires an explicit eval dataset repo/root."
-        )
-    if eval_repo_id is None:
-        return
-    if eval_root_value is None:
-        raise ValueError("LIBERO v3 fixed evaluation requires an explicit eval.dataset_root.")
-    eval_manifest = require_libero_v3_relative_ready_dataset(eval_root_value)
-    if (
-        eval_manifest.get("stage") != "absolute_to_mam"
-        or eval_manifest.get("dataset_split") != "eval"
-        or eval_manifest.get("policy_action_representation") != LIBERO_CHUNK_RELATIVE_ACTION
-    ):
-        raise ValueError(
-            "Normal LIBERO v3 evaluation requires an absolute_to_mam/eval dataset "
-            "with chunk-relative SE(3) policy actions."
-        )
-    _validate_libero_split_provenance(train_manifest, eval_manifest)
-
-
-def apply_overfit_subset_stats(cfg: TrainPipelineConfig, dataset: Any) -> None:
-    """Recompute numeric policy-feature stats on the episodes used by an overfit run.
-
-    ``LeRobotDataset(..., episodes=...)`` filters frames but intentionally keeps the
-    repository-wide metadata stats. That is desirable for normal training subsets,
-    but undermines a strict overfit diagnostic: normalization can still be dominated
-    by tasks and episodes that are not being trained. Visual stats are left unchanged
-    (in particular, ImageNet normalization remains ImageNet normalization).
-    """
-    if not cfg.overfit_test or cfg.dataset.episodes is None:
-        return
-    if cfg.dataset.streaming:
-        raise ValueError("overfit_test=True does not support subset-stat recomputation for streaming data.")
-
-    active_cfg = cfg.trainable_config
-    policy_features = {
-        **(getattr(active_cfg, "input_features", None) or {}),
-        **(getattr(active_cfg, "output_features", None) or {}),
-    }
-    feature_keys = set(policy_features)
-    if not feature_keys:
-        # Fresh CLI configs receive input/output feature objects later, inside
-        # make_policy(). At this earlier stage derive numeric candidates from the
-        # dataset schema instead of silently skipping subset normalization.
-        feature_keys = set(dataset.meta.features)
-    metadata_keys = {"index", "episode_index", "task_index", "frame_index", "timestamp"}
-    hf_dataset = getattr(getattr(dataset, "reader", None), "hf_dataset", None)
-    if hf_dataset is None:
-        raise ValueError("Overfit subset stats require a loaded random-access dataset.")
-
-    dataset.meta.stats = dict(dataset.meta.stats or {})
-    updated: list[str] = []
-    quantiles = {"q01": 0.01, "q10": 0.10, "q50": 0.50, "q90": 0.90, "q99": 0.99}
-    frame_count: int | None = None
-    for key in sorted(feature_keys):
-        if key in metadata_keys or key not in dataset.meta.features:
-            continue
-        dtype = dataset.meta.features[key]["dtype"]
-        if dtype in {"image", "video", "string", "language"}:
-            continue
-        arrow_data = getattr(hf_dataset, "data", None)
-        column = (
-            arrow_data.column(key).to_pylist()
-            if arrow_data is not None and key in arrow_data.column_names
-            else hf_dataset[key]
-        )
-        if len(column) == 0:
-            raise ValueError(f"Cannot compute overfit stats for empty feature {key!r}.")
-        values = torch.stack([torch.as_tensor(value) for value in column]).to(dtype=torch.float32)
-        frame_count = values.shape[0]
-        if not torch.isfinite(values).all():
-            raise ValueError(f"Cannot compute overfit stats for non-finite feature {key!r}.")
-
-        feature_stats = {
-            "min": values.amin(dim=0),
-            "max": values.amax(dim=0),
-            "mean": values.mean(dim=0),
-            "std": values.std(dim=0, unbiased=False),
-            "count": torch.tensor([values.shape[0]], dtype=torch.int64),
-        }
-        for name, quantile in quantiles.items():
-            feature_stats[name] = torch.quantile(values, quantile, dim=0)
-        dataset.meta.stats[key] = feature_stats
-        updated.append(key)
-
-    logging.info(
-        "Overfit normalization stats recomputed from %d selected frame(s): %s",
-        frame_count or 0,
-        updated,
-    )
-
-
-def get_sampler_episode_boundaries(dataset: Any) -> tuple[list[int], list[int]]:
-    """Return episode boundaries in the index space expected by DatasetReader.get_item."""
-    if dataset.episodes is None:
-        return (
-            [int(idx) for idx in dataset.meta.episodes["dataset_from_index"]],
-            [int(idx) for idx in dataset.meta.episodes["dataset_to_index"]],
-        )
-
-    selected_episodes = {int(ep) for ep in dataset.episodes}
-    selected_rows = [row for row in dataset.meta.episodes if int(row["episode_index"]) in selected_episodes]
-    missing = selected_episodes - {int(row["episode_index"]) for row in selected_rows}
-    if missing:
-        raise ValueError(f"Sampler episodes missing from dataset metadata: {sorted(missing)}")
-
-    selected_rows.sort(key=lambda row: int(row["dataset_from_index"]))
-    from_indices: list[int] = []
-    to_indices: list[int] = []
-    cursor = 0
-    for row in selected_rows:
-        episode_length = int(row["dataset_to_index"]) - int(row["dataset_from_index"])
-        from_indices.append(cursor)
-        cursor += episode_length
-        to_indices.append(cursor)
-
-    if cursor != dataset.num_frames:
-        logging.warning(
-            "Sampler frame count (%d) differs from loaded dataset.num_frames (%d).",
-            cursor,
-            dataset.num_frames,
-        )
-
-    return from_indices, to_indices
+from .lerobot_eval import eval_policy_all
 
 
 def update_policy(
@@ -851,20 +204,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     from accelerate import Accelerator
 
     cfg.validate()
-    validate_libero_action_semantics(cfg)
-    apply_overfit_test_config(cfg)
-    apply_overfit_per_task_episode_selection(cfg)
+    if cfg.env is not None:
+        cfg.env.validate_policy_compatibility(cfg.trainable_config)
+    prepare_training_config(cfg)
 
-    # LIBERO env construction is lazy, so missing simulator assets would otherwise
-    # surface only at the first evaluation step after potentially hours of training.
-    if (
-        cfg.env is not None
-        and cfg.eval_freq > 0
-        and getattr(cfg.env, "type", None) in {"libero", "libero_plus"}
-    ):
-        from lerobot.envs.libero_assets import validate_libero_assets
-
-        validate_libero_assets()
+    if cfg.env is not None and cfg.eval_freq > 0:
+        cfg.env.validate_runtime_assets()
 
     # Create Accelerator if not provided
     # It will automatically detect if running in distributed mode or single-process mode
@@ -928,46 +273,18 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if not is_main_process:
         dataset = make_dataset(cfg)
 
-    validate_libero_v3_training_dataset(cfg, dataset)
-    apply_overfit_subset_stats(cfg, dataset)
-    apply_diffusion_relative_action_stats(cfg, dataset)
+    prepare_dataset_for_training(cfg, dataset, configure_eval=is_main_process)
 
     if is_main_process:
-        apply_overfit_eval_init_state_ids(cfg, dataset)
-        mam_eval_episodes = None
-        if getattr(cfg.trainable_config, "type", None) != "mam" and cfg.env is not None and cfg.eval_freq > 0:
-            configure_fixed_libero_eval_from_dataset(cfg)
-        mam_online_eval = (
-            getattr(cfg.trainable_config, "type", None) == "mam" and cfg.env is not None and cfg.eval_freq > 0
+        evaluation_runtime = (
+            prepare_policy_evaluation(cfg) if cfg.env is not None and cfg.eval_freq > 0 else None
         )
-        if mam_online_eval and not getattr(cfg.trainable_config, "mam_eval_dataset_repo_id", None):
-            raise ValueError(
-                "MAM online eval requires policy.mam_eval_dataset_repo_id; generic eval cannot provide "
-                "aligned MAS, progress, task-specific STPM, or fixed LIBERO init states."
-            )
-        if mam_online_eval:
-            from lerobot.policies.mam.eval_mam import (
-                configure_mam_eval_init_state_ids,
-                load_mam_eval_episodes,
-            )
-
-            mam_eval_episodes = load_mam_eval_episodes(
-                repo_id=cfg.trainable_config.mam_eval_dataset_repo_id,
-                root=getattr(cfg.trainable_config, "mam_eval_dataset_root", None),
-                episodes=getattr(cfg.trainable_config, "mam_eval_episodes", None),
-            )
-            configure_mam_eval_init_state_ids(cfg, mam_eval_episodes, cfg.eval.n_episodes)
-            logging.info(
-                "MAM eval fixed LIBERO init states: ids=%s ids_by_task=%s",
-                getattr(cfg.env, "init_state_ids", None),
-                getattr(cfg.env, "init_state_ids_by_task", None),
-            )
+        if evaluation_runtime is None and cfg.env is not None and cfg.eval_freq > 0:
+            cfg.env.prepare_evaluation(cfg)
     else:
-        mam_eval_episodes = None
+        evaluation_runtime = None
 
-    # Create evaluation environments lazily at each eval step. `eval_policy_all`
-    # closes the vector envs it receives, so reusing one across eval steps would
-    # leave LIBERO's wrapped robosuite env in a partially closed state.
+    # Evaluation owns and closes each environment batch at the corresponding step.
     eval_env = None
 
     if cfg.is_reward_model_training:
@@ -1179,9 +496,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         train_log_path = cfg.output_dir / "logs" / "train_metrics.jsonl"
         eval_log_path = cfg.output_dir / "logs" / "eval_metrics.jsonl"
         if cfg.resume:
-            _trim_jsonl_after_step(train_log_path, step)
-            eval_records = _trim_jsonl_after_step(eval_log_path, step)
-            best_eval_score, best_checkpoint_dir = _restore_resume_eval_state(
+            trim_jsonl_after_step(train_log_path, step)
+            eval_records = trim_jsonl_after_step(eval_log_path, step)
+            best_eval_score, best_checkpoint_dir = restore_resume_eval_state(
                 eval_records,
                 output_dir=cfg.output_dir,
                 total_steps=cfg.steps,
@@ -1245,7 +562,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             if sample_weighter is not None:
                 weighter_stats = sample_weighter.get_stats()
                 log_dict.update({f"sample_weighting/{k}": v for k, v in weighter_stats.items()})
-            _append_jsonl(
+            append_jsonl(
                 train_log_path,
                 {
                     "mode": "train",
@@ -1300,34 +617,21 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 )
                 try:
                     with torch.no_grad(), accelerator.autocast():
-                        if mam_eval_episodes is not None:
-                            from lerobot.policies.mam.eval_mam import eval_mam_policy_all
-
-                            eval_info = eval_mam_policy_all(
-                                envs=eval_env,
-                                policy=accelerator.unwrap_model(policy),
-                                env_preprocessor=env_preprocessor,
-                                env_postprocessor=env_postprocessor,
-                                preprocessor=preprocessor,
-                                postprocessor=postprocessor,
-                                episodes=mam_eval_episodes,
-                                n_episodes=cfg.eval.n_episodes,
-                                start_seed=cfg.seed,
-                            )
-                        else:
-                            eval_info = eval_policy_all(
-                                envs=eval_env,  # dict[suite][task_id] -> vec_env
-                                policy=accelerator.unwrap_model(policy),
-                                env_preprocessor=env_preprocessor,
-                                env_postprocessor=env_postprocessor,
-                                preprocessor=preprocessor,
-                                postprocessor=postprocessor,
-                                n_episodes=cfg.eval.n_episodes,
-                                videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
-                                max_episodes_rendered=4,
-                                start_seed=cfg.seed,
-                                max_parallel_tasks=cfg.env.max_parallel_tasks,
-                            )
+                        eval_info = run_policy_evaluation(
+                            evaluation_runtime,
+                            eval_policy_all,
+                            envs=eval_env,
+                            policy=accelerator.unwrap_model(policy),
+                            env_preprocessor=env_preprocessor,
+                            env_postprocessor=env_postprocessor,
+                            preprocessor=preprocessor,
+                            postprocessor=postprocessor,
+                            n_episodes=cfg.eval.n_episodes,
+                            videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
+                            max_episodes_rendered=4,
+                            start_seed=cfg.seed,
+                            max_parallel_tasks=cfg.env.max_parallel_tasks,
+                        )
                 finally:
                     if eval_env is not None:
                         close_envs(eval_env)
@@ -1399,7 +703,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                             keep_checkpoint_dirs=[best_checkpoint_dir, last_checkpoint_dir],
                         )
 
-                _append_jsonl(
+                append_jsonl(
                     eval_log_path,
                     {
                         "mode": "eval",

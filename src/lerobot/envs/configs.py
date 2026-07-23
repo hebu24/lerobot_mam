@@ -127,6 +127,15 @@ class EnvConfig(draccus.ChoiceRegistry, abc.ABC):
         """Return (preprocessor, postprocessor) for this env. Default: identity."""
         return PolicyProcessorPipeline(steps=[]), PolicyProcessorPipeline(steps=[])
 
+    def validate_policy_compatibility(self, policy_cfg: Any) -> None:
+        """Validate environment/policy semantics before constructing runtime resources."""
+
+    def validate_runtime_assets(self) -> None:
+        """Validate optional runtime assets before a delayed evaluation."""
+
+    def prepare_evaluation(self, cfg: Any) -> None:
+        """Apply environment-specific evaluation configuration before creating envs."""
+
 
 @dataclass
 class HubEnvConfig(EnvConfig):
@@ -456,6 +465,21 @@ class LiberoEnv(EnvConfig):
             PolicyProcessorPipeline(steps=[LiberoProcessorStep(flip_images=self.flip_images)]),
             PolicyProcessorPipeline(steps=[]),
         )
+
+    def validate_policy_compatibility(self, policy_cfg: Any) -> None:
+        from .libero_eval import validate_libero_action_semantics
+
+        validate_libero_action_semantics(self, policy_cfg)
+
+    def validate_runtime_assets(self) -> None:
+        from .libero_assets import validate_libero_assets
+
+        validate_libero_assets()
+
+    def prepare_evaluation(self, cfg: Any) -> None:
+        from .libero_eval import configure_fixed_libero_eval_from_dataset
+
+        configure_fixed_libero_eval_from_dataset(cfg)
 
 
 @EnvConfig.register_subclass("metaworld")

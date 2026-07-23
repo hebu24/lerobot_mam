@@ -2,7 +2,8 @@ from types import SimpleNamespace
 
 import pytest
 
-import lerobot.scripts.lerobot_eval as eval_module
+import lerobot.envs.libero_eval as libero_eval
+from lerobot.envs.configs import LiberoEnv
 
 
 class EpisodeRows(list):
@@ -16,8 +17,7 @@ class EpisodeRows(list):
 
 def _cfg(n_episodes: int = 2):
     return SimpleNamespace(
-        env=SimpleNamespace(
-            type="libero",
+        env=LiberoEnv(
             task="libero_10",
             task_ids=None,
             init_state_ids=None,
@@ -49,13 +49,13 @@ def test_fixed_libero_eval_uses_recorded_init_states_per_task(monkeypatch):
         ]
     )
     monkeypatch.setattr(
-        eval_module,
+        libero_eval,
         "LeRobotDatasetMetadata",
         lambda *args, **kwargs: SimpleNamespace(episodes=rows),
     )
     cfg = _cfg()
 
-    eval_module.configure_fixed_libero_eval_from_dataset(cfg)
+    cfg.env.prepare_evaluation(cfg)
 
     assert cfg.env.task_ids == [0, 1]
     assert cfg.env.init_state_values_by_task == {
@@ -79,10 +79,11 @@ def test_fixed_libero_eval_requires_n_episodes_for_every_task(monkeypatch):
         ]
     )
     monkeypatch.setattr(
-        eval_module,
+        libero_eval,
         "LeRobotDatasetMetadata",
         lambda *args, **kwargs: SimpleNamespace(episodes=rows),
     )
 
     with pytest.raises(ValueError, match="interpreted per task"):
-        eval_module.configure_fixed_libero_eval_from_dataset(_cfg(n_episodes=2))
+        cfg = _cfg(n_episodes=2)
+        cfg.env.prepare_evaluation(cfg)

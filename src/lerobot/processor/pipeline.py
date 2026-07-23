@@ -154,6 +154,11 @@ class ProcessorStep(ABC):
     _current_transition: EnvTransition | None = None
 
     @property
+    def requires_transition_context(self) -> bool:
+        """Whether this step needs fields beyond the pipeline's primary value."""
+        return False
+
+    @property
     def transition(self) -> EnvTransition:
         """Provides access to the most recent transition being processed.
 
@@ -1213,6 +1218,11 @@ class DataProcessorPipeline[TInput, TOutput](HubMixin):
     def __len__(self) -> int:
         """Returns the number of steps in the pipeline."""
         return len(self.steps)
+
+    @property
+    def requires_transition_context(self) -> bool:
+        """Whether any step requires an explicit observation/action transition."""
+        return any(step.requires_transition_context for step in self.steps)
 
     def __getitem__(self, idx: int | slice) -> ProcessorStep | DataProcessorPipeline[TInput, TOutput]:
         """Retrieves a step or a sub-pipeline by index or slice.

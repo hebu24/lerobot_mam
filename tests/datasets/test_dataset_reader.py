@@ -121,6 +121,20 @@ def test_get_item_values_are_correct(tmp_path, lerobot_dataset_factory):
     assert item_0["episode_index"].item() == 0
 
 
+def test_get_item_prefers_single_episode_task_when_task_index_metadata_is_stale(
+    tmp_path, lerobot_dataset_factory
+):
+    dataset = lerobot_dataset_factory(
+        root=tmp_path / "ds", total_episodes=1, total_frames=10, use_videos=False
+    )
+    expected_task = dataset.meta.episodes[0]["tasks"][0]
+    dataset.meta.tasks = dataset.meta.tasks.rename(index={expected_task: "stale task"})
+
+    item = dataset.reader.get_item(0)
+
+    assert item["task"] == expected_task
+
+
 # ── Transforms ───────────────────────────────────────────────────────
 
 

@@ -22,10 +22,6 @@ from lerobot.datasets.libero_pipeline import (
 from lerobot.envs import preprocess_observation
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import PolicyProcessorPipeline
-from lerobot.processor.libero_relative_action_processor import (
-    chunk_relative_to_absolute,
-    slice_current_action_window,
-)
 from lerobot.scripts.lerobot_eval import _compile_episode_data
 from lerobot.stpm import STPMEncoder
 from lerobot.types import PolicyAction
@@ -64,6 +60,36 @@ class MamEvalEpisode:
     source_episode_id: int | None = None
 
 
+@dataclass
+class MamEvaluationRuntime:
+    episodes: list[MamEvalEpisode]
+
+    def __call__(
+        self,
+        *,
+        envs: dict[str, dict[int, gym.vector.VectorEnv]],
+        policy: PreTrainedPolicy,
+        env_preprocessor: PolicyProcessorPipeline,
+        env_postprocessor: PolicyProcessorPipeline,
+        preprocessor: PolicyProcessorPipeline,
+        postprocessor: PolicyProcessorPipeline,
+        n_episodes: int,
+        start_seed: int | None = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        return eval_mam_policy_all(
+            envs=envs,
+            policy=policy,
+            env_preprocessor=env_preprocessor,
+            env_postprocessor=env_postprocessor,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            episodes=self.episodes,
+            n_episodes=n_episodes,
+            start_seed=start_seed,
+        )
+
+
 def _row_get(row: Any, key: str, default: Any = None) -> Any:
     try:
         return row[key]
@@ -98,6 +124,27 @@ def _stack_float32(values: list[Any], *, keep_feature_dim: bool = False) -> Tens
     return stacked
 
 
+def _episode_task_description(meta: LeRobotDatasetMetadata, row: Any, task_indices: list[Any]) -> str:
+    """Resolve eval language from episode metadata, with task_index as fallback."""
+    episode_tasks = _row_get(row, "tasks", None)
+    if isinstance(episode_tasks, (list, tuple)) and len(episode_tasks) == 1:
+        task = str(episode_tasks[0]).strip()
+        if task:
+            return task
+
+    unique_task_indices = {int(value) for value in task_indices}
+    if len(unique_task_indices) != 1:
+        raise ValueError(
+            "MAM eval episode must have one task description, but its frames contain "
+            f"task_indices={sorted(unique_task_indices)}."
+        )
+    task_index = next(iter(unique_task_indices))
+    try:
+        return str(meta.tasks.iloc[task_index].name)
+    except (AttributeError, IndexError, TypeError) as exc:
+        raise ValueError(f"Cannot resolve MAM eval task description for task_index={task_index}.") from exc
+
+
 def load_mam_eval_episodes(
     repo_id: str,
     root: str | Path | None = None,
@@ -108,8 +155,7 @@ def load_mam_eval_episodes(
     meta = LeRobotDatasetMetadata(repo_id, root=root)
     if meta.robot_type != "libero":
         raise ValueError(
-            "LIBERO MAM evaluation requires dataset robot_type='libero', "
-            f"got {meta.robot_type!r}."
+            f"LIBERO MAM evaluation requires dataset robot_type='libero', got {meta.robot_type!r}."
         )
     manifest = require_libero_v3_relative_ready_dataset(meta.root)
     if (
@@ -132,12 +178,11 @@ def load_mam_eval_episodes(
     columns = [
         "episode_index",
         "frame_index",
+        "task_index",
         MAM_MAS_ACTION_ABSOLUTE,
         MAM_MAS_ACTION_MASK,
         MAM_PROGRESS,
     ]
-    if "task" in dataset.hf_dataset.column_names:
-        columns.append("task")
     table = dataset.select_columns(columns)
 
     grouped: dict[int, dict[str, list[Any]]] = defaultdict(
@@ -145,7 +190,7 @@ def load_mam_eval_episodes(
             MAM_MAS_ACTION_ABSOLUTE: [],
             MAM_MAS_ACTION_MASK: [],
             MAM_PROGRESS: [],
-            "task": [],
+            "task_index": [],
         }
     )
     for row in table:
@@ -153,7 +198,7 @@ def load_mam_eval_episodes(
         grouped[ep_idx][MAM_MAS_ACTION_ABSOLUTE].append(row[MAM_MAS_ACTION_ABSOLUTE])
         grouped[ep_idx][MAM_MAS_ACTION_MASK].append(row[MAM_MAS_ACTION_MASK])
         grouped[ep_idx][MAM_PROGRESS].append(row[MAM_PROGRESS])
-        grouped[ep_idx]["task"].append(row.get("task", ""))
+        grouped[ep_idx]["task_index"].append(row["task_index"])
 
     rows = _episode_rows(meta)
     episode_columns = _column_names(meta.episodes)
@@ -179,8 +224,7 @@ def load_mam_eval_episodes(
             mask_type_slot = int(raw_mask_slot)
         except (TypeError, ValueError):
             mask_type_slot = -1
-        task_values = grouped[ep_idx]["task"]
-        task = str(task_values[0]) if task_values else ""
+        task = _episode_task_description(meta, row, grouped[ep_idx]["task_index"])
         source_episode_id = _row_get(
             row,
             "libero/source_episode_id",
@@ -275,6 +319,28 @@ def configure_mam_eval_init_state_ids(cfg: Any, episodes: list[MamEvalEpisode], 
         cfg.env.init_state_values = None
         cfg.env.init_state_values_by_task = None
         cfg.env.init_state_ids_by_task = None
+
+
+def prepare_mam_evaluation(cfg: Any) -> MamEvaluationRuntime:
+    """Load MAM control data and configure fixed resets before env construction."""
+    policy_cfg = cfg.policy
+    if not policy_cfg.mam_eval_dataset_repo_id:
+        raise ValueError(
+            "MAM evaluation requires policy.mam_eval_dataset_repo_id so MAS, progress, "
+            "task identity, and fixed LIBERO init states remain aligned."
+        )
+    episodes = load_mam_eval_episodes(
+        repo_id=policy_cfg.mam_eval_dataset_repo_id,
+        root=policy_cfg.mam_eval_dataset_root,
+        episodes=policy_cfg.mam_eval_episodes,
+    )
+    configure_mam_eval_init_state_ids(cfg, episodes, cfg.eval.n_episodes)
+    logging.info(
+        "MAM eval fixed LIBERO init states: ids=%s ids_by_task=%s",
+        getattr(cfg.env, "init_state_ids", None),
+        getattr(cfg.env, "init_state_ids_by_task", None),
+    )
+    return MamEvaluationRuntime(episodes)
 
 
 def _map_lookup(mapping: dict[str, str] | None, task_group: str | None, task_id: int | None) -> str | None:
@@ -441,7 +507,7 @@ def rollout_mam(
     env_preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     env_postprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
-    postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    postprocessor: PolicyProcessorPipeline[PolicyAction | dict[str, Any], PolicyAction],
     episodes: list[MamEvalEpisode],
     episode_offset: int,
     stpm: STPMEncoder | None,
@@ -507,19 +573,14 @@ def rollout_mam(
         with torch.inference_mode():
             processed = policy.update_observation_queue(processed)
             if needs_prediction:
-                relative_chunk = policy.predict_action_chunk(processed)
-                relative_chunk = postprocessor(relative_chunk)
-                absolute_chunk = chunk_relative_to_absolute(
-                    relative_chunk, anchor_state.to(relative_chunk.device)
+                action_chunk = policy.predict_action_chunk(processed)
+                action_chunk = postprocessor(
+                    {
+                        ACTION: action_chunk,
+                        OBS_STATE: anchor_state,
+                    }
                 )
-                if not isinstance(absolute_chunk, Tensor):
-                    absolute_chunk = torch.as_tensor(absolute_chunk)
-                absolute_chunk = slice_current_action_window(
-                    absolute_chunk,
-                    n_obs_steps=policy.config.n_obs_steps,
-                    n_action_steps=policy.config.n_action_steps,
-                )
-                absolute_action_queue.extend(absolute_chunk.transpose(0, 1))
+                absolute_action_queue.extend(action_chunk.transpose(0, 1))
             action = absolute_action_queue.popleft()
 
         action_transition = env_postprocessor({ACTION: action})
@@ -572,7 +633,7 @@ def eval_mam_policy(
     env_preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     env_postprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
-    postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    postprocessor: PolicyProcessorPipeline[PolicyAction | dict[str, Any], PolicyAction],
     episodes: list[MamEvalEpisode],
     n_episodes: int,
     stpm: STPMEncoder | None = None,
@@ -702,7 +763,7 @@ def eval_mam_policy_all(
     env_preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     env_postprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
-    postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    postprocessor: PolicyProcessorPipeline[PolicyAction | dict[str, Any], PolicyAction],
     episodes: list[MamEvalEpisode],
     n_episodes: int,
     start_seed: int | None = None,

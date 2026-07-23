@@ -10,12 +10,14 @@ from lerobot.configs import PipelineFeatureType, PolicyFeature
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
+    LiberoChunkRelativeActionsPostprocessorStep,
     NormalizerProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
     RenameObservationsProcessorStep,
     UnnormalizerProcessorStep,
-    policy_action_to_transition,
+    ensure_libero_chunk_relative_actions_postprocessor,
+    policy_action_with_context_to_transition,
     transition_to_policy_action,
 )
 from lerobot.processor.converters import create_transition, transition_to_batch
@@ -257,7 +259,7 @@ def make_mam_pre_post_processors(
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
-    PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    PolicyProcessorPipeline[PolicyAction | dict[str, Any], PolicyAction],
 ]:
     action_stats = None if dataset_stats is None else dataset_stats.get(ACTION)
     input_steps = [
@@ -286,6 +288,11 @@ def make_mam_pre_post_processors(
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
         ),
+        LiberoChunkRelativeActionsPostprocessorStep(
+            enabled=config.use_relative_actions,
+            n_obs_steps=config.n_obs_steps,
+            n_action_steps=config.n_action_steps,
+        ),
         DeviceProcessorStep(device="cpu"),
     ]
     return (
@@ -295,10 +302,23 @@ def make_mam_pre_post_processors(
             to_transition=mam_batch_to_transition,
             to_output=transition_to_batch,
         ),
-        PolicyProcessorPipeline[PolicyAction, PolicyAction](
+        PolicyProcessorPipeline[PolicyAction | dict[str, Any], PolicyAction](
             steps=output_steps,
             name=POLICY_POSTPROCESSOR_DEFAULT_NAME,
-            to_transition=policy_action_to_transition,
+            to_transition=policy_action_with_context_to_transition,
             to_output=transition_to_policy_action,
         ),
+    )
+
+
+def upgrade_loaded_mam_postprocessor(
+    config: MamConfig,
+    postprocessor: PolicyProcessorPipeline[PolicyAction | dict[str, Any], PolicyAction],
+) -> None:
+    """Upgrade a legacy serialized MAM postprocessor to the current contract."""
+    ensure_libero_chunk_relative_actions_postprocessor(
+        postprocessor,
+        enabled=config.use_relative_actions,
+        n_obs_steps=config.n_obs_steps,
+        n_action_steps=config.n_action_steps,
     )

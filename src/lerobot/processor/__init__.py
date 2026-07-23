@@ -31,6 +31,7 @@ from .converters import (
     identity_transition,
     observation_to_transition,
     policy_action_to_transition,
+    policy_action_with_context_to_transition,
     robot_action_observation_to_transition,
     robot_action_to_transition,
     transition_to_batch,
@@ -62,10 +63,12 @@ from .hil_processor import (
     TimeLimitProcessorStep,
 )
 from .libero_relative_action_processor import (
+    LiberoChunkRelativeActionsPostprocessorStep,
     LiberoChunkRelativeActionsProcessorStep,
     absolute_to_chunk_relative,
     chunk_relative_to_absolute,
     delta_to_absolute_action,
+    ensure_libero_chunk_relative_actions_postprocessor,
     slice_current_action_window,
 )
 from .newline_task_processor import NewLineTaskProcessorStep
@@ -120,6 +123,7 @@ __all__ = [
     "identity_transition",
     "observation_to_transition",
     "policy_action_to_transition",
+    "policy_action_with_context_to_transition",
     "robot_action_observation_to_transition",
     "robot_action_to_transition",
     "transition_to_observation",
@@ -164,6 +168,7 @@ __all__ = [
     "DataProcessorPipeline",
     "IsaaclabArenaProcessorStep",
     "LiberoProcessorStep",
+    "LiberoChunkRelativeActionsPostprocessorStep",
     "LiberoChunkRelativeActionsProcessorStep",
     "TimeLimitProcessorStep",
     "AddBatchDimensionProcessorStep",
@@ -181,6 +186,7 @@ __all__ = [
     "absolute_to_chunk_relative",
     "chunk_relative_to_absolute",
     "delta_to_absolute_action",
+    "ensure_libero_chunk_relative_actions_postprocessor",
     "slice_current_action_window",
     "UnnormalizerProcessorStep",
     "VanillaObservationProcessorStep",

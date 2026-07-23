@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, TypedDict, Unpack
 
 import torch
@@ -32,7 +33,7 @@ from lerobot.processor import (
     PolicyProcessorPipeline,
     RelativeActionsProcessorStep,
     batch_to_transition,
-    policy_action_to_transition,
+    policy_action_with_context_to_transition,
     transition_to_batch,
     transition_to_policy_action,
 )
@@ -163,6 +164,24 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
             raise ValueError(f"Policy type '{name}' is not available.") from e
 
 
+def prepare_policy_evaluation(cfg: Any) -> Callable[..., dict[str, Any]] | None:
+    """Create an optional policy-specific evaluation runner."""
+    if isinstance(getattr(cfg, "policy", None), MamConfig):
+        from .mam.eval_mam import prepare_mam_evaluation
+
+        return prepare_mam_evaluation(cfg)
+    return None
+
+
+def run_policy_evaluation(
+    runtime: Callable[..., dict[str, Any]] | None,
+    default_runner: Callable[..., dict[str, Any]],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Run a policy-specific evaluator when provided, otherwise use the default."""
+    return (runtime or default_runner)(**kwargs)
+
+
 def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
     """
     Instantiates a policy configuration object based on the policy type.
@@ -246,7 +265,7 @@ def make_pre_post_processors(
     **kwargs: Unpack[ProcessorConfigKwargs],
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
-    PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    PolicyProcessorPipeline[PolicyAction | dict[str, Any], PolicyAction],
 ]:
     """
     Create or load pre- and post-processor pipelines for a given policy.
@@ -293,10 +312,16 @@ def make_pre_post_processors(
             kwargs["postprocessor_overrides"] = postprocessor_overrides
 
         preprocessor_to_transition = batch_to_transition
+        postprocessor_upgrade = None
         if isinstance(policy_cfg, MamConfig):
-            from .mam.processor_mam import mam_batch_to_transition
+            from .mam.processor_mam import mam_batch_to_transition, upgrade_loaded_mam_postprocessor
 
             preprocessor_to_transition = mam_batch_to_transition
+            postprocessor_upgrade = upgrade_loaded_mam_postprocessor
+        elif isinstance(policy_cfg, DiffusionConfig):
+            from .diffusion.processor_diffusion import upgrade_loaded_diffusion_postprocessor
+
+            postprocessor_upgrade = upgrade_loaded_diffusion_postprocessor
 
         preprocessor = PolicyProcessorPipeline.from_pretrained(
             pretrained_model_name_or_path=pretrained_path,
@@ -313,9 +338,11 @@ def make_pre_post_processors(
                 "postprocessor_config_filename", f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
             ),
             overrides=kwargs.get("postprocessor_overrides", {}),
-            to_transition=policy_action_to_transition,
+            to_transition=policy_action_with_context_to_transition,
             to_output=transition_to_policy_action,
         )
+        if postprocessor_upgrade is not None:
+            postprocessor_upgrade(policy_cfg, postprocessor)
         _reconnect_relative_absolute_steps(preprocessor, postprocessor)
         return preprocessor, postprocessor
 

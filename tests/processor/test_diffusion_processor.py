@@ -23,16 +23,19 @@ import torch
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.diffusion.processor_diffusion import make_diffusion_pre_post_processors
+from lerobot.policies.factory import make_pre_post_processors
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DataProcessorPipeline,
     DeviceProcessorStep,
+    LiberoChunkRelativeActionsPostprocessorStep,
     LiberoChunkRelativeActionsProcessorStep,
     NormalizerProcessorStep,
     RenameObservationsProcessorStep,
     TransitionKey,
     UnnormalizerProcessorStep,
     chunk_relative_to_absolute,
+    ensure_libero_chunk_relative_actions_postprocessor,
 )
 from lerobot.processor.converters import create_transition, transition_to_batch
 from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
@@ -86,14 +89,17 @@ def test_make_diffusion_processor_basic():
     assert isinstance(preprocessor.steps[4], NormalizerProcessorStep)
 
     # Check steps in postprocessor
-    assert len(postprocessor.steps) == 2
+    assert len(postprocessor.steps) == 3
     assert isinstance(postprocessor.steps[0], UnnormalizerProcessorStep)
-    assert isinstance(postprocessor.steps[1], DeviceProcessorStep)
+    assert isinstance(postprocessor.steps[1], LiberoChunkRelativeActionsPostprocessorStep)
+    assert isinstance(postprocessor.steps[2], DeviceProcessorStep)
 
 
 def test_libero_v3_preprocess_normalize_unnormalize_and_absolute_roundtrip():
     config = create_default_config()
     config.use_relative_actions = True
+    config.n_obs_steps = 1
+    config.n_action_steps = 2
     config.input_features[OBS_STATE] = PolicyFeature(type=FeatureType.STATE, shape=(14,))
     config.output_features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=(7,))
     stats = create_default_stats()
@@ -117,11 +123,40 @@ def test_libero_v3_preprocess_normalize_unnormalize_and_absolute_roundtrip():
     )
 
     normalized = preprocessor(transition_to_batch(transition))[TransitionKey.ACTION.value]
-    recovered_relative = postprocessor(normalized)
-    recovered_absolute = chunk_relative_to_absolute(recovered_relative, anchor)
+    recovered_absolute = postprocessor({ACTION: normalized, OBS_STATE: anchor.unsqueeze(0)})
 
-    torch.testing.assert_close(recovered_relative.squeeze(0), relative, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(recovered_absolute.squeeze(0), absolute, atol=1e-6, rtol=1e-6)
+
+
+def test_legacy_relative_postprocessor_gets_context_decoder():
+    config = create_default_config()
+    config.use_relative_actions = True
+    _, postprocessor = make_diffusion_pre_post_processors(config, create_default_stats())
+    postprocessor.steps = [postprocessor.steps[0], postprocessor.steps[-1]]
+
+    ensure_libero_chunk_relative_actions_postprocessor(
+        postprocessor,
+        enabled=True,
+        n_obs_steps=config.n_obs_steps,
+        n_action_steps=config.n_action_steps,
+    )
+
+    assert isinstance(postprocessor.steps[1], LiberoChunkRelativeActionsPostprocessorStep)
+    assert postprocessor.requires_transition_context is True
+
+
+def test_factory_loads_legacy_relative_postprocessor_with_context_decoder(tmp_path):
+    config = create_default_config()
+    config.use_relative_actions = True
+    preprocessor, postprocessor = make_diffusion_pre_post_processors(config, create_default_stats())
+    postprocessor.steps = [postprocessor.steps[0], postprocessor.steps[-1]]
+    preprocessor.save_pretrained(tmp_path)
+    postprocessor.save_pretrained(tmp_path)
+
+    _, loaded_postprocessor = make_pre_post_processors(config, pretrained_path=str(tmp_path))
+
+    assert isinstance(loaded_postprocessor.steps[1], LiberoChunkRelativeActionsPostprocessorStep)
+    assert loaded_postprocessor.requires_transition_context is True
 
 
 def test_diffusion_processor_with_images():
@@ -290,13 +325,17 @@ def test_diffusion_processor_save_and_load():
     preprocessor, postprocessor = make_diffusion_pre_post_processors(config, stats)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Save preprocessor
         preprocessor.save_pretrained(tmpdir)
+        postprocessor.save_pretrained(tmpdir)
 
-        # Load preprocessor
         loaded_preprocessor = DataProcessorPipeline.from_pretrained(
             tmpdir, config_filename="policy_preprocessor.json"
         )
+        loaded_postprocessor = DataProcessorPipeline.from_pretrained(
+            tmpdir, config_filename="policy_postprocessor.json"
+        )
+
+        assert isinstance(loaded_postprocessor.steps[1], LiberoChunkRelativeActionsPostprocessorStep)
 
         # Test that loaded processor works
         observation = {

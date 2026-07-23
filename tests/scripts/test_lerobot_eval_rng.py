@@ -23,6 +23,12 @@ from torch import Tensor, nn
 
 import lerobot.scripts.lerobot_eval as eval_module
 from lerobot.policies import PreTrainedPolicy
+from lerobot.processor import (
+    LiberoChunkRelativeActionsPostprocessorStep,
+    PolicyProcessorPipeline,
+    policy_action_with_context_to_transition,
+    transition_to_policy_action,
+)
 from lerobot.processor.libero_relative_action_processor import (
     absolute_to_chunk_relative,
     axis_angle_to_matrix,
@@ -146,7 +152,9 @@ class _ClosedLoopFourStepEnv(_TwoStepEnv):
 
 
 class _MaterializedRelativeChunkPolicy(_StubPolicy):
-    def __init__(self, relative_chunks: list[Tensor], *, n_obs_steps: int = 1, n_action_steps: int = 2) -> None:
+    def __init__(
+        self, relative_chunks: list[Tensor], *, n_obs_steps: int = 1, n_action_steps: int = 2
+    ) -> None:
         super().__init__()
         self.config = SimpleNamespace(
             use_relative_actions=True, n_obs_steps=n_obs_steps, n_action_steps=n_action_steps
@@ -164,6 +172,20 @@ class _MaterializedRelativeChunkPolicy(_StubPolicy):
         chunk = self.relative_chunks[self.prediction_calls]
         self.prediction_calls += 1
         return chunk
+
+
+def _make_relative_postprocessor(policy: _StubPolicy) -> PolicyProcessorPipeline:
+    return PolicyProcessorPipeline(
+        steps=[
+            LiberoChunkRelativeActionsPostprocessorStep(
+                enabled=True,
+                n_obs_steps=policy.config.n_obs_steps,
+                n_action_steps=policy.config.n_action_steps,
+            )
+        ],
+        to_transition=policy_action_with_context_to_transition,
+        to_output=transition_to_policy_action,
+    )
 
 
 def test_eval_policy_seeds_policy_rng_and_restores_caller_state(monkeypatch):
@@ -244,7 +266,7 @@ def test_relative_rollout_converts_one_chunk_to_absolute_once(monkeypatch):
         env_preprocessor=identity,
         env_postprocessor=identity,
         preprocessor=identity,
-        postprocessor=identity,
+        postprocessor=_make_relative_postprocessor(policy),
     )
 
     executed = result[ACTION][0]
@@ -283,7 +305,7 @@ def test_relative_rollout_matches_closed_loop_materialized_actions_across_chunks
         env_preprocessor=lambda value: value,
         env_postprocessor=lambda value: value,
         preprocessor=lambda value: value,
-        postprocessor=lambda value: value,
+        postprocessor=_make_relative_postprocessor(policy),
     )
 
     executed = result[ACTION][0]
@@ -306,9 +328,7 @@ def test_relative_rollout_executes_current_window_not_past_action(monkeypatch):
     recorded_state[:3] = torch.tensor((0.4, -0.2, 0.7))
     recorded_state[6] = 1.0
     past_current_future = torch.zeros(3, 7, dtype=torch.float32)
-    past_current_future[:, :3] = torch.tensor(
-        [[-9.0, -9.0, -9.0], [0.5, -0.2, 0.7], [0.6, -0.2, 0.7]]
-    )
+    past_current_future[:, :3] = torch.tensor([[-9.0, -9.0, -9.0], [0.5, -0.2, 0.7], [0.6, -0.2, 0.7]])
     past_current_future[:, 6] = torch.tensor([-1.0, 1.0, -1.0])
     relative_chunk = absolute_to_chunk_relative(past_current_future, recorded_state).unsqueeze(0)
     policy = _MaterializedRelativeChunkPolicy([relative_chunk], n_obs_steps=2, n_action_steps=2)
@@ -319,7 +339,7 @@ def test_relative_rollout_executes_current_window_not_past_action(monkeypatch):
         env_preprocessor=lambda value: value,
         env_postprocessor=lambda value: value,
         preprocessor=lambda value: value,
-        postprocessor=lambda value: value,
+        postprocessor=_make_relative_postprocessor(policy),
     )
 
     executed = result[ACTION][0]

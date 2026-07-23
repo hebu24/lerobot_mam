@@ -74,7 +74,6 @@ from tqdm import trange
 
 from lerobot.configs import parser
 from lerobot.configs.eval import EvalPipelineConfig
-from lerobot.datasets import LeRobotDatasetMetadata
 from lerobot.envs import (
     check_env_attributes_and_types,
     close_envs,
@@ -82,15 +81,16 @@ from lerobot.envs import (
     make_env_pre_post_processors,
     preprocess_observation,
 )
-from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
-from lerobot.policies.mam.configuration_mam import MamConfig
-from lerobot.processor import PolicyProcessorPipeline
-from lerobot.processor.libero_relative_action_processor import (
-    chunk_relative_to_absolute,
-    slice_current_action_window,
+from lerobot.policies import (
+    PreTrainedPolicy,
+    make_policy,
+    make_pre_post_processors,
+    prepare_policy_evaluation,
+    run_policy_evaluation,
 )
+from lerobot.processor import PolicyProcessorPipeline
 from lerobot.types import PolicyAction
-from lerobot.utils.constants import ACTION, DONE, OBS_STATE, OBS_STR, REWARD
+from lerobot.utils.constants import ACTION, DONE, OBS_STR, REWARD
 from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.io_utils import write_video
@@ -101,148 +101,13 @@ from lerobot.utils.utils import (
 )
 
 
-def _prepare_mam_eval_episodes(cfg: EvalPipelineConfig):
-    """Load MAM control episodes and configure their fixed env resets before env creation."""
-    if not isinstance(cfg.policy, MamConfig):
-        return None
-
-    from lerobot.policies.mam.eval_mam import (
-        configure_mam_eval_init_state_ids,
-        load_mam_eval_episodes,
-    )
-
-    if not cfg.policy.mam_eval_dataset_repo_id:
-        raise ValueError(
-            "MAM evaluation requires policy.mam_eval_dataset_repo_id so MAS, progress, "
-            "task identity, and fixed LIBERO init states remain aligned."
-        )
-    episodes = load_mam_eval_episodes(
-        repo_id=cfg.policy.mam_eval_dataset_repo_id,
-        root=cfg.policy.mam_eval_dataset_root,
-        episodes=cfg.policy.mam_eval_episodes,
-    )
-    configure_mam_eval_init_state_ids(cfg, episodes, cfg.eval.n_episodes)
-    return episodes
-
-
-def configure_fixed_libero_eval_from_dataset(cfg: Any) -> None:
-    """Wire a generic policy eval to task-scoped LIBERO init states from a dataset split."""
-    repo_id = getattr(cfg.eval, "dataset_repo_id", None)
-    if not repo_id:
-        return
-    if cfg.env is None or getattr(cfg.env, "type", None) not in {"libero", "libero_plus"}:
-        raise ValueError("eval.dataset_repo_id currently supports env.type=libero or libero_plus only.")
-
-    metadata = LeRobotDatasetMetadata(repo_id, root=getattr(cfg.eval, "dataset_root", None))
-    requested = getattr(cfg.eval, "dataset_episodes", None)
-    requested_set = set(requested) if requested is not None else None
-    rows = [
-        row
-        for row in metadata.episodes
-        if requested_set is None or int(row["episode_index"]) in requested_set
-    ]
-    found = {int(row["episode_index"]) for row in rows}
-    if requested_set is not None and found != requested_set:
-        raise ValueError(f"Fixed eval dataset is missing episode ids {sorted(requested_set - found)}.")
-
-    columns = set(getattr(metadata.episodes, "column_names", []) or [])
-    task_key = next((key for key in ("libero/task_id", "task_id") if key in columns), None)
-    suite_key = next((key for key in ("libero/suite", "suite") if key in columns), None)
-    init_value_key = next((key for key in ("libero/init_state", "init_state") if key in columns), None)
-    init_id_key = next((key for key in ("libero/init_state_id", "init_state_id") if key in columns), None)
-    if task_key is None or (init_value_key is None and init_id_key is None):
-        raise ValueError(
-            "Fixed LIBERO eval metadata requires task_id and either raw init_state or init_state_id."
-        )
-
-    by_task: dict[tuple[str, int], list[Any]] = defaultdict(list)
-    for row in rows:
-        raw_suite = row[suite_key] if suite_key is not None else getattr(cfg.env, "task", "")
-        suite = str(raw_suite) if raw_suite is not None else str(getattr(cfg.env, "task", ""))
-        by_task[(suite, int(row[task_key]))].append(row)
-    if not by_task:
-        raise ValueError("Fixed LIBERO eval dataset selected no episodes.")
-
-    per_task = int(cfg.eval.n_episodes)
-    selected_by_task: dict[tuple[str, int], list[Any]] = {}
-    for key, task_rows in sorted(by_task.items()):
-        task_rows = sorted(task_rows, key=lambda row: int(row["episode_index"]))
-        if len(task_rows) < per_task:
-            raise ValueError(
-                f"Fixed eval split has {len(task_rows)} episode(s) for {key[0]}/{key[1]}, "
-                f"but eval.n_episodes={per_task} is interpreted per task."
-            )
-        selected_by_task[key] = task_rows[:per_task]
-
-    suites = {suite for suite, _ in selected_by_task}
-    if len(suites) != 1:
-        raise ValueError(f"Fixed LIBERO eval currently requires one suite, got {sorted(suites)}.")
-    cfg.env.task = next(iter(suites))
-    cfg.env.task_ids = sorted(task_id for _, task_id in selected_by_task)
-    all_have_raw_values = init_value_key is not None and all(
-        row[init_value_key] is not None for task_rows in selected_by_task.values() for row in task_rows
-    )
-    if all_have_raw_values:
-        cfg.env.init_state_values_by_task = {
-            f"{suite}/{task_id}": [
-                np.asarray(row[init_value_key], dtype=np.float64).reshape(-1).tolist() for row in task_rows
-            ]
-            for (suite, task_id), task_rows in selected_by_task.items()
-        }
-        cfg.env.init_state_ids_by_task = None
-        cfg.env.init_state_values = None
-        cfg.env.init_state_ids = None
-        if hasattr(cfg.env, "num_steps_wait"):
-            cfg.env.num_steps_wait = 0
-    else:
-        if init_id_key is None:
-            raise ValueError(
-                "Some fixed eval episodes lack raw init_state and no init_state_id is available."
-            )
-        cfg.env.init_state_ids_by_task = {
-            f"{suite}/{task_id}": [int(row[init_id_key]) for row in task_rows]
-            for (suite, task_id), task_rows in selected_by_task.items()
-        }
-        cfg.env.init_state_values_by_task = None
-        cfg.env.init_state_values = None
-        cfg.env.init_state_ids = None
-    cfg.eval.batch_size = min(int(cfg.eval.batch_size), per_task)
-    logging.info(
-        "Fixed LIBERO eval uses %d episode(s) per task from %s: task_ids=%s",
-        per_task,
-        repo_id,
-        cfg.env.task_ids,
-    )
-
-
-def validate_libero_action_semantics(cfg: Any) -> None:
-    """Reject a silent relative-chunk/relative-controller mismatch."""
-    env_cfg = getattr(cfg, "env", None)
-    if env_cfg is None or getattr(env_cfg, "type", None) not in {"libero", "libero_plus"}:
-        return
-    policy_cfg = getattr(cfg, "policy", None)
-    if policy_cfg is None and hasattr(cfg, "trainable_config"):
-        policy_cfg = cfg.trainable_config
-    if policy_cfg is None:
-        return
-    if (
-        bool(getattr(policy_cfg, "use_relative_actions", False))
-        and getattr(env_cfg, "control_mode", None) != "absolute"
-    ):
-        raise ValueError(
-            "LIBERO policy.use_relative_actions=True predicts chunk-relative SE(3) actions and "
-            "requires env.control_mode='absolute'. A relative controller would silently execute "
-            "the reconstructed absolute goals as deltas."
-        )
-
-
 def rollout(
     env: gym.vector.VectorEnv,
     policy: PreTrainedPolicy,
     env_preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     env_postprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
-    postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    postprocessor: PolicyProcessorPipeline[PolicyAction | dict[str, Any], PolicyAction],
     seeds: list[int] | None = None,
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
@@ -291,12 +156,15 @@ def rollout(
     all_rewards = []
     all_successes = []
     all_dones = []
-    chunk_absolute_action_queue: deque[Tensor] = deque()
-    use_chunk_relative_actions = bool(
-        getattr(getattr(policy, "config", None), "use_relative_actions", False)
-        and hasattr(policy, "update_observation_queue")
-        and hasattr(policy, "predict_action_chunk")
-    )
+    postprocessed_action_queue: deque[Tensor] = deque()
+    requires_action_context = bool(getattr(postprocessor, "requires_transition_context", False))
+    if requires_action_context and not (
+        hasattr(policy, "update_observation_queue") and hasattr(policy, "predict_action_chunk")
+    ):
+        raise TypeError(
+            "A context-aware action postprocessor requires a policy with "
+            "update_observation_queue() and predict_action_chunk()."
+        )
 
     step = 0
     # Keep track of which environments are done.
@@ -325,30 +193,19 @@ def rollout(
             except (AttributeError, NotImplementedError):
                 observation["task"] = [""] * env.num_envs
 
-        # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
+        # Apply environment-specific preprocessing.
         observation = env_preprocessor(observation)
-        anchor_state = observation.get(OBS_STATE) if use_chunk_relative_actions else None
-        anchor_state = anchor_state.clone() if anchor_state is not None else None
+        postprocessor_context = dict(observation) if requires_action_context else None
 
         observation = preprocessor(observation)
         with torch.inference_mode():
-            if use_chunk_relative_actions:
+            if requires_action_context:
                 observation = policy.update_observation_queue(observation)
-                if len(chunk_absolute_action_queue) == 0:
-                    relative_chunk = policy.predict_action_chunk(observation)
-                    relative_chunk = postprocessor(relative_chunk)
-                    if anchor_state is None:
-                        raise RuntimeError("Chunk-relative actions require observation.state as anchor.")
-                    absolute_chunk = chunk_relative_to_absolute(relative_chunk, anchor_state)
-                    if not isinstance(absolute_chunk, Tensor):
-                        absolute_chunk = torch.as_tensor(absolute_chunk)
-                    absolute_chunk = slice_current_action_window(
-                        absolute_chunk,
-                        n_obs_steps=policy.config.n_obs_steps,
-                        n_action_steps=policy.config.n_action_steps,
-                    )
-                    chunk_absolute_action_queue.extend(absolute_chunk.transpose(0, 1))
-                action = chunk_absolute_action_queue.popleft()
+                if len(postprocessed_action_queue) == 0:
+                    action_chunk = policy.predict_action_chunk(observation)
+                    action_chunk = postprocessor({**postprocessor_context, ACTION: action_chunk})
+                    postprocessed_action_queue.extend(action_chunk.transpose(0, 1))
+                action = postprocessed_action_queue.popleft()
             else:
                 action = policy.select_action(observation)
                 action = postprocessor(action)
@@ -434,7 +291,7 @@ def eval_policy(
     env_preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     env_postprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
-    postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    postprocessor: PolicyProcessorPipeline[PolicyAction | dict[str, Any], PolicyAction],
     n_episodes: int,
     max_episodes_rendered: int = 0,
     videos_dir: Path | None = None,
@@ -695,7 +552,7 @@ def _compile_episode_data(
 @parser.wrap()
 def eval_main(cfg: EvalPipelineConfig):
     logging.info(pformat(asdict(cfg)))
-    validate_libero_action_semantics(cfg)
+    cfg.env.validate_policy_compatibility(cfg.policy)
 
     # Check device is available
     device = get_safe_torch_device(cfg.policy.device, log=True)
@@ -706,11 +563,9 @@ def eval_main(cfg: EvalPipelineConfig):
 
     logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
 
-    # This must run before make_env(): fixed init-state lists are copied into
-    # each task-specific vector environment at construction time.
-    mam_eval_episodes = _prepare_mam_eval_episodes(cfg)
-    if mam_eval_episodes is None:
-        configure_fixed_libero_eval_from_dataset(cfg)
+    evaluation_runtime = prepare_policy_evaluation(cfg)
+    if evaluation_runtime is None:
+        cfg.env.prepare_evaluation(cfg)
 
     logging.info(f"Making environment (batch_size={cfg.eval.batch_size}, async={cfg.eval.use_async_envs}).")
     envs = make_env(
@@ -742,38 +597,25 @@ def eval_main(cfg: EvalPipelineConfig):
         preprocessor_overrides=preprocessor_overrides,
     )
 
-    # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
+    # Create environment-specific preprocessor and postprocessor.
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
 
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
-        if mam_eval_episodes is not None:
-            from lerobot.policies.mam.eval_mam import eval_mam_policy_all
-
-            info = eval_mam_policy_all(
-                envs=envs,
-                policy=policy,
-                env_preprocessor=env_preprocessor,
-                env_postprocessor=env_postprocessor,
-                preprocessor=preprocessor,
-                postprocessor=postprocessor,
-                episodes=mam_eval_episodes,
-                n_episodes=cfg.eval.n_episodes,
-                start_seed=cfg.seed,
-            )
-        else:
-            info = eval_policy_all(
-                envs=envs,
-                policy=policy,
-                env_preprocessor=env_preprocessor,
-                env_postprocessor=env_postprocessor,
-                preprocessor=preprocessor,
-                postprocessor=postprocessor,
-                n_episodes=cfg.eval.n_episodes,
-                max_episodes_rendered=10,
-                videos_dir=Path(cfg.output_dir) / "videos",
-                start_seed=cfg.seed,
-                max_parallel_tasks=cfg.env.max_parallel_tasks,
-            )
+        info = run_policy_evaluation(
+            evaluation_runtime,
+            eval_policy_all,
+            envs=envs,
+            policy=policy,
+            env_preprocessor=env_preprocessor,
+            env_postprocessor=env_postprocessor,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            n_episodes=cfg.eval.n_episodes,
+            max_episodes_rendered=10,
+            videos_dir=Path(cfg.output_dir) / "videos",
+            start_seed=cfg.seed,
+            max_parallel_tasks=cfg.env.max_parallel_tasks,
+        )
         print("Overall Aggregated Metrics:")
         print(info["overall"])
 
@@ -809,7 +651,7 @@ def eval_one(
     env_preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     env_postprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
-    postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    postprocessor: PolicyProcessorPipeline[PolicyAction | dict[str, Any], PolicyAction],
     n_episodes: int,
     max_episodes_rendered: int,
     videos_dir: Path | None,
@@ -895,7 +737,7 @@ def eval_policy_all(
     env_preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     env_postprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
-    postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    postprocessor: PolicyProcessorPipeline[PolicyAction | dict[str, Any], PolicyAction],
     n_episodes: int,
     *,
     max_episodes_rendered: int = 0,

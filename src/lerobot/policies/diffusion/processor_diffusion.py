@@ -21,13 +21,15 @@ import torch
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
+    LiberoChunkRelativeActionsPostprocessorStep,
     LiberoChunkRelativeActionsProcessorStep,
     NormalizerProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
     RenameObservationsProcessorStep,
     UnnormalizerProcessorStep,
-    policy_action_to_transition,
+    ensure_libero_chunk_relative_actions_postprocessor,
+    policy_action_with_context_to_transition,
     transition_to_policy_action,
 )
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
@@ -40,7 +42,7 @@ def make_diffusion_pre_post_processors(
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
-    PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    PolicyProcessorPipeline[PolicyAction | dict[str, Any], PolicyAction],
 ]:
     """
     Constructs pre-processor and post-processor pipelines for a diffusion policy.
@@ -52,8 +54,9 @@ def make_diffusion_pre_post_processors(
     4. Moving the data to the specified device.
 
     The post-processing pipeline handles the model's output by:
-    1. Moving the data to the CPU.
-    2. Unnormalizing the output features to their original scale.
+    1. Unnormalizing the output features to their original scale.
+    2. Decoding chunk-relative actions and selecting the executable window.
+    3. Moving the result to the CPU.
 
     Args:
         config: The configuration object for the diffusion policy,
@@ -80,6 +83,11 @@ def make_diffusion_pre_post_processors(
         UnnormalizerProcessorStep(
             features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
         ),
+        LiberoChunkRelativeActionsPostprocessorStep(
+            enabled=config.use_relative_actions,
+            n_obs_steps=config.n_obs_steps,
+            n_action_steps=config.n_action_steps,
+        ),
         DeviceProcessorStep(device="cpu"),
     ]
     return (
@@ -87,10 +95,23 @@ def make_diffusion_pre_post_processors(
             steps=input_steps,
             name=POLICY_PREPROCESSOR_DEFAULT_NAME,
         ),
-        PolicyProcessorPipeline[PolicyAction, PolicyAction](
+        PolicyProcessorPipeline[PolicyAction | dict[str, Any], PolicyAction](
             steps=output_steps,
             name=POLICY_POSTPROCESSOR_DEFAULT_NAME,
-            to_transition=policy_action_to_transition,
+            to_transition=policy_action_with_context_to_transition,
             to_output=transition_to_policy_action,
         ),
+    )
+
+
+def upgrade_loaded_diffusion_postprocessor(
+    config: DiffusionConfig,
+    postprocessor: PolicyProcessorPipeline[PolicyAction | dict[str, Any], PolicyAction],
+) -> None:
+    """Upgrade a legacy serialized DP postprocessor to the current contract."""
+    ensure_libero_chunk_relative_actions_postprocessor(
+        postprocessor,
+        enabled=config.use_relative_actions,
+        n_obs_steps=config.n_obs_steps,
+        n_action_steps=config.n_action_steps,
     )

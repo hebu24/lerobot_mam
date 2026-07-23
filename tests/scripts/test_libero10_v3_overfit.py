@@ -14,8 +14,8 @@ from lerobot.datasets.libero_pipeline import (
     require_libero_v3_relative_ready_dataset,
     write_libero_pipeline_manifest,
 )
-from lerobot.scripts.lerobot_eval import validate_libero_action_semantics
-from lerobot.scripts.lerobot_train import validate_libero_v3_training_dataset
+from lerobot.datasets.libero_training import validate_libero_v3_training_dataset
+from lerobot.envs.libero_eval import validate_libero_action_semantics
 from scripts import convert_libero_absolute_to_mam
 from scripts.convert_libero10_hdf5_to_lerobot import _assign_demo_index_map
 from scripts.convert_libero_absolute_to_mam import _as_float_list
@@ -113,10 +113,10 @@ def test_chunk_relative_libero_requires_absolute_controller():
     )
 
     with pytest.raises(ValueError, match="requires env.control_mode='absolute'"):
-        validate_libero_action_semantics(cfg)
+        validate_libero_action_semantics(cfg.env, cfg.policy)
 
     cfg.env.control_mode = "absolute"
-    validate_libero_action_semantics(cfg)
+    validate_libero_action_semantics(cfg.env, cfg.policy)
 
 
 def _write_mam_manifest(root, split):
@@ -196,12 +196,8 @@ def test_training_preflight_certifies_normal_and_exact_overfit_splits(tmp_path):
     _write_mam_manifest(eval_root, "eval")
     dataset = SimpleNamespace(root=train_root, meta=SimpleNamespace(robot_type="libero"))
 
-    validate_libero_v3_training_dataset(
-        _training_cfg(train_root, eval_root, overfit=False), dataset
-    )
-    validate_libero_v3_training_dataset(
-        _training_cfg(train_root, eval_root, overfit=True), dataset
-    )
+    validate_libero_v3_training_dataset(_training_cfg(train_root, eval_root, overfit=False), dataset)
+    validate_libero_v3_training_dataset(_training_cfg(train_root, eval_root, overfit=True), dataset)
 
     mam_cfg = _training_cfg(train_root, eval_root, overfit=False)
     mam_cfg.trainable_config.type = "mam"
@@ -235,9 +231,7 @@ def test_training_preflight_rejects_normal_source_trajectory_leakage(tmp_path):
     dataset = SimpleNamespace(root=train_root, meta=SimpleNamespace(robot_type="libero"))
 
     with pytest.raises(ValueError, match="source trajectory leakage"):
-        validate_libero_v3_training_dataset(
-            _training_cfg(train_root, eval_root, overfit=False), dataset
-        )
+        validate_libero_v3_training_dataset(_training_cfg(train_root, eval_root, overfit=False), dataset)
 
 
 def test_training_preflight_fails_closed_for_libero_env_with_wrong_robot_type(tmp_path):
@@ -321,9 +315,7 @@ def test_demo_index_map_rejects_unused_ambiguous_and_oversized_keys(tmp_path):
     source = tmp_path / "task.hdf5"
     tasks = {source: {"task_id": 8}}
 
-    assert _assign_demo_index_map([source], tasks, {"8": [0, 2]}, 2) == {
-        source: [0, 2]
-    }
+    assert _assign_demo_index_map([source], tasks, {"8": [0, 2]}, 2) == {source: [0, 2]}
     with pytest.raises(ValueError, match="did not match"):
         _assign_demo_index_map([source], tasks, {"typo": [0]}, 2)
     with pytest.raises(ValueError, match="ambiguous aliases"):

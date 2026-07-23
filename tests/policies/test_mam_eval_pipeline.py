@@ -5,9 +5,11 @@ import pytest
 import torch
 
 from lerobot.configs import FeatureType, PolicyFeature
+from lerobot.policies import prepare_policy_evaluation
 from lerobot.policies.mam.configuration_mam import MamConfig
 from lerobot.policies.mam.eval_mam import (
     MamEvalEpisode,
+    _episode_task_description,
     _resolve_stpm_paths,
     _slice_episode_window,
     _stack_history,
@@ -17,7 +19,6 @@ from lerobot.policies.mam.eval_mam import (
     load_mam_eval_episodes,
     make_stpm_encoder,
 )
-from lerobot.scripts.lerobot_eval import _prepare_mam_eval_episodes
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 
@@ -77,6 +78,13 @@ def test_eval_mam_window_clamps_each_relative_offset_without_shifting():
     assert torch.equal(actions[:, 0], expected)
 
 
+def test_mam_eval_task_description_prefers_episode_metadata():
+    meta = SimpleNamespace(tasks=SimpleNamespace(iloc=None))
+    row = {"tasks": ["correct task"]}
+
+    assert _episode_task_description(meta, row, [7, 7]) == "correct task"
+
+
 def test_mam_eval_requires_absolute_libero_control_mode():
     cfg = SimpleNamespace(
         env=SimpleNamespace(type="libero", control_mode="relative", init_state_ids=None),
@@ -117,9 +125,10 @@ def test_standalone_eval_prepares_mam_before_environment_creation(monkeypatch):
 
     monkeypatch.setattr("lerobot.policies.mam.eval_mam.load_mam_eval_episodes", fake_load)
 
-    loaded = _prepare_mam_eval_episodes(cfg)
+    runtime = prepare_policy_evaluation(cfg)
 
-    assert loaded == [episode]
+    assert runtime is not None
+    assert runtime.episodes == [episode]
     assert calls == [{"repo_id": "local/eval", "root": "/tmp/eval", "episodes": [9]}]
     assert cfg.env.task_ids == [0]
     assert cfg.env.init_state_ids_by_task == {"libero_10/0": [0]}
