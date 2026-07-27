@@ -106,6 +106,196 @@ def test_mam_conversion_preserves_float64_init_state():
     assert np.array_equal(converted, value)
 
 
+def test_mam_pose_mask_retains_complete_actions_at_sampled_timesteps():
+    actions = np.arange(70, dtype=np.float32).reshape(10, 7)
+
+    masked, mask = convert_libero_absolute_to_mam._apply_mask(
+        actions,
+        mask_type="pose",
+        retain_ratio=0.3,
+        mask_value=-1.0,
+        rng=np.random.default_rng(0),
+    )
+
+    retained_timesteps = np.flatnonzero(mask[:, 0])
+    assert retained_timesteps.size == 3
+    assert np.all(mask[retained_timesteps] == 1.0)
+    assert np.all(mask[np.setdiff1d(np.arange(10), retained_timesteps)] == 0.0)
+    assert np.array_equal(masked[retained_timesteps], actions[retained_timesteps])
+    assert np.all(masked[mask == 0.0] == -1.0)
+
+
+def test_mam_pose_motion_planning_matches_pose_alias():
+    actions = np.arange(70, dtype=np.float32).reshape(10, 7)
+
+    _, pose_mask = convert_libero_absolute_to_mam._apply_mask(
+        actions, "pose", 0.3, 0.0, np.random.default_rng(7)
+    )
+    _, planning_mask = convert_libero_absolute_to_mam._apply_mask(
+        actions, "pose_motion_planning", 0.3, 0.0, np.random.default_rng(7)
+    )
+
+    assert np.array_equal(pose_mask, planning_mask)
+
+
+@pytest.mark.parametrize(
+    ("mask_type", "expected_known"),
+    [("points", 6), ("3D_points", 9), ("random_mask", 21)],
+)
+def test_mam_ratio_masks_match_maniskill_retained_entry_counts(mask_type, expected_known):
+    _, mask = convert_libero_absolute_to_mam._apply_mask(
+        np.zeros((10, 7), dtype=np.float32),
+        mask_type,
+        retain_ratio=0.3,
+        mask_value=0.0,
+        rng=np.random.default_rng(0),
+    )
+
+    assert np.count_nonzero(mask) == expected_known
+
+
+@pytest.mark.parametrize("mask_type", ["2D_video_trajectory", "2D_image_trajectory"])
+def test_mam_2d_trajectory_masks_retain_xy_at_every_timestep(mask_type):
+    _, mask = convert_libero_absolute_to_mam._apply_mask(
+        np.zeros((6, 7), dtype=np.float32),
+        mask_type,
+        retain_ratio=None,
+        mask_value=0.0,
+        rng=np.random.default_rng(0),
+    )
+
+    assert np.all(mask[:, :2] == 1.0)
+    assert np.all(mask[:, 2:] == 0.0)
+
+
+@pytest.mark.parametrize("mask_type", ["mix", "mix0"])
+def test_mam_mix_mask_matches_maniskill_mix0(mask_type):
+    _, mask = convert_libero_absolute_to_mam._apply_mask(
+        np.zeros((10, 7), dtype=np.float32),
+        mask_type,
+        retain_ratio=None,
+        mask_value=0.0,
+        rng=np.random.default_rng(0),
+    )
+
+    assert np.all(mask[:, :2] == 1.0)
+    assert np.count_nonzero(mask[:, 2]) == 4
+    assert np.count_nonzero(np.all(mask == 1.0, axis=1)) == 1
+
+
+def test_mam_partial_and_local_planner_masks_use_contiguous_windows():
+    actions = np.zeros((10, 7), dtype=np.float32)
+
+    _, partial = convert_libero_absolute_to_mam._apply_mask(
+        actions,
+        "2D_partial_trajectory",
+        retain_ratio=None,
+        mask_value=0.0,
+        rng=np.random.default_rng(0),
+        mask_seq_len=3,
+    )
+    partial_rows = np.flatnonzero(partial[:, 0])
+    assert partial_rows.size == 3
+    assert np.all(np.diff(partial_rows) == 1)
+    assert np.all(partial[partial_rows, :2] == 1.0)
+    assert np.all(partial[:, 2:] == 0.0)
+
+    _, local = convert_libero_absolute_to_mam._apply_mask(
+        actions,
+        "local_planner",
+        retain_ratio=None,
+        mask_value=0.0,
+        rng=np.random.default_rng(0),
+        mask_seq_len=3,
+    )
+    hidden_rows = np.flatnonzero(np.all(local == 0.0, axis=1))
+    assert hidden_rows.size == 3
+    assert np.all(np.diff(hidden_rows) == 1)
+    assert np.all(local[np.setdiff1d(np.arange(10), hidden_rows)] == 1.0)
+
+
+def test_mam_mixed_mask_specs_and_composition_assignment():
+    args = SimpleNamespace(
+        mask_type="random_mask",
+        mask_types="pose,points,mix0",
+        retain_ratio=0.2,
+        retain_ratios="0.3,0.4,0.9",
+        mask_seq_len=20,
+        mask_seq_lens=None,
+        mask_composition="0.5,0.3,0.2",
+    )
+
+    specs = convert_libero_absolute_to_mam._resolve_mask_specs(args)
+    assigned = convert_libero_absolute_to_mam._assign_mask_specs(
+        list(range(10)),
+        specs,
+        assign_mode="composition",
+        seed=0,
+    )
+
+    counts = {
+        mask_type: sum(rows[0]["mask_type"] == mask_type for rows in assigned.values())
+        for mask_type in ("pose", "points", "mix0")
+    }
+    assert counts == {"pose": 5, "points": 3, "mix0": 2}
+    assert [spec["retain_ratio"] for spec in specs] == [0.3, 0.4, None]
+
+
+def test_mam_resolves_reference_experiment_train_and_eval_masks_independently():
+    args = SimpleNamespace(
+        mask_type="random_mask",
+        mask_types=None,
+        mask_assign_mode="one_demo_multi_mask",
+        mask_composition=None,
+        retain_ratio=0.2,
+        retain_ratios=None,
+        mask_seq_len=20,
+        mask_seq_lens=None,
+        train_mask_types="points,3D_points,3D_points,pose_motion_planning",
+        train_mask_assign_mode="composition",
+        train_mask_composition="0.25,0.25,0.25,0.25",
+        train_retain_ratios="1,1,0.2,0.2",
+        train_mask_seq_lens=None,
+        eval_mask_types="points,3D_points,3D_points,pose_motion_planning,mix0",
+        eval_mask_assign_mode="composition",
+        eval_mask_composition="0.2,0.2,0.2,0.2,0.2",
+        eval_retain_ratios="1,1,0.2,0.2,1",
+        eval_mask_seq_lens=None,
+    )
+
+    train_specs = convert_libero_absolute_to_mam._resolve_mask_specs(args, split="train")
+    eval_specs = convert_libero_absolute_to_mam._resolve_mask_specs(args, split="eval")
+
+    assert [spec["mask_type"] for spec in train_specs] == [
+        "points",
+        "3D_points",
+        "3D_points",
+        "pose_motion_planning",
+    ]
+    assert [spec["retain_ratio"] for spec in train_specs] == [1.0, 1.0, 0.2, 0.2]
+    assert [spec["mask_type"] for spec in eval_specs] == [
+        "points",
+        "3D_points",
+        "3D_points",
+        "pose_motion_planning",
+        "mix0",
+    ]
+    assert [spec["retain_ratio"] for spec in eval_specs] == [1.0, 1.0, 0.2, 0.2, None]
+    assert convert_libero_absolute_to_mam._resolve_mask_assign_mode(args, "train") == "composition"
+    assert convert_libero_absolute_to_mam._resolve_mask_assign_mode(args, "eval") == "composition"
+
+
+def test_mam_full_mask_type_is_no_longer_supported():
+    with pytest.raises(ValueError, match="Unsupported mask_type='full'"):
+        convert_libero_absolute_to_mam._apply_mask(
+            np.zeros((5, 7), dtype=np.float32),
+            mask_type="full",
+            retain_ratio=0.2,
+            mask_value=0.0,
+            rng=np.random.default_rng(0),
+        )
+
+
 def test_chunk_relative_libero_requires_absolute_controller():
     cfg = SimpleNamespace(
         policy=SimpleNamespace(type="diffusion", use_relative_actions=True),

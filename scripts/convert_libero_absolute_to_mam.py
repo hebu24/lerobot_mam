@@ -3,15 +3,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from lerobot.datasets import LeRobotDataset
-from lerobot.datasets.compute_stats import compute_libero_relative_action_stats
+from lerobot.datasets.compute_stats import (
+    aggregate_stats,
+    compute_episode_stats,
+    compute_libero_relative_action_stats,
+)
 from lerobot.datasets.io_utils import write_stats
 from lerobot.datasets.libero_pipeline import (
     LIBERO_ABSOLUTE_ACTION,
@@ -28,6 +35,29 @@ from lerobot.utils.constants import ACTION, DEFAULT_FEATURES
 MAM_MAS_ACTION_ABSOLUTE = "mam.mas_action_absolute"
 MAM_MAS_ACTION_MASK = "mam.mas_action_mask"
 MAM_PROGRESS = "mam.progress"
+
+MASK_TYPES_REQUIRING_RATIO = {
+    "pose",
+    "pose_motion_planning",
+    "points",
+    "3D_points",
+    "random_mask",
+}
+MASK_TYPES_REQUIRING_SEQ_LEN = {"2D_partial_trajectory", "local_planner"}
+SUPPORTED_MASK_TYPES = {
+    "none",
+    "2D_video_trajectory",
+    "2D_image_trajectory",
+    "mix",
+    "mix0",
+    "2D_partial_trajectory",
+    "pose",
+    "pose_motion_planning",
+    "points",
+    "3D_points",
+    "local_planner",
+    "random_mask",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,14 +83,81 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--split-seed", type=int, default=0)
     parser.add_argument("--only-split", choices=("both", "train", "eval"), default="both")
+    parser.add_argument(
+        "--remask-existing-split",
+        action="store_true",
+        help=(
+            "Treat an existing absolute_to_mam train or eval dataset as the source, preserve all "
+            "episodes in that split, and write --output-root directly with new masks."
+        ),
+    )
     parser.add_argument("--mask-type", type=str, default="random_mask")
     parser.add_argument(
         "--mask-types",
         type=str,
         default=None,
-        help="Comma-separated mask types. Each source episode is materialized once per entry.",
+        help="Comma-separated mask types used to build a mixed-mask dataset.",
+    )
+    parser.add_argument(
+        "--mask-assign-mode",
+        choices=("one_demo_multi_mask", "composition"),
+        default="one_demo_multi_mask",
+        help=(
+            "one_demo_multi_mask duplicates every source episode for every mask type; "
+            "composition assigns exactly one mask type to each source episode."
+        ),
+    )
+    parser.add_argument(
+        "--mask-composition",
+        type=str,
+        default=None,
+        help="Comma-separated per-type fractions for composition mode. Defaults to equal fractions.",
     )
     parser.add_argument("--retain-ratio", type=float, default=0.2)
+    parser.add_argument(
+        "--retain-ratios",
+        type=str,
+        default=None,
+        help="Comma-separated retain ratios aligned with --mask-types. A single value is broadcast.",
+    )
+    parser.add_argument("--mask-seq-len", type=int, default=20)
+    parser.add_argument(
+        "--mask-seq-lens",
+        type=str,
+        default=None,
+        help="Comma-separated sequence lengths aligned with --mask-types. A single value is broadcast.",
+    )
+    for split in ("train", "eval"):
+        parser.add_argument(
+            f"--{split}-mask-types",
+            type=str,
+            default=None,
+            help=f"Comma-separated mask types for the {split} split. Defaults to --mask-types.",
+        )
+        parser.add_argument(
+            f"--{split}-mask-assign-mode",
+            choices=("one_demo_multi_mask", "composition"),
+            default=None,
+            help=f"Mask assignment mode for the {split} split.",
+        )
+        parser.add_argument(
+            f"--{split}-mask-composition",
+            type=str,
+            default=None,
+            help=f"Comma-separated mask fractions for the {split} split.",
+        )
+        parser.add_argument(
+            f"--{split}-retain-ratios",
+            type=str,
+            default=None,
+            help=f"Comma-separated retain ratios for the {split} split.",
+        )
+        parser.add_argument(
+            f"--{split}-mask-seq-lens",
+            type=str,
+            default=None,
+            help=f"Comma-separated mask sequence lengths for the {split} split.",
+        )
     parser.add_argument("--mask-value", type=float, default=0.0)
     parser.add_argument("--n-obs-steps", type=int, default=2)
     parser.add_argument("--horizon", type=int, default=32)
@@ -81,19 +178,169 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _resolve_mask_types(args: argparse.Namespace) -> list[str]:
-    raw_mask_types = getattr(args, "mask_types", None)
+def _resolve_mask_types(args: argparse.Namespace, split: str | None = None) -> list[str]:
+    raw_mask_types = (
+        getattr(args, f"{split}_mask_types", None)
+        if split is not None
+        else None
+    )
+    if raw_mask_types is None:
+        raw_mask_types = getattr(args, "mask_types", None)
     if raw_mask_types is None:
         mask_types = [str(args.mask_type).strip()]
     else:
         mask_types = [item.strip() for item in str(raw_mask_types).split(",")]
     if not mask_types or any(not item for item in mask_types):
         raise ValueError("--mask-types must contain one or more non-empty comma-separated values.")
+    unsupported = sorted(set(mask_types) - SUPPORTED_MASK_TYPES)
+    if unsupported:
+        raise ValueError(
+            f"Unsupported mask type(s): {unsupported}. Supported: {sorted(SUPPORTED_MASK_TYPES)}"
+        )
     return mask_types
+
+
+def _resolve_aligned_values(
+    raw_values: Any,
+    count: int,
+    default: Any,
+    caster,
+    option_name: str,
+) -> list[Any]:
+    if raw_values is None:
+        return [caster(default)] * count
+    values = [caster(item.strip()) for item in str(raw_values).split(",") if item.strip()]
+    if len(values) == 1:
+        return values * count
+    if len(values) != count:
+        raise ValueError(f"{option_name} expects 1 or {count} value(s), got {len(values)}.")
+    return values
+
+
+def _resolve_split_option(args: argparse.Namespace, split: str | None, name: str) -> Any:
+    if split is not None:
+        split_value = getattr(args, f"{split}_{name}", None)
+        if split_value is not None:
+            return split_value
+    return getattr(args, name, None)
+
+
+def _resolve_mask_assign_mode(args: argparse.Namespace, split: str | None = None) -> str:
+    value = _resolve_split_option(args, split, "mask_assign_mode")
+    return "one_demo_multi_mask" if value is None else str(value)
+
+
+def _resolve_mask_specs(
+    args: argparse.Namespace,
+    split: str | None = None,
+) -> list[dict[str, Any]]:
+    mask_types = _resolve_mask_types(args, split=split)
+    retain_ratios = _resolve_aligned_values(
+        _resolve_split_option(args, split, "retain_ratios"),
+        len(mask_types),
+        getattr(args, "retain_ratio", 0.2),
+        float,
+        "--retain-ratios",
+    )
+    mask_seq_lens = _resolve_aligned_values(
+        _resolve_split_option(args, split, "mask_seq_lens"),
+        len(mask_types),
+        getattr(args, "mask_seq_len", 20),
+        int,
+        "--mask-seq-lens",
+    )
+    raw_composition = _resolve_split_option(args, split, "mask_composition")
+    if raw_composition is None:
+        composition = [1.0 / len(mask_types)] * len(mask_types)
+    else:
+        composition = _resolve_aligned_values(
+            raw_composition,
+            len(mask_types),
+            1.0,
+            float,
+            "--mask-composition",
+        )
+    if any(ratio < 0.0 or ratio > 1.0 for ratio in retain_ratios):
+        raise ValueError(f"retain ratios must be in [0, 1], got {retain_ratios}.")
+    if any(length <= 0 for length in mask_seq_lens):
+        raise ValueError(f"mask sequence lengths must be positive, got {mask_seq_lens}.")
+    if any(weight < 0.0 for weight in composition) or not np.isclose(sum(composition), 1.0):
+        raise ValueError(f"mask composition must be non-negative and sum to 1, got {composition}.")
+
+    return [
+        {
+            "mask_type": mask_type,
+            "mask_type_slot": slot,
+            "composition": float(composition[slot]),
+            "retain_ratio": (
+                float(retain_ratios[slot]) if mask_type in MASK_TYPES_REQUIRING_RATIO else None
+            ),
+            "mask_seq_len": (
+                int(mask_seq_lens[slot]) if mask_type in MASK_TYPES_REQUIRING_SEQ_LEN else None
+            ),
+        }
+        for slot, mask_type in enumerate(mask_types)
+    ]
+
+
+def _largest_remainder_counts(total: int, weights: list[float]) -> list[int]:
+    exact = np.asarray(weights, dtype=np.float64) * int(total)
+    counts = np.floor(exact).astype(np.int64)
+    remaining = int(total) - int(counts.sum())
+    if remaining > 0:
+        order = sorted(range(len(weights)), key=lambda idx: (-(exact[idx] - counts[idx]), idx))
+        for idx in order[:remaining]:
+            counts[idx] += 1
+    return [int(value) for value in counts]
+
+
+def _assign_mask_specs(
+    episode_ids: list[int],
+    mask_specs: list[dict[str, Any]],
+    assign_mode: str,
+    seed: int,
+) -> dict[int, list[dict[str, Any]]]:
+    if assign_mode == "one_demo_multi_mask":
+        return {int(episode_id): mask_specs for episode_id in episode_ids}
+    if assign_mode != "composition":
+        raise ValueError(f"Unsupported mask_assign_mode={assign_mode!r}.")
+
+    counts = _largest_remainder_counts(
+        len(episode_ids),
+        [float(spec["composition"]) for spec in mask_specs],
+    )
+    shuffled_ids = np.random.default_rng(seed).permutation(
+        np.asarray(episode_ids, dtype=np.int64)
+    )
+    assigned: dict[int, list[dict[str, Any]]] = {}
+    cursor = 0
+    for spec, count in zip(mask_specs, counts):
+        for episode_id in shuffled_ids[cursor : cursor + count]:
+            assigned[int(episode_id)] = [spec]
+        cursor += count
+    if len(assigned) != len(episode_ids):
+        raise AssertionError("Mask composition did not assign every source episode.")
+    return assigned
 
 
 def _repo_id_from_root(root: Path) -> str:
     return f"local/{root.name}"
+
+
+def _absolute_source_provenance(args: argparse.Namespace) -> tuple[str, str]:
+    input_manifest = read_libero_pipeline_manifest(args.input_root)
+    if input_manifest.get("stage") == "absolute_to_mam":
+        source_root = input_manifest.get("source_root")
+        source_repo_id = input_manifest.get("source_repo_id")
+        if not source_root or not source_repo_id:
+            raise ValueError(
+                "An existing MAM split must retain its absolute source_root and source_repo_id."
+            )
+        return str(source_root), str(source_repo_id)
+    return (
+        str(args.input_root.resolve()),
+        args.input_repo_id or _repo_id_from_root(args.input_root),
+    )
 
 
 def _selected_episode_ids(total: int, eval_ratio: float, seed: int) -> tuple[list[int], list[int]]:
@@ -289,16 +536,54 @@ def _selected_episode_ids_by_task_ratio(
 def _apply_mask(
     action: np.ndarray,
     mask_type: str,
-    retain_ratio: float,
+    retain_ratio: float | None,
     mask_value: float,
     rng,
+    mask_seq_len: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     action = np.asarray(action, dtype=np.float32)
+    if action.ndim != 2 or action.shape[1] != 7:
+        raise ValueError(f"MAM actions must have shape (T, 7), got {action.shape}.")
+    if mask_type not in SUPPORTED_MASK_TYPES:
+        raise ValueError(f"Unsupported mask_type={mask_type!r} for LeRobot MAM conversion.")
+    if mask_type in MASK_TYPES_REQUIRING_RATIO and retain_ratio is None:
+        raise ValueError(f"mask_type={mask_type!r} requires retain_ratio.")
+    if retain_ratio is not None and not 0.0 <= float(retain_ratio) <= 1.0:
+        raise ValueError(f"retain_ratio must be in [0, 1], got {retain_ratio}.")
+    if mask_type in MASK_TYPES_REQUIRING_SEQ_LEN and (
+        mask_seq_len is None or int(mask_seq_len) <= 0
+    ):
+        raise ValueError(f"mask_type={mask_type!r} requires a positive mask_seq_len.")
+
+    n, _ = action.shape
     mask = np.zeros_like(action, dtype=np.float32)
     if mask_type == "none":
         return np.full_like(action, mask_value), mask
-    if mask_type == "full":
-        mask[:] = 1.0
+    if n == 0:
+        return np.full_like(action, mask_value), mask
+
+    if mask_type in {"2D_video_trajectory", "2D_image_trajectory"}:
+        mask[:, :2] = 1.0
+    elif mask_type in {"mix", "mix0"}:
+        if n < 4:
+            raise ValueError(f"{mask_type} requires trajectory length >= 4, got {n}.")
+        mask[:, :2] = 1.0
+        idx = np.arange(n)
+        rng.shuffle(idx)
+        mask[idx[0], :] = 1.0
+        mask[idx[1:4], :3] = 1.0
+    elif mask_type == "2D_partial_trajectory":
+        if int(mask_seq_len) >= n:
+            raise ValueError(
+                f"mask_seq_len ({mask_seq_len}) must be smaller than trajectory length ({n})."
+            )
+        start = int(rng.integers(0, n - int(mask_seq_len) + 1))
+        mask[start : start + int(mask_seq_len), :2] = 1.0
+    elif mask_type in {"pose", "pose_motion_planning"}:
+        keep = int(n * float(retain_ratio))
+        idx = np.arange(n)
+        rng.shuffle(idx)
+        mask[idx[:keep], :] = 1.0
     elif mask_type == "random_mask":
         total = action.size
         keep = int(total * float(retain_ratio))
@@ -307,17 +592,23 @@ def _apply_mask(
             rng.shuffle(idx)
             mask.reshape(-1)[idx[:keep]] = 1.0
     elif mask_type == "3D_points":
-        keep = int(action.shape[0] * float(retain_ratio))
-        idx = np.arange(action.shape[0])
+        keep = int(n * float(retain_ratio))
+        idx = np.arange(n)
         rng.shuffle(idx)
         mask[idx[:keep], :3] = 1.0
     elif mask_type == "points":
-        keep = int(action.shape[0] * float(retain_ratio))
-        idx = np.arange(action.shape[0])
+        keep = int(n * float(retain_ratio))
+        idx = np.arange(n)
         rng.shuffle(idx)
         mask[idx[:keep], :2] = 1.0
-    else:
-        raise ValueError(f"Unsupported mask_type={mask_type!r} for LeRobot MAM conversion.")
+    elif mask_type == "local_planner":
+        if int(mask_seq_len) >= n:
+            raise ValueError(
+                f"mask_seq_len ({mask_seq_len}) must be smaller than trajectory length ({n})."
+            )
+        mask[:, :] = 1.0
+        start = int(rng.integers(0, n - int(mask_seq_len) + 1))
+        mask[start : start + int(mask_seq_len), :] = 0.0
     masked = np.full_like(action, mask_value)
     masked[mask > 0.5] = action[mask > 0.5]
     return masked.astype(np.float32), mask.astype(np.float32)
@@ -341,6 +632,8 @@ def _patch_episode_metadata(root: Path, rows: dict[int, dict]) -> None:
             "source_episode_id",
             "mask_type",
             "mask_type_slot",
+            "retain_ratio",
+            "mask_seq_len",
             "libero/init_state_id",
             "libero/init_state",
             "libero/suite",
@@ -354,7 +647,204 @@ def _patch_episode_metadata(root: Path, rows: dict[int, dict]) -> None:
             for episode_index in df["episode_index"].astype(int).tolist():
                 values.append(rows.get(episode_index, {}).get(key))
             df[key] = values
-        df.to_parquet(parquet_path)
+        temporary_path = parquet_path.with_suffix(f"{parquet_path.suffix}.tmp")
+        df.to_parquet(temporary_path, index=False)
+        os.replace(temporary_path, parquet_path)
+
+
+def _copy_existing_split_for_remask(source_root: Path, output_root: Path) -> None:
+    """Clone a materialized MAM split while avoiding another image decode/encode pass."""
+
+    source_data_root = (source_root.resolve() / "data")
+
+    def copy_file(source_path: str, destination_path: str) -> str:
+        source = Path(source_path).resolve()
+        if source.is_relative_to(source_data_root):
+            os.link(source_path, destination_path)
+            return destination_path
+        return shutil.copy2(source_path, destination_path)
+
+    shutil.copytree(source_root, output_root, copy_function=copy_file)
+
+
+def _write_existing_split_with_new_masks(
+    source: LeRobotDataset,
+    root: Path,
+    args: argparse.Namespace,
+) -> None:
+    """Fast path for composition remasking: preserve every column except the mask."""
+
+    dataset_split = str(read_libero_pipeline_manifest(args.input_root)["dataset_split"])
+    episode_ids = sorted(int(row["episode_index"]) for row in source.meta.episodes)
+    mask_specs = _resolve_mask_specs(args, split=dataset_split)
+    mask_assign_mode = _resolve_mask_assign_mode(args, split=dataset_split)
+    if mask_assign_mode != "composition":
+        raise ValueError(
+            "Fast --remask-existing-split currently requires mask_assign_mode=composition "
+            "because one_demo_multi_mask changes the episode count."
+        )
+    assigned_mask_specs = _assign_mask_specs(
+        episode_ids,
+        mask_specs,
+        mask_assign_mode,
+        args.split_seed,
+    )
+
+    if root.exists():
+        if not args.overwrite:
+            raise FileExistsError(f"{root} exists; pass --overwrite")
+        shutil.rmtree(root)
+    _copy_existing_split_for_remask(args.input_root, root)
+
+    source_episode_rows = {int(row["episode_index"]): row for row in source.meta.episodes}
+    episode_meta_rows: dict[int, dict[str, Any]] = {}
+    episode_mask_stats: dict[int, dict[str, np.ndarray]] = {}
+    mask_feature = {MAM_MAS_ACTION_MASK: source.meta.features[MAM_MAS_ACTION_MASK]}
+    seen_episode_ids: set[int] = set()
+
+    for parquet_path in sorted((root / "data").glob("**/*.parquet")):
+        table = pq.read_table(parquet_path)
+        actions = np.asarray(table[MAM_MAS_ACTION_ABSOLUTE].to_pylist(), dtype=np.float32)
+        parquet_episode_ids = np.asarray(table["episode_index"].to_numpy(), dtype=np.int64)
+        masks = np.zeros_like(actions, dtype=np.float32)
+
+        for episode_id in np.unique(parquet_episode_ids):
+            episode_id = int(episode_id)
+            if episode_id in seen_episode_ids:
+                raise ValueError(
+                    f"Episode {episode_id} spans more than one parquet file; "
+                    "cannot use the fast remask path safely."
+                )
+            seen_episode_ids.add(episode_id)
+            row_indices = np.flatnonzero(parquet_episode_ids == episode_id)
+            mask_spec = assigned_mask_specs[episode_id][0]
+            rng = np.random.default_rng(
+                np.random.SeedSequence(
+                    [int(args.split_seed), episode_id, int(mask_spec["mask_type_slot"])]
+                )
+            )
+            _, episode_mask = _apply_mask(
+                actions[row_indices],
+                str(mask_spec["mask_type"]),
+                mask_spec["retain_ratio"],
+                args.mask_value,
+                rng,
+                mask_seq_len=mask_spec["mask_seq_len"],
+            )
+            masks[row_indices] = episode_mask
+            episode_mask_stats[episode_id] = compute_episode_stats(
+                {MAM_MAS_ACTION_MASK: episode_mask},
+                mask_feature,
+            )[MAM_MAS_ACTION_MASK]
+
+            source_row = source_episode_rows[episode_id]
+            original_source_episode_id = int(
+                _row_get(
+                    source_row,
+                    "libero/source_episode_id",
+                    _row_get(source_row, "source_episode_id", episode_id),
+                )
+            )
+            episode_meta_rows[episode_id] = {
+                "source_episode_id": original_source_episode_id,
+                "mask_type": str(mask_spec["mask_type"]),
+                "mask_type_slot": int(mask_spec["mask_type_slot"]),
+                "retain_ratio": mask_spec["retain_ratio"],
+                "mask_seq_len": mask_spec["mask_seq_len"],
+                "libero/init_state_id": int(
+                    _row_get(source_row, "libero/init_state_id", episode_id)
+                ),
+                "libero/init_state": _as_float_list(_row_get(source_row, "libero/init_state")),
+                "libero/suite": _row_get(source_row, "libero/suite"),
+                "libero/task_id": _row_get(source_row, "libero/task_id"),
+                "libero/task_name": _row_get(source_row, "libero/task_name"),
+                "libero/source_episode_id": original_source_episode_id,
+                "libero/source_file": _row_get(source_row, "libero/source_file"),
+                "libero/source_demo": _row_get(source_row, "libero/source_demo"),
+            }
+
+        mask_array = pa.FixedSizeListArray.from_arrays(
+            pa.array(masks.reshape(-1), type=pa.float32()),
+            actions.shape[1],
+        )
+        mask_column_index = table.schema.get_field_index(MAM_MAS_ACTION_MASK)
+        table = table.set_column(
+            mask_column_index,
+            table.schema.field(mask_column_index),
+            mask_array,
+        )
+        temporary_path = parquet_path.with_suffix(f"{parquet_path.suffix}.tmp")
+        pq.write_table(table, temporary_path)
+        os.replace(temporary_path, parquet_path)
+
+    if seen_episode_ids != set(episode_ids):
+        raise ValueError(
+            "Fast remask did not cover exactly the source episodes: "
+            f"missing={sorted(set(episode_ids) - seen_episode_ids)}, "
+            f"extra={sorted(seen_episode_ids - set(episode_ids))}."
+        )
+
+    _patch_episode_metadata(root, episode_meta_rows)
+    for parquet_path in sorted((root / "meta" / "episodes").glob("**/*.parquet")):
+        df = pd.read_parquet(parquet_path)
+        for stat_name in ("min", "max", "mean", "std", "count", "q01", "q10", "q50", "q90", "q99"):
+            column = f"stats/{MAM_MAS_ACTION_MASK}/{stat_name}"
+            df[column] = [
+                episode_mask_stats[int(episode_id)][stat_name].tolist()
+                for episode_id in df["episode_index"].astype(int)
+            ]
+        temporary_path = parquet_path.with_suffix(f"{parquet_path.suffix}.tmp")
+        df.to_parquet(temporary_path, index=False)
+        os.replace(temporary_path, parquet_path)
+
+    stats = dict(source.meta.stats or {})
+    stats[MAM_MAS_ACTION_MASK] = aggregate_stats(
+        [
+            {MAM_MAS_ACTION_MASK: episode_mask_stats[episode_id]}
+            for episode_id in episode_ids
+        ]
+    )[MAM_MAS_ACTION_MASK]
+    write_stats(stats, root)
+
+    manifest_source_episode_ids = [
+        int(
+            _row_get(
+                source_episode_rows[episode_id],
+                "libero/source_episode_id",
+                _row_get(source_episode_rows[episode_id], "source_episode_id", episode_id),
+            )
+        )
+        for episode_id in episode_ids
+    ]
+    absolute_source_root, absolute_source_repo_id = _absolute_source_provenance(args)
+    write_libero_pipeline_manifest(
+        root,
+        {
+            "pipeline_version": LIBERO_PIPELINE_VERSION,
+            "stage": "absolute_to_mam",
+            "conversion_complete": True,
+            "dataset_split": dataset_split,
+            "action_representation": LIBERO_ABSOLUTE_ACTION,
+            "policy_action_representation": LIBERO_CHUNK_RELATIVE_ACTION,
+            "relative_action_stats": True,
+            "relative_action_stats_n_obs_steps": int(args.n_obs_steps),
+            "relative_action_stats_horizon": int(args.horizon),
+            "relative_action_stats_action_delta_indices": list(
+                range(1 - args.n_obs_steps, 1 - args.n_obs_steps + args.horizon)
+            ),
+            "observation_materialization": LIBERO_CLOSED_LOOP_ABSOLUTE_MATERIALIZATION,
+            "relative_action_ready": True,
+            "state_representation": LIBERO_STATE_14D,
+            "source_root": absolute_source_root,
+            "source_repo_id": absolute_source_repo_id,
+            "source_episode_ids": manifest_source_episode_ids,
+            "mask_types": [str(spec["mask_type"]) for spec in mask_specs],
+            "mask_assign_mode": mask_assign_mode,
+            "mask_specs": mask_specs,
+            "source_episode_count": len(episode_ids),
+            "expanded_episode_count": len(episode_ids),
+        },
+    )
 
 
 def _write_split(
@@ -364,6 +854,7 @@ def _write_split(
     repo_id: str,
     args: argparse.Namespace,
 ) -> None:
+    dataset_split = "train" if root.name.endswith("_train") else "eval"
     if root.exists():
         if not args.overwrite:
             raise FileExistsError(f"{root} exists; pass --overwrite")
@@ -385,7 +876,28 @@ def _write_split(
 
     episode_meta_rows = {}
     source_episode_rows = {int(row["episode_index"]): row for row in source.meta.episodes}
-    mask_types = _resolve_mask_types(args)
+    manifest_source_episode_ids = [
+        int(
+            _row_get(
+                source_episode_rows.get(int(episode_id), {}),
+                "libero/source_episode_id",
+                _row_get(
+                    source_episode_rows.get(int(episode_id), {}),
+                    "source_episode_id",
+                    episode_id,
+                ),
+            )
+        )
+        for episode_id in episode_ids
+    ]
+    mask_specs = _resolve_mask_specs(args, split=dataset_split)
+    mask_assign_mode = _resolve_mask_assign_mode(args, split=dataset_split)
+    assigned_mask_specs = _assign_mask_specs(
+        episode_ids,
+        mask_specs,
+        mask_assign_mode,
+        args.split_seed,
+    )
     local_episode_index = 0
 
     for source_episode_id in episode_ids:
@@ -414,16 +926,19 @@ def _write_split(
         init_state = _as_float_list(_row_get(source_row, "libero/init_state"))
         denom = max(len(frames) - 1, 1)
 
-        for mask_type_slot, mask_type in enumerate(mask_types):
+        for mask_spec in assigned_mask_specs[int(source_episode_id)]:
+            mask_type = str(mask_spec["mask_type"])
+            mask_type_slot = int(mask_spec["mask_type_slot"])
             rng = np.random.default_rng(
                 np.random.SeedSequence([int(args.split_seed), int(source_episode_id), int(mask_type_slot)])
             )
             _, mask = _apply_mask(
                 actions,
                 mask_type,
-                args.retain_ratio,
+                mask_spec["retain_ratio"],
                 args.mask_value,
                 rng,
+                mask_seq_len=mask_spec["mask_seq_len"],
             )
             for frame_index, item in enumerate(frames):
                 out = {"task": item["task"]}
@@ -441,6 +956,8 @@ def _write_split(
                 "source_episode_id": int(original_source_episode_id),
                 "mask_type": mask_type,
                 "mask_type_slot": int(mask_type_slot),
+                "retain_ratio": mask_spec["retain_ratio"],
+                "mask_seq_len": mask_spec["mask_seq_len"],
                 "libero/init_state_id": int(init_state_id),
                 "libero/init_state": init_state,
                 "libero/suite": None if suite is None else str(suite),
@@ -466,13 +983,14 @@ def _write_split(
         )
         write_stats(stats, root)
 
+    absolute_source_root, absolute_source_repo_id = _absolute_source_provenance(args)
     write_libero_pipeline_manifest(
         root,
         {
             "pipeline_version": LIBERO_PIPELINE_VERSION,
             "stage": "absolute_to_mam",
             "conversion_complete": True,
-            "dataset_split": "train" if root.name.endswith("_train") else "eval",
+            "dataset_split": dataset_split,
             "action_representation": LIBERO_ABSOLUTE_ACTION,
             "policy_action_representation": LIBERO_CHUNK_RELATIVE_ACTION,
             "relative_action_stats": not args.skip_relative_action_stats,
@@ -484,10 +1002,18 @@ def _write_split(
             "observation_materialization": LIBERO_CLOSED_LOOP_ABSOLUTE_MATERIALIZATION,
             "relative_action_ready": True,
             "state_representation": LIBERO_STATE_14D,
-            "source_root": str(args.input_root.resolve()),
-            "source_repo_id": args.input_repo_id or _repo_id_from_root(args.input_root),
-            "source_episode_ids": [int(episode_id) for episode_id in episode_ids],
-            "mask_types": _resolve_mask_types(args),
+            "source_root": absolute_source_root,
+            "source_repo_id": absolute_source_repo_id,
+            "source_episode_ids": manifest_source_episode_ids,
+            "mask_types": [str(spec["mask_type"]) for spec in mask_specs],
+            "mask_assign_mode": mask_assign_mode,
+            "mask_specs": mask_specs,
+            "source_episode_count": len(episode_ids),
+            "expanded_episode_count": (
+                len(episode_ids) * len(mask_specs)
+                if mask_assign_mode == "one_demo_multi_mask"
+                else len(episode_ids)
+            ),
         },
     )
 
@@ -495,6 +1021,32 @@ def _write_split(
 def main() -> None:
     args = parse_args()
     input_manifest = read_libero_pipeline_manifest(args.input_root)
+    if getattr(args, "remask_existing_split", False):
+        dataset_split = input_manifest.get("dataset_split")
+        if (
+            input_manifest.get("stage") != "absolute_to_mam"
+            or dataset_split not in {"train", "eval"}
+            or input_manifest.get("action_representation") != LIBERO_ABSOLUTE_ACTION
+        ):
+            raise ValueError(
+                "--remask-existing-split requires an absolute_to_mam train or eval dataset "
+                "with absolute actions."
+            )
+        if args.input_root.resolve() == args.output_root.resolve():
+            raise ValueError("Remasking requires a distinct --output-root; refusing in-place overwrite.")
+        input_repo_id = args.input_repo_id or _repo_id_from_root(args.input_root)
+        source = LeRobotDataset(input_repo_id, root=args.input_root, return_uint8=True)
+        episode_ids = sorted(int(row["episode_index"]) for row in source.meta.episodes)
+        if _resolve_mask_assign_mode(args, split=str(dataset_split)) == "composition":
+            _write_existing_split_with_new_masks(source, args.output_root, args)
+        else:
+            _write_split(source, episode_ids, args.output_root, args.output_repo_id, args)
+        print(
+            f"Remasked {dataset_split} dataset: source={args.input_root}, "
+            f"output={args.output_root}, episodes={len(episode_ids)}"
+        )
+        return
+
     excluded_episode_ids: set[int] = set()
     valid_absolute_episode_ids: set[int] | None = None
     if input_manifest.get("relative_action_ready") is True:
@@ -528,7 +1080,12 @@ def main() -> None:
             "MAM conversion input must be the closed-loop-rematerialized delta_to_absolute v3 dataset, "
             f"got stage={input_manifest.get('stage')!r}."
         )
-    mask_types = _resolve_mask_types(args)
+    train_mask_specs = _resolve_mask_specs(args, split="train")
+    eval_mask_specs = _resolve_mask_specs(args, split="eval")
+    train_mask_types = [str(spec["mask_type"]) for spec in train_mask_specs]
+    eval_mask_types = [str(spec["mask_type"]) for spec in eval_mask_specs]
+    train_mask_assign_mode = _resolve_mask_assign_mode(args, split="train")
+    eval_mask_assign_mode = _resolve_mask_assign_mode(args, split="eval")
     input_repo_id = args.input_repo_id or _repo_id_from_root(args.input_root)
     source = LeRobotDataset(input_repo_id, root=args.input_root, return_uint8=True)
     source_episode_ids = {
@@ -586,11 +1143,24 @@ def main() -> None:
         "eval_ratio": args.eval_ratio,
         "eval_per_task": args.eval_per_task,
         "explicit_eval_episode_ids": args.eval_episode_ids,
-        "mask_types": mask_types,
+        "train_mask_types": train_mask_types,
+        "eval_mask_types": eval_mask_types,
+        "train_mask_assign_mode": train_mask_assign_mode,
+        "eval_mask_assign_mode": eval_mask_assign_mode,
+        "train_mask_specs": train_mask_specs,
+        "eval_mask_specs": eval_mask_specs,
         "train_episode_ids": train_ids,
         "eval_episode_ids": eval_ids,
-        "train_expanded_episode_count": len(train_ids) * len(mask_types),
-        "eval_expanded_episode_count": len(eval_ids) * len(mask_types),
+        "train_expanded_episode_count": (
+            len(train_ids) * len(train_mask_types)
+            if train_mask_assign_mode == "one_demo_multi_mask"
+            else len(train_ids)
+        ),
+        "eval_expanded_episode_count": (
+            len(eval_ids) * len(eval_mask_types)
+            if eval_mask_assign_mode == "one_demo_multi_mask"
+            else len(eval_ids)
+        ),
         "source_excluded_episode_ids": sorted(excluded_episode_ids),
     }
     args.output_root.parent.mkdir(parents=True, exist_ok=True)

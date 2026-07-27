@@ -134,6 +134,36 @@ uv run python scripts/convert_libero_absolute_to_mam.py \
 
 实际输出为 `libero10_mam_v3_train` 和 `libero10_mam_v3_eval`。无法通过真实闭环回放的 source episode 会被显式排除；当前 v3 全量审计保留 485 条，按 task 固定抽取 5 条 eval，得到 435 条 train 和 50 条 eval。使用多个 mask type 时，episode 数会乘以 mask type 数量，但 train/eval 的 source episode 仍严格隔离。
 
+当前 mask 语义与 ManiSkill MAM 对齐：
+
+- `pose` / `pose_motion_planning`：随机保留 `floor(T × retain_ratio)` 个时间步的完整 7D action。
+- `points` / `3D_points`：随机保留若干时间步的 XY / XYZ。
+- `random_mask`：在整个 `T × 7` action 矩阵中随机保留元素。
+- `2D_video_trajectory` / `2D_image_trajectory`：保留所有时间步的 XY。
+- `2D_partial_trajectory`：保留一个连续 XY 窗口，长度由 `--mask-seq-len` 指定。
+- `local_planner`：保留整段 action，但遮挡一个连续的完整 7D 窗口。
+- `mix0`（别名 `mix`）：保留全轨迹 XY，再保留一个完整 7D pose 和另外三个 XYZ 点。
+- `none`：不提供任何已知 action。
+
+生成 mixed 数据集有两种方式：
+
+```bash
+# 每条 source episode 为每种 mask 各复制一次。
+--mask-types=pose,points,3D_points,random_mask,mix0 \
+--mask-assign-mode=one_demo_multi_mask \
+--retain-ratio=0.2
+
+# 每条 source episode 只使用一种 mask，并按给定比例分配。
+--mask-types=pose,points,3D_points,random_mask,mix0 \
+--mask-assign-mode=composition \
+--mask-composition=0.2,0.2,0.2,0.2,0.2 \
+--retain-ratio=0.2
+```
+
+训练 mixed 数据集时设置与 manifest 顺序一致的
+`MASK_TYPES=pose,points,3D_points,random_mask,mix0`。若评估集使用
+`one_demo_multi_mask`，`EVAL_N_EPISODES` 需要包含展开后的 episode 数。
+
 #### 3.5 数据硬审计
 
 任何一项失败都必须停止训练。

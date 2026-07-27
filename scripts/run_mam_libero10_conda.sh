@@ -45,9 +45,13 @@ export DATASET_ROOT="${DATASET_ROOT:-outputs/datasets/libero10_mam_v3_unfiltered
 export MAM_EVAL_DATASET_REPO_ID="${MAM_EVAL_DATASET_REPO_ID:-local/libero10_mam_v3_unfiltered_eval}"
 export MAM_EVAL_DATASET_ROOT="${MAM_EVAL_DATASET_ROOT:-outputs/datasets/libero10_mam_v3_unfiltered_eval}"
 
-# Mask/MAM contract. MASK_TYPE is validated against the materialized dataset;
-# the remaining values are passed to the policy explicitly.
+# Mask/MAM contract. MASK_TYPES accepts a comma-separated mixed-mask list and is
+# validated against the materialized dataset. MASK_TYPE remains the single-mask
+# compatibility default.
 export MASK_TYPE="${MASK_TYPE:-random_mask}"
+export MASK_TYPES="${MASK_TYPES:-${MASK_TYPE}}"
+export TRAIN_MASK_TYPES="${TRAIN_MASK_TYPES:-${MASK_TYPES}}"
+export EVAL_MASK_TYPES="${EVAL_MASK_TYPES:-${TRAIN_MASK_TYPES}}"
 export MASK_LOSS_MODE="${MASK_LOSS_MODE:-weighted}"
 export MASK_KNOWN_REGION_WEIGHT="${MASK_KNOWN_REGION_WEIGHT:-0.2}"
 export MASK_INPAINTING="${MASK_INPAINTING:-false}"
@@ -135,7 +139,11 @@ import sys
 from pathlib import Path
 
 train_root, eval_root = map(Path, sys.argv[1:3])
-mask_type = sys.argv[3]
+train_mask_types = [item.strip() for item in sys.argv[3].split(",") if item.strip()]
+eval_mask_types = [item.strip() for item in sys.argv[4].split(",") if item.strip()]
+if not train_mask_types or not eval_mask_types:
+    raise SystemExit("TRAIN_MASK_TYPES and EVAL_MASK_TYPES must each contain at least one mask type")
+expected_mask_types = {"train": train_mask_types, "eval": eval_mask_types}
 expected_indices = list(range(-1, 31))
 payloads = {}
 for split, root in (("train", train_root), ("eval", eval_root)):
@@ -156,9 +164,10 @@ for split, root in (("train", train_root), ("eval", eval_root)):
         raise SystemExit(f"{path}: relative_action_ready must be true")
     if data.get("relative_action_stats_action_delta_indices") != expected_indices:
         raise SystemExit(f"{path}: relative action stats do not match n_obs_steps=2/horizon=32")
-    if data.get("mask_types") != [mask_type]:
+    if data.get("mask_types") != expected_mask_types[split]:
         raise SystemExit(
-            f"{path}: expected exactly mask_types=[{mask_type!r}], got {data.get('mask_types')!r}"
+            f"{path}: expected mask_types={expected_mask_types[split]!r}, "
+            f"got {data.get('mask_types')!r}"
         )
     payloads[split] = data
 overlap = set(payloads["train"].get("source_episode_ids", [])) & set(
@@ -166,7 +175,7 @@ overlap = set(payloads["train"].get("source_episode_ids", [])) & set(
 )
 if overlap:
     raise SystemExit(f"train/eval source leakage: {sorted(overlap)}")
-' "${DATASET_ROOT}" "${MAM_EVAL_DATASET_ROOT}" "${MASK_TYPE}"
+' "${DATASET_ROOT}" "${MAM_EVAL_DATASET_ROOT}" "${TRAIN_MASK_TYPES}" "${EVAL_MASK_TYPES}"
 
   if [[ "${ENABLE_EVAL}" == "true" ]]; then
     python -c '
@@ -224,7 +233,7 @@ train_cmd=(
 
 echo "MAM dataset: ${DATASET_ROOT}"
 echo "MAM eval dataset: ${MAM_EVAL_DATASET_ROOT}"
-echo "Mask: type=${MASK_TYPE}, loss=${MASK_LOSS_MODE}, known_weight=${MASK_KNOWN_REGION_WEIGHT}, inpainting=${MASK_INPAINTING}"
+echo "Mask: train_types=${TRAIN_MASK_TYPES}, eval_types=${EVAL_MASK_TYPES}, loss=${MASK_LOSS_MODE}, known_weight=${MASK_KNOWN_REGION_WEIGHT}, inpainting=${MASK_INPAINTING}"
 echo "STPM paths: ${STPM_PATHS}"
 if [[ "${DRY_RUN}" == "true" ]]; then
   printf "%q " "${train_cmd[@]}"
