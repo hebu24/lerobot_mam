@@ -7,6 +7,10 @@ set -euo pipefail
 #   STEPS=100000 BATCH_SIZE=16 LEARNING_RATE=1e-4 \
 #     bash scripts/run_diffusion_libero10.sh
 #
+# Evaluation environment:
+#   EVAL_ENV_MODE=random bash scripts/run_diffusion_libero10.sh
+#   EVAL_ENV_MODE=fixed bash scripts/run_diffusion_libero10.sh
+#
 # Resume:
 #   RESUME=true OUTPUT_DIR=outputs/train/diffusion_libero10_v3_full \
 #     STEPS=100000 bash scripts/run_diffusion_libero10.sh
@@ -25,6 +29,8 @@ DATASET_REPO_ID="${DATASET_REPO_ID:-local/libero10_mam_v3_train}"
 DATASET_ROOT="${DATASET_ROOT:-outputs/datasets/libero10_mam_v3_train}"
 EVAL_DATASET_REPO_ID="${EVAL_DATASET_REPO_ID:-local/libero10_mam_v3_eval}"
 EVAL_DATASET_ROOT="${EVAL_DATASET_ROOT:-outputs/datasets/libero10_mam_v3_eval}"
+EVAL_ENV_MODE="${EVAL_ENV_MODE:-${eval_env_mode:-fixed}}"
+# random/fixed
 DATASET_EPISODES="${DATASET_EPISODES:-}"
 EVAL_DATASET_EPISODES="${EVAL_DATASET_EPISODES:-}"
 JOB_NAME="${JOB_NAME:-diffusion_libero10_v3_full}"
@@ -121,6 +127,14 @@ for value_name in ENABLE_EVAL RESUME REQUIRE_FULL_DATASET REQUIRE_IDLE_GPU DRY_R
   fi
 done
 
+case "${EVAL_ENV_MODE}" in
+  fixed|random) ;;
+  *)
+    echo "EVAL_ENV_MODE must be fixed or random, got: ${EVAL_ENV_MODE}" >&2
+    exit 2
+    ;;
+esac
+
 for value_name in STEPS BATCH_SIZE NUM_WORKERS SAVE_FREQ LOG_FREQ HORIZON N_OBS_STEPS N_ACTION_STEPS; do
   value="${!value_name}"
   if ! [[ "${value}" =~ ^[0-9]+$ ]]; then
@@ -157,9 +171,13 @@ elif [[ -e "${OUTPUT_DIR}" ]]; then
   exit 2
 fi
 
-if [[ ! -f "${DATASET_ROOT}/meta/info.json" || ! -f "${EVAL_DATASET_ROOT}/meta/info.json" ]]; then
-  echo "Full v3 train/eval datasets are missing:" >&2
+if [[ ! -f "${DATASET_ROOT}/meta/info.json" ]]; then
+  echo "Full v3 train dataset is missing:" >&2
   echo "  train=${DATASET_ROOT}" >&2
+  exit 2
+fi
+if [[ "${EVAL_ENV_MODE}" == "fixed" && ! -f "${EVAL_DATASET_ROOT}/meta/info.json" ]]; then
+  echo "Fixed evaluation dataset is missing:" >&2
   echo "  eval=${EVAL_DATASET_ROOT}" >&2
   echo "Build them with the commands in mam.md section 3 before training." >&2
   exit 2
@@ -170,7 +188,7 @@ fi
 # trajectories, with exactly five eval trajectories per task.
 uv run python - \
   "${DATASET_ROOT}" "${EVAL_DATASET_ROOT}" "${REQUIRE_FULL_DATASET}" \
-  "${N_OBS_STEPS}" "${HORIZON}" <<'PY'
+  "${EVAL_ENV_MODE}" "${N_OBS_STEPS}" "${HORIZON}" <<'PY'
 import json
 import sys
 from collections import Counter
@@ -195,8 +213,8 @@ def read_dataset(root_text: str, expected_split: str):
     for key, expected in required.items():
         if manifest.get(key) != expected:
             raise SystemExit(f"{root}: manifest {key}={manifest.get(key)!r}, expected {expected!r}")
-    n_obs_steps = int(sys.argv[4])
-    horizon = int(sys.argv[5])
+    n_obs_steps = int(sys.argv[5])
+    horizon = int(sys.argv[6])
     expected_delta_indices = list(range(1 - n_obs_steps, 1 - n_obs_steps + horizon))
     certified_delta_indices = manifest.get("relative_action_stats_action_delta_indices")
     if certified_delta_indices != expected_delta_indices:
@@ -246,6 +264,14 @@ def read_dataset(root_text: str, expected_split: str):
 
 
 train_info, train_manifest, train_sources, train_counts = read_dataset(sys.argv[1], "train")
+if sys.argv[4] == "random":
+    print(
+        "Dataset preflight OK: "
+        f"train={train_info['total_episodes']} episodes/{sum(train_counts.values())} sources, "
+        "eval=random environment seeds"
+    )
+    raise SystemExit(0)
+
 eval_info, eval_manifest, eval_sources, eval_counts = read_dataset(sys.argv[2], "eval")
 overlap = train_sources & eval_sources
 if overlap:
@@ -330,6 +356,13 @@ if [[ "${RESUME}" == "true" ]]; then
     --eval_freq="${EVAL_FREQ}"
     --log_freq="${LOG_FREQ}"
   )
+  if [[ "${EVAL_ENV_MODE}" == "random" ]]; then
+    train_args+=(
+      --eval.dataset_repo_id=null
+      --eval.dataset_root=null
+      --eval.dataset_episodes=null
+    )
+  fi
 else
   train_args=(
     --policy.type=diffusion
@@ -387,21 +420,30 @@ else
       --env.observation_width="${ENV_OBSERVATION_WIDTH}"
       --env.num_steps_wait=0
       --env.max_parallel_tasks="${ENV_MAX_PARALLEL_TASKS}"
-      --eval.dataset_repo_id="${EVAL_DATASET_REPO_ID}"
-      --eval.dataset_root="${EVAL_DATASET_ROOT}"
       --eval.n_episodes="${EVAL_N_EPISODES}"
       --eval.batch_size="${EVAL_BATCH_SIZE}"
       --eval.use_async_envs=false
     )
-    if [[ -n "${EVAL_DATASET_EPISODES}" ]]; then
-      train_args+=(--eval.dataset_episodes="${EVAL_DATASET_EPISODES}")
+    if [[ "${EVAL_ENV_MODE}" == "fixed" ]]; then
+      train_args+=(
+        --eval.dataset_repo_id="${EVAL_DATASET_REPO_ID}"
+        --eval.dataset_root="${EVAL_DATASET_ROOT}"
+      )
+      if [[ -n "${EVAL_DATASET_EPISODES}" ]]; then
+        train_args+=(--eval.dataset_episodes="${EVAL_DATASET_EPISODES}")
+      fi
     fi
   fi
 fi
 
 echo "LIBERO-10 v3 full DP"
 echo "  train=${DATASET_ROOT}"
-echo "  eval=${EVAL_DATASET_ROOT}"
+echo "  eval_env_mode=${EVAL_ENV_MODE}"
+if [[ "${EVAL_ENV_MODE}" == "fixed" ]]; then
+  echo "  eval=${EVAL_DATASET_ROOT}"
+else
+  echo "  eval=random environment seeds"
+fi
 echo "  GPUs=${NUM_GPUS} (${CUDA_VISIBLE_DEVICES}), batch/GPU=${BATCH_SIZE}, effective_batch=$((NUM_GPUS * BATCH_SIZE))"
 echo "  steps=${STEPS}, lr=${LEARNING_RATE}, horizon=${HORIZON}, n_action_steps=${N_ACTION_STEPS}"
 echo "  eval_freq=${EVAL_FREQ}, save_freq=${SAVE_FREQ}, output=${OUTPUT_DIR}"

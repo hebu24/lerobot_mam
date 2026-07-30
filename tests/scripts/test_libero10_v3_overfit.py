@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 from types import SimpleNamespace
 
@@ -461,6 +462,30 @@ def test_training_preflight_certifies_normal_and_exact_overfit_splits(tmp_path):
     mam_cfg.trainable_config.mam_eval_dataset_root = str(eval_root)
     mam_cfg.trainable_config.mam_eval_episodes = None
     validate_libero_v3_training_dataset(mam_cfg, dataset)
+
+
+def test_training_preflight_allows_random_env_evaluation_without_eval_dataset(tmp_path):
+    train_root = tmp_path / "train"
+    _write_mam_manifest(train_root, "train")
+    cfg = _training_cfg(train_root, tmp_path / "unused_eval", overfit=False)
+    cfg.eval.dataset_repo_id = None
+    cfg.eval.dataset_root = None
+    dataset = SimpleNamespace(root=train_root, meta=SimpleNamespace(robot_type="libero"))
+
+    validate_libero_v3_training_dataset(cfg, dataset)
+
+
+def test_full_dp_launcher_rejects_invalid_eval_env_mode():
+    result = subprocess.run(
+        ["bash", "scripts/run_diffusion_libero10.sh"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "EVAL_ENV_MODE": "invalid"},
+    )
+
+    assert result.returncode == 2
+    assert "EVAL_ENV_MODE must be fixed or random" in result.stderr
 
 
 def test_training_preflight_rejects_overfit_eval_trajectory_mismatch(tmp_path):

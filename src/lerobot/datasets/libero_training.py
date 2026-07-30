@@ -381,13 +381,6 @@ def validate_libero_v3_training_dataset(cfg: TrainPipelineConfig, dataset: Any) 
             )
         return
 
-    if (
-        cfg.env is not None
-        and cfg.eval_freq > 0
-        and getattr(cfg.env, "type", None) == "libero"
-        and (eval_repo_id is None or eval_root_value is None)
-    ):
-        raise ValueError("Normal LIBERO v3 online evaluation requires an explicit eval dataset repo/root.")
     if eval_repo_id is None:
         return
     if eval_root_value is None:
