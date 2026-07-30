@@ -153,7 +153,7 @@ uv run python scripts/convert_libero_absolute_to_mam.py \
 --mask-assign-mode=one_demo_multi_mask \
 --retain-ratio=0.2
 
-# 每条 source episode 只使用一种 mask，并按给定比例分配。
+# 每条 source episode 只使用一种 mask，并在每个 task 内按给定比例分配。
 --mask-types=pose,points,3D_points,random_mask,mix0 \
 --mask-assign-mode=composition \
 --mask-composition=0.2,0.2,0.2,0.2,0.2 \

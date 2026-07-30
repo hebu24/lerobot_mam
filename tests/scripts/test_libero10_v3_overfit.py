@@ -231,6 +231,7 @@ def test_mam_mixed_mask_specs_and_composition_assignment():
         specs,
         assign_mode="composition",
         seed=0,
+        task_ids_by_episode=dict.fromkeys(range(10), 0),
     )
 
     counts = {
@@ -239,6 +240,71 @@ def test_mam_mixed_mask_specs_and_composition_assignment():
     }
     assert counts == {"pose": 5, "points": 3, "mix0": 2}
     assert [spec["retain_ratio"] for spec in specs] == [0.3, 0.4, None]
+
+
+def test_mam_composition_assignment_maintains_proportions_per_task():
+    specs = [
+        {"mask_type": f"mask_{slot}", "mask_type_slot": slot, "composition": weight}
+        for slot, weight in enumerate((0.5, 0.3, 0.2))
+    ]
+    episode_ids = list(range(20))
+    task_ids_by_episode = {episode_id: 0 if episode_id < 10 else 1 for episode_id in episode_ids}
+
+    assigned = convert_libero_absolute_to_mam._assign_mask_specs(
+        episode_ids,
+        specs,
+        assign_mode="composition",
+        seed=7,
+        task_ids_by_episode=task_ids_by_episode,
+    )
+
+    for task_id in (0, 1):
+        counts = [
+            sum(
+                assigned[episode_id][0]["mask_type_slot"] == slot
+                for episode_id in episode_ids
+                if task_ids_by_episode[episode_id] == task_id
+            )
+            for slot in range(3)
+        ]
+        assert counts == [5, 3, 2]
+
+
+def test_mam_composition_assignment_rounds_within_each_task():
+    specs = [{"mask_type": f"mask_{slot}", "mask_type_slot": slot, "composition": 0.25} for slot in range(4)]
+    episode_ids = list(range(18))
+    task_ids_by_episode = {episode_id: 0 if episode_id < 9 else 1 for episode_id in episode_ids}
+
+    assigned = convert_libero_absolute_to_mam._assign_mask_specs(
+        episode_ids,
+        specs,
+        assign_mode="composition",
+        seed=3,
+        task_ids_by_episode=task_ids_by_episode,
+    )
+
+    for task_id in (0, 1):
+        counts = [
+            sum(
+                assigned[episode_id][0]["mask_type_slot"] == slot
+                for episode_id in episode_ids
+                if task_ids_by_episode[episode_id] == task_id
+            )
+            for slot in range(4)
+        ]
+        assert counts == [3, 2, 2, 2]
+
+
+def test_mam_composition_assignment_requires_task_metadata():
+    specs = [{"mask_type": "pose", "mask_type_slot": 0, "composition": 1.0}]
+
+    with pytest.raises(ValueError, match="requires a task id for every episode"):
+        convert_libero_absolute_to_mam._assign_mask_specs(
+            [0, 1],
+            specs,
+            assign_mode="composition",
+            seed=0,
+        )
 
 
 def test_mam_resolves_reference_experiment_train_and_eval_masks_independently():

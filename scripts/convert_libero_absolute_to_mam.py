@@ -104,7 +104,8 @@ def parse_args() -> argparse.Namespace:
         default="one_demo_multi_mask",
         help=(
             "one_demo_multi_mask duplicates every source episode for every mask type; "
-            "composition assigns exactly one mask type to each source episode."
+            "composition assigns exactly one mask type to each source episode while "
+            "maintaining the requested proportions independently within every task."
         ),
     )
     parser.add_argument(
@@ -299,27 +300,40 @@ def _assign_mask_specs(
     mask_specs: list[dict[str, Any]],
     assign_mode: str,
     seed: int,
+    task_ids_by_episode: dict[int, int] | None = None,
 ) -> dict[int, list[dict[str, Any]]]:
     if assign_mode == "one_demo_multi_mask":
         return {int(episode_id): mask_specs for episode_id in episode_ids}
     if assign_mode != "composition":
         raise ValueError(f"Unsupported mask_assign_mode={assign_mode!r}.")
+    if task_ids_by_episode is None:
+        raise ValueError("composition mask assignment requires a task id for every episode.")
+    missing_episode_ids = sorted(set(episode_ids) - set(task_ids_by_episode))
+    if missing_episode_ids:
+        raise ValueError(
+            f"composition mask assignment is missing task ids for episode(s): {missing_episode_ids}."
+        )
 
-    counts = _largest_remainder_counts(
-        len(episode_ids),
-        [float(spec["composition"]) for spec in mask_specs],
-    )
-    shuffled_ids = np.random.default_rng(seed).permutation(
-        np.asarray(episode_ids, dtype=np.int64)
-    )
+    episode_ids_by_task: dict[int, list[int]] = {}
+    for episode_id in episode_ids:
+        task_id = int(task_ids_by_episode[int(episode_id)])
+        episode_ids_by_task.setdefault(task_id, []).append(int(episode_id))
+
     assigned: dict[int, list[dict[str, Any]]] = {}
-    cursor = 0
-    for spec, count in zip(mask_specs, counts):
-        for episode_id in shuffled_ids[cursor : cursor + count]:
-            assigned[int(episode_id)] = [spec]
-        cursor += count
+    weights = [float(spec["composition"]) for spec in mask_specs]
+    for task_id in sorted(episode_ids_by_task):
+        task_episode_ids = episode_ids_by_task[task_id]
+        counts = _largest_remainder_counts(len(task_episode_ids), weights)
+        shuffled_ids = np.random.default_rng(np.random.SeedSequence([int(seed), int(task_id)])).permutation(
+            np.asarray(sorted(task_episode_ids), dtype=np.int64)
+        )
+        cursor = 0
+        for spec, count in zip(mask_specs, counts, strict=True):
+            for episode_id in shuffled_ids[cursor : cursor + count]:
+                assigned[int(episode_id)] = [spec]
+            cursor += count
     if len(assigned) != len(episode_ids):
-        raise AssertionError("Mask composition did not assign every source episode.")
+        raise AssertionError("Per-task mask composition did not assign every source episode.")
     return assigned
 
 
@@ -377,6 +391,28 @@ def _as_float_list(value: Any) -> list[float] | None:
 
 def _episode_rows(dataset: LeRobotDataset) -> dict[int, Any]:
     return {int(row["episode_index"]): row for row in dataset.meta.episodes}
+
+
+def _task_ids_by_episode(
+    episode_rows: dict[int, Any],
+    episode_ids: list[int],
+) -> dict[int, int]:
+    task_ids: dict[int, int] = {}
+    missing_episode_ids: list[int] = []
+    for episode_id in episode_ids:
+        row = episode_rows.get(int(episode_id), {})
+        task_id = _row_get(row, "libero/task_id", _row_get(row, "task_id"))
+        if task_id is None:
+            missing_episode_ids.append(int(episode_id))
+        else:
+            task_ids[int(episode_id)] = int(task_id)
+    if missing_episode_ids:
+        raise ValueError(
+            "Per-task mask composition requires episode metadata column "
+            "'libero/task_id' or 'task_id'; missing for episode(s): "
+            f"{missing_episode_ids}."
+        )
+    return task_ids
 
 
 def _column_names(dataset: LeRobotDataset) -> set[str]:
@@ -676,6 +712,7 @@ def _write_existing_split_with_new_masks(
 
     dataset_split = str(read_libero_pipeline_manifest(args.input_root)["dataset_split"])
     episode_ids = sorted(int(row["episode_index"]) for row in source.meta.episodes)
+    source_episode_rows = {int(row["episode_index"]): row for row in source.meta.episodes}
     mask_specs = _resolve_mask_specs(args, split=dataset_split)
     mask_assign_mode = _resolve_mask_assign_mode(args, split=dataset_split)
     if mask_assign_mode != "composition":
@@ -688,6 +725,11 @@ def _write_existing_split_with_new_masks(
         mask_specs,
         mask_assign_mode,
         args.split_seed,
+        task_ids_by_episode=(
+            _task_ids_by_episode(source_episode_rows, episode_ids)
+            if mask_assign_mode == "composition"
+            else None
+        ),
     )
 
     if root.exists():
@@ -696,7 +738,6 @@ def _write_existing_split_with_new_masks(
         shutil.rmtree(root)
     _copy_existing_split_for_remask(args.input_root, root)
 
-    source_episode_rows = {int(row["episode_index"]): row for row in source.meta.episodes}
     episode_meta_rows: dict[int, dict[str, Any]] = {}
     episode_mask_stats: dict[int, dict[str, np.ndarray]] = {}
     mask_feature = {MAM_MAS_ACTION_MASK: source.meta.features[MAM_MAS_ACTION_MASK]}
@@ -840,6 +881,7 @@ def _write_existing_split_with_new_masks(
             "source_episode_ids": manifest_source_episode_ids,
             "mask_types": [str(spec["mask_type"]) for spec in mask_specs],
             "mask_assign_mode": mask_assign_mode,
+            "mask_composition_scope": "per_task",
             "mask_specs": mask_specs,
             "source_episode_count": len(episode_ids),
             "expanded_episode_count": len(episode_ids),
@@ -897,6 +939,11 @@ def _write_split(
         mask_specs,
         mask_assign_mode,
         args.split_seed,
+        task_ids_by_episode=(
+            _task_ids_by_episode(source_episode_rows, episode_ids)
+            if mask_assign_mode == "composition"
+            else None
+        ),
     )
     local_episode_index = 0
 
@@ -1007,6 +1054,9 @@ def _write_split(
             "source_episode_ids": manifest_source_episode_ids,
             "mask_types": [str(spec["mask_type"]) for spec in mask_specs],
             "mask_assign_mode": mask_assign_mode,
+            "mask_composition_scope": (
+                "per_task" if mask_assign_mode == "composition" else "all_source_episodes"
+            ),
             "mask_specs": mask_specs,
             "source_episode_count": len(episode_ids),
             "expanded_episode_count": (
@@ -1147,6 +1197,12 @@ def main() -> None:
         "eval_mask_types": eval_mask_types,
         "train_mask_assign_mode": train_mask_assign_mode,
         "eval_mask_assign_mode": eval_mask_assign_mode,
+        "train_mask_composition_scope": (
+            "per_task" if train_mask_assign_mode == "composition" else "all_source_episodes"
+        ),
+        "eval_mask_composition_scope": (
+            "per_task" if eval_mask_assign_mode == "composition" else "all_source_episodes"
+        ),
         "train_mask_specs": train_mask_specs,
         "eval_mask_specs": eval_mask_specs,
         "train_episode_ids": train_ids,

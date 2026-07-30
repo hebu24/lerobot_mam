@@ -23,7 +23,28 @@ EVAL_MASK_COMPOSITION="0.2,0.2,0.2,0.2,0.2"
 
 mkdir -p "$(dirname "${TRAIN_ROOT}")" outputs/logs
 
-if [[ ! -f "${TRAIN_ROOT}/meta/libero_pipeline.json" ]]; then
+manifest_uses_per_task_composition() {
+  local manifest_path="$1"
+  [[ -f "${manifest_path}" ]] && "${PYTHON}" -c '
+import json
+import sys
+from pathlib import Path
+
+manifest = json.loads(Path(sys.argv[1]).read_text())
+raise SystemExit(
+    0
+    if manifest.get("mask_assign_mode") == "composition"
+    and manifest.get("mask_composition_scope") == "per_task"
+    else 1
+)
+' "${manifest_path}"
+}
+
+if ! manifest_uses_per_task_composition "${TRAIN_ROOT}/meta/libero_pipeline.json"; then
+  train_overwrite_args=()
+  if [[ -e "${TRAIN_ROOT}" ]]; then
+    train_overwrite_args+=(--overwrite)
+  fi
   "${PYTHON}" scripts/convert_libero_absolute_to_mam.py \
     --input-root="${TRAIN_SOURCE_ROOT}" \
     --input-repo-id=local/libero10_mam_v3_unfiltered_train \
@@ -35,10 +56,15 @@ if [[ ! -f "${TRAIN_ROOT}/meta/libero_pipeline.json" ]]; then
     --train-mask-assign-mode=composition \
     --train-mask-composition="${TRAIN_MASK_COMPOSITION}" \
     --n-obs-steps=2 \
-    --horizon=32
+    --horizon=32 \
+    "${train_overwrite_args[@]}"
 fi
 
-if [[ ! -f "${EVAL_ROOT}/meta/libero_pipeline.json" ]]; then
+if ! manifest_uses_per_task_composition "${EVAL_ROOT}/meta/libero_pipeline.json"; then
+  eval_overwrite_args=()
+  if [[ -e "${EVAL_ROOT}" ]]; then
+    eval_overwrite_args+=(--overwrite)
+  fi
   "${PYTHON}" scripts/convert_libero_absolute_to_mam.py \
     --input-root="${EVAL_SOURCE_ROOT}" \
     --input-repo-id=local/libero10_mam_v3_unfiltered_eval \
@@ -50,7 +76,8 @@ if [[ ! -f "${EVAL_ROOT}/meta/libero_pipeline.json" ]]; then
     --eval-mask-assign-mode=composition \
     --eval-mask-composition="${EVAL_MASK_COMPOSITION}" \
     --n-obs-steps=2 \
-    --horizon=32
+    --horizon=32 \
+    "${eval_overwrite_args[@]}"
 fi
 
 export CONDA_PREFIX=/root/miniconda3

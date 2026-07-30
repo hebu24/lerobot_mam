@@ -169,6 +169,14 @@ for split, root in (("train", train_root), ("eval", eval_root)):
             f"{path}: expected mask_types={expected_mask_types[split]!r}, "
             f"got {data.get('mask_types')!r}"
         )
+    if (
+        data.get("mask_assign_mode") == "composition"
+        and data.get("mask_composition_scope") != "per_task"
+    ):
+        raise SystemExit(
+            f"{path}: composition masks must be assigned per task; "
+            f"got mask_composition_scope={data.get('mask_composition_scope')!r}"
+        )
     payloads[split] = data
 overlap = set(payloads["train"].get("source_episode_ids", [])) & set(
     payloads["eval"].get("source_episode_ids", [])
