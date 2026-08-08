@@ -162,6 +162,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-value", type=float, default=0.0)
     parser.add_argument("--n-obs-steps", type=int, default=2)
     parser.add_argument("--horizon", type=int, default=32)
+    parser.add_argument("--image-writer-threads", type=int, default=8)
     parser.add_argument(
         "--skip-relative-action-stats",
         action="store_true",
@@ -914,6 +915,7 @@ def _write_split(
         robot_type=source.meta.robot_type,
         features=features,
         use_videos=len(source.meta.video_keys) > 0,
+        image_writer_threads=args.image_writer_threads,
     )
 
     episode_meta_rows = {}
