@@ -69,6 +69,7 @@ class DiffusionConfig(PreTrainedConfig):
             The group sizes are set to be about 16 (to be precise, feature_dim // 16).
         spatial_softmax_num_keypoints: Number of keypoints for SpatialSoftmax.
         use_separate_rgb_encoder_per_camera: Whether to use a separate RGB encoder for each camera view.
+        denoiser_type: Action denoiser architecture. Supported options are ``"unet"`` and ``"dit"``.
         down_dims: Feature dimension for each stage of temporal downsampling in the diffusion modeling Unet.
             You may provide a variable number of dimensions, therefore also controlling the degree of
             downsampling.
@@ -128,12 +129,23 @@ class DiffusionConfig(PreTrainedConfig):
     use_group_norm: bool = False
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = True
+    # Action denoiser.
+    denoiser_type: str = "unet"
     # Unet.
     down_dims: tuple[int, ...] = (512, 1024, 2048)
     kernel_size: int = 5
     n_groups: int = 8
     diffusion_step_embed_dim: int = 128
     use_film_scale_modulation: bool = True
+    # DiT. Its feed-forward dimension is fixed to 4 * dit_hidden_dim by the shared implementation.
+    dit_hidden_dim: int = 512
+    dit_num_layers: int = 6
+    dit_num_heads: int = 8
+    dit_dropout: float = 0.1
+    dit_timestep_embed_dim: int = 256
+    dit_use_positional_encoding: bool = False
+    dit_use_rope: bool = True
+    dit_rope_base: float = 10000.0
     # LPB-style language conditioning.
     use_language_conditioning: bool = False
     language_tokenizer_name: str = "openai/clip-vit-base-patch32"
@@ -185,6 +197,12 @@ class DiffusionConfig(PreTrainedConfig):
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
             )
 
+        supported_denoiser_types = ["unet", "dit"]
+        if self.denoiser_type not in supported_denoiser_types:
+            raise ValueError(
+                f"`denoiser_type` must be one of {supported_denoiser_types}. Got {self.denoiser_type}."
+            )
+
         supported_prediction_types = ["epsilon", "sample"]
         if self.prediction_type not in supported_prediction_types:
             raise ValueError(
@@ -226,9 +244,7 @@ class DiffusionConfig(PreTrainedConfig):
             if self.language_output_dim <= 0:
                 raise ValueError(f"`language_output_dim` must be positive. Got {self.language_output_dim}.")
             if self.language_num_layers <= 0:
-                raise ValueError(
-                    f"`language_num_layers` must be positive. Got {self.language_num_layers}."
-                )
+                raise ValueError(f"`language_num_layers` must be positive. Got {self.language_num_layers}.")
             if self.language_num_heads <= 0:
                 raise ValueError(f"`language_num_heads` must be positive. Got {self.language_num_heads}.")
             if self.language_embed_dim % self.language_num_heads != 0:
@@ -237,14 +253,40 @@ class DiffusionConfig(PreTrainedConfig):
                     f"Got {self.language_embed_dim=} and {self.language_num_heads=}."
                 )
 
-        # Check that the horizon size and U-Net downsampling is compatible.
-        # U-Net downsamples by 2 with each stage.
-        downsampling_factor = 2 ** len(self.down_dims)
-        if self.horizon % downsampling_factor != 0:
-            raise ValueError(
-                "The horizon should be an integer multiple of the downsampling factor (which is determined "
-                f"by `len(down_dims)`). Got {self.horizon=} and {self.down_dims=}"
-            )
+        if self.denoiser_type == "unet":
+            # U-Net downsamples by 2 with each stage.
+            downsampling_factor = 2 ** len(self.down_dims)
+            if self.horizon % downsampling_factor != 0:
+                raise ValueError(
+                    "The horizon should be an integer multiple of the downsampling factor (which is "
+                    f"determined by `len(down_dims)`). Got {self.horizon=} and {self.down_dims=}"
+                )
+        else:
+            if self.dit_hidden_dim <= 0:
+                raise ValueError(f"`dit_hidden_dim` must be positive. Got {self.dit_hidden_dim}.")
+            if self.dit_num_layers <= 0:
+                raise ValueError(f"`dit_num_layers` must be positive. Got {self.dit_num_layers}.")
+            if self.dit_num_heads <= 0:
+                raise ValueError(f"`dit_num_heads` must be positive. Got {self.dit_num_heads}.")
+            if self.dit_hidden_dim % self.dit_num_heads != 0:
+                raise ValueError(
+                    "`dit_hidden_dim` must be divisible by `dit_num_heads`. "
+                    f"Got {self.dit_hidden_dim=} and {self.dit_num_heads=}."
+                )
+            if self.dit_use_rope and (self.dit_hidden_dim // self.dit_num_heads) % 2 != 0:
+                raise ValueError(
+                    "The DiT attention head dimension must be even when `dit_use_rope=True`. "
+                    f"Got hidden/head={self.dit_hidden_dim // self.dit_num_heads}."
+                )
+            if not 0.0 <= self.dit_dropout <= 1.0:
+                raise ValueError(f"`dit_dropout` must be in [0, 1]. Got {self.dit_dropout}.")
+            if self.dit_timestep_embed_dim < 4 or self.dit_timestep_embed_dim % 2 != 0:
+                raise ValueError(
+                    "`dit_timestep_embed_dim` must be an even integer greater than or equal to 4. "
+                    f"Got {self.dit_timestep_embed_dim}."
+                )
+            if self.dit_rope_base <= 0:
+                raise ValueError(f"`dit_rope_base` must be positive. Got {self.dit_rope_base}.")
 
     def get_optimizer_preset(self) -> AdamConfig:
         return AdamConfig(

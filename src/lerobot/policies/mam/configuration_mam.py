@@ -9,7 +9,7 @@ from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 class MamConfig(DiffusionConfig):
     """Masked Action Model policy configuration.
 
-    MAM reuses the Diffusion Policy U-Net backbone, but adds masked-action-space
+    MAM reuses the Diffusion Policy denoiser, but adds masked-action-space
     conditioning and a mask-aware diffusion loss.
     """
 

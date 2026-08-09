@@ -23,6 +23,7 @@ TODO(alexander-soare):
 import math
 from collections import deque
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import einops
@@ -43,6 +44,7 @@ else:
     DDIMScheduler = None
     DDPMScheduler = None
 
+from ..multi_task_dit.modeling_multi_task_dit import DiffusionTransformer
 from ..pretrained import PreTrainedPolicy
 from ..utils import (
     get_device_from_parameters,
@@ -299,14 +301,14 @@ class DiffusionModel(nn.Module):
             global_cond_dim += self.config.env_state_feature.shape[0]
 
         self.language_encoder = DiffusionLanguageEncoder(config) if config.use_language_conditioning else None
-        unet_global_cond_dim = global_cond_dim * config.n_obs_steps
+        denoiser_global_cond_dim = global_cond_dim * config.n_obs_steps
         if self.language_encoder is not None:
-            unet_global_cond_dim += config.language_output_dim
+            denoiser_global_cond_dim += config.language_output_dim
 
-        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=unet_global_cond_dim)
+        self.unet = make_diffusion_denoiser(config, global_cond_dim=denoiser_global_cond_dim)
 
         if config.compile_model:
-            # Compile the U-Net. "reduce-overhead" is preferred for the small-batch repetitive loops
+            # Compile the denoiser. "reduce-overhead" is preferred for the small-batch repetitive loops
             # common in diffusion inference.
             self.unet = torch.compile(self.unet, mode=config.compile_mode)
 
@@ -913,3 +915,40 @@ class DiffusionConditionalResidualBlock1d(nn.Module):
         out = self.conv2(out)
         out = out + self.residual_conv(x)
         return out
+
+
+class DiffusionTransformerDenoiser(nn.Module):
+    """Expose the repository's shared DiT through the Diffusion Policy denoiser interface."""
+
+    def __init__(self, config: DiffusionConfig, global_cond_dim: int):
+        super().__init__()
+        dit_config = SimpleNamespace(
+            action_feature=config.action_feature,
+            horizon=config.horizon,
+            hidden_dim=config.dit_hidden_dim,
+            num_layers=config.dit_num_layers,
+            num_heads=config.dit_num_heads,
+            dropout=config.dit_dropout,
+            timestep_embed_dim=config.dit_timestep_embed_dim,
+            use_positional_encoding=config.dit_use_positional_encoding,
+            use_rope=config.dit_use_rope,
+            rope_base=config.dit_rope_base,
+        )
+        self.model = DiffusionTransformer(dit_config, conditioning_dim=global_cond_dim)
+
+    def forward(self, x: Tensor, timestep: Tensor | int, global_cond: Tensor | None = None) -> Tensor:
+        if global_cond is None:
+            raise ValueError("DiT denoiser requires `global_cond`.")
+        if not isinstance(timestep, Tensor):
+            timestep = torch.full((x.shape[0],), timestep, dtype=torch.long, device=x.device)
+        elif timestep.ndim == 0:
+            timestep = timestep.expand(x.shape[0])
+        return self.model(x, timestep, conditioning_vec=global_cond)
+
+
+def make_diffusion_denoiser(config: DiffusionConfig, global_cond_dim: int) -> nn.Module:
+    if config.denoiser_type == "unet":
+        return DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim)
+    if config.denoiser_type == "dit":
+        return DiffusionTransformerDenoiser(config, global_cond_dim=global_cond_dim)
+    raise ValueError(f"Unsupported denoiser type: {config.denoiser_type}.")

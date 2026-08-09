@@ -10,10 +10,10 @@ from torch.nn import functional
 
 from lerobot.policies.diffusion.modeling_diffusion import (
     TASK_KEY,
-    DiffusionConditionalUnet1d,
     DiffusionLanguageEncoder,
     DiffusionRgbEncoder,
     _make_noise_scheduler,
+    make_diffusion_denoiser,
 )
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import populate_queues
@@ -173,11 +173,11 @@ class MamDiffusionModel(nn.Module):
         global_cond_dim += config.mas_short_window_horizon * self.mas_step_dim
 
         self.language_encoder = DiffusionLanguageEncoder(config) if config.use_language_conditioning else None
-        unet_global_cond_dim = global_cond_dim * config.n_obs_steps
+        denoiser_global_cond_dim = global_cond_dim * config.n_obs_steps
         if self.language_encoder is not None:
-            unet_global_cond_dim += config.language_output_dim
+            denoiser_global_cond_dim += config.language_output_dim
 
-        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=unet_global_cond_dim)
+        self.unet = make_diffusion_denoiser(config, global_cond_dim=denoiser_global_cond_dim)
         self.noise_scheduler = _make_noise_scheduler(
             config.noise_scheduler_type,
             num_train_timesteps=config.num_train_timesteps,

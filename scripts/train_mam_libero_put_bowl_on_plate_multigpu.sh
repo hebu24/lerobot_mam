@@ -37,6 +37,27 @@ POLICY_DEVICE="${POLICY_DEVICE:-cuda}"
 PUSH_TO_HUB="${PUSH_TO_HUB:-false}"
 WANDB_ENABLE="${WANDB_ENABLE:-false}"
 PRETRAINED_BACKBONE_WEIGHTS="${PRETRAINED_BACKBONE_WEIGHTS:-}"
+DENOISER_TYPE="${DENOISER_TYPE:-unet}"
+# U-Net-only parameters.
+DOWN_DIMS="${DOWN_DIMS:-[512,1024,2048]}"
+UNET_KERNEL_SIZE="${UNET_KERNEL_SIZE:-5}"
+UNET_N_GROUPS="${UNET_N_GROUPS:-8}"
+DIFFUSION_STEP_EMBED_DIM="${DIFFUSION_STEP_EMBED_DIM:-128}"
+UNET_USE_FILM_SCALE_MODULATION="${UNET_USE_FILM_SCALE_MODULATION:-true}"
+# DiT-only parameters. The DiT feed-forward dimension is 4 * DIT_HIDDEN_DIM.
+DIT_HIDDEN_DIM="${DIT_HIDDEN_DIM:-512}"
+DIT_NUM_LAYERS="${DIT_NUM_LAYERS:-6}"
+DIT_NUM_HEADS="${DIT_NUM_HEADS:-8}"
+DIT_DROPOUT="${DIT_DROPOUT:-0.1}"
+DIT_TIMESTEP_EMBED_DIM="${DIT_TIMESTEP_EMBED_DIM:-256}"
+DIT_USE_POSITIONAL_ENCODING="${DIT_USE_POSITIONAL_ENCODING:-false}"
+DIT_USE_ROPE="${DIT_USE_ROPE:-true}"
+DIT_ROPE_BASE="${DIT_ROPE_BASE:-10000.0}"
+
+if [[ "${DENOISER_TYPE}" != "unet" && "${DENOISER_TYPE}" != "dit" ]]; then
+  echo "DENOISER_TYPE must be unet or dit, got ${DENOISER_TYPE}." >&2
+  exit 2
+fi
 
 launch_args=(
   --num_processes="${NUM_GPUS}"
@@ -50,6 +71,7 @@ train_args=(
   --policy.type=mam
   --policy.device="${POLICY_DEVICE}"
   --policy.push_to_hub="${PUSH_TO_HUB}"
+  --policy.denoiser_type="${DENOISER_TYPE}"
   --policy.do_mask_loss_for_padding="${DO_MASK_LOSS_FOR_PADDING:-true}"
   --policy.loss_mode="${MASK_LOSS_MODE:-weighted}"
   --policy.loss_mask_area_weight="${MASK_KNOWN_REGION_WEIGHT:-0.2}"
@@ -71,6 +93,27 @@ train_args=(
   --log_freq="${LOG_FREQ}"
   --wandb.enable="${WANDB_ENABLE}"
 )
+
+if [[ "${DENOISER_TYPE}" == "unet" ]]; then
+  train_args+=(
+    --policy.down_dims="${DOWN_DIMS}"
+    --policy.kernel_size="${UNET_KERNEL_SIZE}"
+    --policy.n_groups="${UNET_N_GROUPS}"
+    --policy.diffusion_step_embed_dim="${DIFFUSION_STEP_EMBED_DIM}"
+    --policy.use_film_scale_modulation="${UNET_USE_FILM_SCALE_MODULATION}"
+  )
+else
+  train_args+=(
+    --policy.dit_hidden_dim="${DIT_HIDDEN_DIM}"
+    --policy.dit_num_layers="${DIT_NUM_LAYERS}"
+    --policy.dit_num_heads="${DIT_NUM_HEADS}"
+    --policy.dit_dropout="${DIT_DROPOUT}"
+    --policy.dit_timestep_embed_dim="${DIT_TIMESTEP_EMBED_DIM}"
+    --policy.dit_use_positional_encoding="${DIT_USE_POSITIONAL_ENCODING}"
+    --policy.dit_use_rope="${DIT_USE_ROPE}"
+    --policy.dit_rope_base="${DIT_ROPE_BASE}"
+  )
+fi
 
 if [[ "${NUM_WORKERS}" -gt 0 ]]; then
   train_args+=(
@@ -124,5 +167,5 @@ if [[ "${ENABLE_EVAL:-false}" == "true" ]]; then
   )
 fi
 
-echo "Launching MAM with ${NUM_GPUS} process(es); per-GPU batch=${BATCH_SIZE}; effective batch=$((NUM_GPUS * BATCH_SIZE))"
+echo "Launching MAM with ${NUM_GPUS} process(es); denoiser=${DENOISER_TYPE}; per-GPU batch=${BATCH_SIZE}; effective batch=$((NUM_GPUS * BATCH_SIZE))"
 accelerate launch "${launch_args[@]}" -m lerobot.scripts.lerobot_train "${train_args[@]}" "$@"

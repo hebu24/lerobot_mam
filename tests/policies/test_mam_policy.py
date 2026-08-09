@@ -30,7 +30,7 @@ from lerobot.processor.libero_relative_action_processor import (
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STATE
 
 
-def _make_config() -> MamConfig:
+def _make_config(denoiser_type: str = "unet") -> MamConfig:
     return MamConfig(
         device="cpu",
         input_features={
@@ -38,11 +38,17 @@ def _make_config() -> MamConfig:
             OBS_ENV_STATE: PolicyFeature(FeatureType.ENV, (1,)),
         },
         output_features={ACTION: PolicyFeature(FeatureType.ACTION, (7,))},
+        denoiser_type=denoiser_type,
         horizon=16,
         n_action_steps=8,
         n_obs_steps=2,
         down_dims=(32, 64),
         diffusion_step_embed_dim=16,
+        dit_hidden_dim=32,
+        dit_num_layers=2,
+        dit_num_heads=4,
+        dit_dropout=0.0,
+        dit_timestep_embed_dim=16,
         n_groups=8,
         num_train_timesteps=4,
         mas_long_feature_dim=8,
@@ -154,9 +160,10 @@ def test_mam_long_encoder_preserves_observation_axis_and_pools_time_axis():
     assert sum(isinstance(module, nn.MaxPool2d) for module in encoder.net) == 2
 
 
-def test_mam_forward_and_action_mask_builds_features():
+@pytest.mark.parametrize("denoiser_type", ["unet", "dit"])
+def test_mam_forward_and_action_mask_builds_features(denoiser_type: str):
     torch.manual_seed(0)
-    cfg = _make_config()
+    cfg = _make_config(denoiser_type)
     preprocessor, _ = make_mam_pre_post_processors(cfg, _make_stats())
     batch = {
         OBS_STATE: torch.zeros(2, 2, 6),

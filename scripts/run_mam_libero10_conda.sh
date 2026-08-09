@@ -89,6 +89,24 @@ export PRETRAINED_BACKBONE_WEIGHTS="${PRETRAINED_BACKBONE_WEIGHTS:-null}"
 export PUSH_TO_HUB="${PUSH_TO_HUB:-false}"
 export WANDB_ENABLE="${WANDB_ENABLE:-false}"
 
+# Action denoiser. U-Net and DiT use separate architecture parameters.
+export DENOISER_TYPE="${DENOISER_TYPE:-unet}"
+# U-Net-only parameters.
+export DOWN_DIMS="${DOWN_DIMS:-[512,1024,2048]}"
+export UNET_KERNEL_SIZE="${UNET_KERNEL_SIZE:-5}"
+export UNET_N_GROUPS="${UNET_N_GROUPS:-8}"
+export DIFFUSION_STEP_EMBED_DIM="${DIFFUSION_STEP_EMBED_DIM:-128}"
+export UNET_USE_FILM_SCALE_MODULATION="${UNET_USE_FILM_SCALE_MODULATION:-true}"
+# DiT-only parameters. The DiT feed-forward dimension is 4 * DIT_HIDDEN_DIM.
+export DIT_HIDDEN_DIM="${DIT_HIDDEN_DIM:-512}"
+export DIT_NUM_LAYERS="${DIT_NUM_LAYERS:-6}"
+export DIT_NUM_HEADS="${DIT_NUM_HEADS:-8}"
+export DIT_DROPOUT="${DIT_DROPOUT:-0.1}"
+export DIT_TIMESTEP_EMBED_DIM="${DIT_TIMESTEP_EMBED_DIM:-256}"
+export DIT_USE_POSITIONAL_ENCODING="${DIT_USE_POSITIONAL_ENCODING:-false}"
+export DIT_USE_ROPE="${DIT_USE_ROPE:-true}"
+export DIT_ROPE_BASE="${DIT_ROPE_BASE:-10000.0}"
+
 export LEARNING_RATE="${LEARNING_RATE:-1e-4}"
 export WEIGHT_DECAY="${WEIGHT_DECAY:-1e-6}"
 export WARMUP_STEPS="${WARMUP_STEPS:-500}"
@@ -116,6 +134,7 @@ export DRY_RUN="${DRY_RUN:-false}"
 for boolean_name in \
   ENABLE_EVAL MASK_INPAINTING MASK_PADDING_LOSS DO_MASK_LOSS_FOR_PADDING \
   PUSH_TO_HUB WANDB_ENABLE CUDNN_DETERMINISTIC \
+  UNET_USE_FILM_SCALE_MODULATION DIT_USE_POSITIONAL_ENCODING DIT_USE_ROPE \
   SKIP_PREFLIGHT DRY_RUN; do
   value="${!boolean_name}"
   if [[ "${value}" != "true" && "${value}" != "false" ]]; then
@@ -123,6 +142,10 @@ for boolean_name in \
     exit 2
   fi
 done
+if [[ "${DENOISER_TYPE}" != "unet" && "${DENOISER_TYPE}" != "dit" ]]; then
+  echo "DENOISER_TYPE must be unet or dit; got ${DENOISER_TYPE}." >&2
+  exit 2
+fi
 if [[ "${MASK_LOSS_MODE}" != "average" && "${MASK_LOSS_MODE}" != "weighted" ]]; then
   echo "MASK_LOSS_MODE must be average or weighted; got ${MASK_LOSS_MODE}." >&2
   exit 2
@@ -220,8 +243,6 @@ train_cmd=(
   --policy.horizon=32
   --policy.n_action_steps=15
   --policy.use_relative_actions=true
-  --policy.down_dims='[512,1024,2048]'
-  --policy.diffusion_step_embed_dim=128
   --policy.spatial_softmax_num_keypoints=32
   --policy.use_language_conditioning=true
   --policy.pretrained_backbone_weights="${PRETRAINED_BACKBONE_WEIGHTS}"
@@ -241,6 +262,7 @@ train_cmd=(
 
 echo "MAM dataset: ${DATASET_ROOT}"
 echo "MAM eval dataset: ${MAM_EVAL_DATASET_ROOT}"
+echo "Denoiser: ${DENOISER_TYPE}"
 echo "Mask: train_types=${TRAIN_MASK_TYPES}, eval_types=${EVAL_MASK_TYPES}, loss=${MASK_LOSS_MODE}, known_weight=${MASK_KNOWN_REGION_WEIGHT}, inpainting=${MASK_INPAINTING}"
 echo "STPM paths: ${STPM_PATHS}"
 if [[ "${DRY_RUN}" == "true" ]]; then

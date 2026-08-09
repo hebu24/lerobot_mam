@@ -35,6 +35,22 @@ SAVE_FREQ="${SAVE_FREQ:-5000}"
 EVAL_FREQ="${EVAL_FREQ:-1000}"
 LOG_FREQ="${LOG_FREQ:-200}"
 N_ACTION_STEPS="${N_ACTION_STEPS:-15}"
+DENOISER_TYPE="${DENOISER_TYPE:-unet}" # unet / dit
+# U-Net-only parameters.
+DOWN_DIMS="${DOWN_DIMS:-[512,1024,2048]}"
+UNET_KERNEL_SIZE="${UNET_KERNEL_SIZE:-5}"
+UNET_N_GROUPS="${UNET_N_GROUPS:-8}"
+DIFFUSION_STEP_EMBED_DIM="${DIFFUSION_STEP_EMBED_DIM:-128}"
+UNET_USE_FILM_SCALE_MODULATION="${UNET_USE_FILM_SCALE_MODULATION:-true}"
+# DiT-only parameters. The DiT feed-forward dimension is 4 * DIT_HIDDEN_DIM.
+DIT_HIDDEN_DIM="${DIT_HIDDEN_DIM:-512}"
+DIT_NUM_LAYERS="${DIT_NUM_LAYERS:-6}"
+DIT_NUM_HEADS="${DIT_NUM_HEADS:-8}"
+DIT_DROPOUT="${DIT_DROPOUT:-0.1}"
+DIT_TIMESTEP_EMBED_DIM="${DIT_TIMESTEP_EMBED_DIM:-256}"
+DIT_USE_POSITIONAL_ENCODING="${DIT_USE_POSITIONAL_ENCODING:-false}"
+DIT_USE_ROPE="${DIT_USE_ROPE:-true}"
+DIT_ROPE_BASE="${DIT_ROPE_BASE:-10000.0}"
 SEED="${SEED:-1000}"
 RESUME="${RESUME:-false}"
 RESUME_CONFIG_PATH="${RESUME_CONFIG_PATH:-${OUTPUT_DIR}/checkpoints/last/pretrained_model/train_config.json}"
@@ -42,6 +58,11 @@ DRY_RUN="${DRY_RUN:-false}"
 ORACLE_PREFLIGHT="${ORACLE_PREFLIGHT:-true}"
 ORACLE_CHUNK_SIZES="${ORACLE_CHUNK_SIZES:-1,4,${N_ACTION_STEPS},full}"
 ORACLE_OUTPUT_PATH="${ORACLE_OUTPUT_PATH:-${OUTPUT_DIR}.relative_oracle.json}"
+
+if [[ "${DENOISER_TYPE}" != "unet" && "${DENOISER_TYPE}" != "dit" ]]; then
+  echo "DENOISER_TYPE must be unet or dit, got ${DENOISER_TYPE}." >&2
+  exit 2
+fi
 
 if ! [[ "${K}" =~ ^[0-9]+$ ]] || (( K < 1 || K > 10 )); then
   echo "K must be an integer in [1, 10], got ${K}." >&2
@@ -201,8 +222,7 @@ train_cmd=(
   --policy.use_relative_actions=true
   --policy.horizon=32
   --policy.n_action_steps="${N_ACTION_STEPS}"
-  --policy.down_dims='[512,1024,2048]'
-  --policy.diffusion_step_embed_dim=128
+  --policy.denoiser_type="${DENOISER_TYPE}"
   --policy.spatial_softmax_num_keypoints=32
   --policy.use_language_conditioning=true
   --policy.do_mask_loss_for_padding=true
@@ -239,6 +259,26 @@ train_cmd=(
   --eval.batch_size=1
   --eval.use_async_envs=false
 )
+if [[ "${DENOISER_TYPE}" == "unet" ]]; then
+  train_cmd+=(
+    --policy.down_dims="${DOWN_DIMS}"
+    --policy.kernel_size="${UNET_KERNEL_SIZE}"
+    --policy.n_groups="${UNET_N_GROUPS}"
+    --policy.diffusion_step_embed_dim="${DIFFUSION_STEP_EMBED_DIM}"
+    --policy.use_film_scale_modulation="${UNET_USE_FILM_SCALE_MODULATION}"
+  )
+else
+  train_cmd+=(
+    --policy.dit_hidden_dim="${DIT_HIDDEN_DIM}"
+    --policy.dit_num_layers="${DIT_NUM_LAYERS}"
+    --policy.dit_num_heads="${DIT_NUM_HEADS}"
+    --policy.dit_dropout="${DIT_DROPOUT}"
+    --policy.dit_timestep_embed_dim="${DIT_TIMESTEP_EMBED_DIM}"
+    --policy.dit_use_positional_encoding="${DIT_USE_POSITIONAL_ENCODING}"
+    --policy.dit_use_rope="${DIT_USE_ROPE}"
+    --policy.dit_rope_base="${DIT_ROPE_BASE}"
+  )
+fi
 if (( NUM_WORKERS > 0 )); then
   train_cmd+=(--prefetch_factor="${PREFETCH_FACTOR}" --persistent_workers=true)
 else
