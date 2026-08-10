@@ -477,9 +477,13 @@ class LiberoEnv(EnvConfig):
         validate_libero_assets()
 
     def prepare_evaluation(self, cfg: Any) -> None:
-        from .libero_eval import configure_fixed_libero_eval_from_dataset
+        from .libero_eval import (
+            configure_fixed_libero_eval_from_dataset,
+            configure_random_libero_eval_seed,
+        )
 
         configure_fixed_libero_eval_from_dataset(cfg)
+        configure_random_libero_eval_seed(cfg)
 
 
 @EnvConfig.register_subclass("metaworld")

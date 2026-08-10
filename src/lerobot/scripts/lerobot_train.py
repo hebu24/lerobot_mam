@@ -617,6 +617,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 )
                 try:
                     with torch.no_grad(), accelerator.autocast():
+                        eval_start_seed = cfg.eval.start_seed if cfg.eval.start_seed is not None else cfg.seed
                         eval_info = run_policy_evaluation(
                             evaluation_runtime,
                             eval_policy_all,
@@ -629,7 +630,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                             n_episodes=cfg.eval.n_episodes,
                             videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
                             max_episodes_rendered=4,
-                            start_seed=cfg.seed,
+                            start_seed=eval_start_seed,
                             max_parallel_tasks=cfg.env.max_parallel_tasks,
                         )
                 finally:

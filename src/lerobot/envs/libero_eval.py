@@ -8,6 +8,9 @@ import numpy as np
 
 from lerobot.datasets import LeRobotDatasetMetadata
 
+LPB_RANDOM_EVAL_START_SEED = 100_000
+LIBERO_DEMONSTRATION_SEED_MAX = 49
+
 
 def validate_libero_action_semantics(env_cfg: Any, policy_cfg: Any) -> None:
     """Reject a relative-chunk policy paired with a relative LIBERO controller."""
@@ -107,4 +110,34 @@ def configure_fixed_libero_eval_from_dataset(cfg: Any) -> None:
         per_task,
         repo_id,
         cfg.env.task_ids,
+    )
+
+
+def configure_random_libero_eval_seed(cfg: Any) -> None:
+    """Configure LPB-style deterministic random resets for LIBERO evaluation."""
+    if getattr(cfg.eval, "dataset_repo_id", None) or bool(getattr(cfg.env, "init_states", True)):
+        return
+
+    start_seed = getattr(cfg.eval, "start_seed", None)
+    if start_seed is None:
+        start_seed = LPB_RANDOM_EVAL_START_SEED
+        cfg.eval.start_seed = start_seed
+    start_seed = int(start_seed)
+    n_episodes = int(cfg.eval.n_episodes)
+    if start_seed < 0:
+        raise ValueError("Random LIBERO eval start seed must be non-negative.")
+    if n_episodes <= 0:
+        raise ValueError("Random LIBERO eval requires eval.n_episodes > 0.")
+
+    end_seed = start_seed + n_episodes - 1
+    if start_seed <= LIBERO_DEMONSTRATION_SEED_MAX and end_seed >= 0:
+        raise ValueError(
+            "Random LIBERO eval seeds must not overlap demonstration seeds 0..49; "
+            f"got {start_seed}..{end_seed}."
+        )
+
+    logging.info(
+        "Random LIBERO eval uses LPB-style native resets with seeds %d..%d per task.",
+        start_seed,
+        end_seed,
     )

@@ -9,6 +9,8 @@ set -euo pipefail
 #
 # Evaluation environment:
 #   EVAL_ENV_MODE=random bash scripts/run_diffusion_libero10.sh
+#   EVAL_ENV_MODE=random EVAL_START_SEED=100000 EVAL_N_EPISODES=50 \
+#     bash scripts/run_diffusion_libero10.sh
 #   EVAL_ENV_MODE=fixed bash scripts/run_diffusion_libero10.sh
 #
 # Resume:
@@ -97,7 +99,13 @@ DO_MASK_LOSS_FOR_PADDING="${DO_MASK_LOSS_FOR_PADDING:-true}"
 # -----------------------------------------------------------------------------
 ENABLE_EVAL="${ENABLE_EVAL:-true}"
 EVAL_FREQ="${EVAL_FREQ:-5000}"
-EVAL_N_EPISODES="${EVAL_N_EPISODES:-5}"
+if [[ "${EVAL_ENV_MODE}" == "random" ]]; then
+  # Match LPB: 50 deterministic held-out resets per task by default.
+  EVAL_N_EPISODES="${EVAL_N_EPISODES:-50}"
+else
+  EVAL_N_EPISODES="${EVAL_N_EPISODES:-5}"
+fi
+EVAL_START_SEED="${EVAL_START_SEED:-100000}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
 ENV_TASK_IDS="${ENV_TASK_IDS:-[0,1,2,3,4,5,6,7,8,9]}"
 ENV_MAX_PARALLEL_TASKS="${ENV_MAX_PARALLEL_TASKS:-1}"
@@ -156,7 +164,9 @@ case "${EVAL_ENV_MODE}" in
     ;;
 esac
 
-for value_name in STEPS BATCH_SIZE NUM_WORKERS SAVE_FREQ LOG_FREQ HORIZON N_OBS_STEPS N_ACTION_STEPS; do
+for value_name in \
+  STEPS BATCH_SIZE NUM_WORKERS SAVE_FREQ LOG_FREQ HORIZON N_OBS_STEPS N_ACTION_STEPS \
+  EVAL_N_EPISODES; do
   value="${!value_name}"
   if ! [[ "${value}" =~ ^[0-9]+$ ]]; then
     echo "${value_name} must be a non-negative integer, got: ${value}" >&2
@@ -164,8 +174,8 @@ for value_name in STEPS BATCH_SIZE NUM_WORKERS SAVE_FREQ LOG_FREQ HORIZON N_OBS_
   fi
 done
 
-if (( STEPS <= 0 || BATCH_SIZE <= 0 || SAVE_FREQ <= 0 || HORIZON <= 0 || N_OBS_STEPS <= 0 || N_ACTION_STEPS <= 0 )); then
-  echo "STEPS, BATCH_SIZE, SAVE_FREQ, HORIZON, N_OBS_STEPS and N_ACTION_STEPS must be positive." >&2
+if (( STEPS <= 0 || BATCH_SIZE <= 0 || SAVE_FREQ <= 0 || HORIZON <= 0 || N_OBS_STEPS <= 0 || N_ACTION_STEPS <= 0 || EVAL_N_EPISODES <= 0 )); then
+  echo "STEPS, BATCH_SIZE, SAVE_FREQ, HORIZON, N_OBS_STEPS, N_ACTION_STEPS and EVAL_N_EPISODES must be positive." >&2
   exit 2
 fi
 if (( N_OBS_STEPS - 1 + N_ACTION_STEPS > HORIZON )); then
@@ -179,6 +189,17 @@ if [[ "${ENABLE_EVAL}" == "true" ]]; then
   fi
 else
   EVAL_FREQ=0
+fi
+if [[ "${EVAL_ENV_MODE}" == "random" ]]; then
+  if ! [[ "${EVAL_START_SEED}" =~ ^[0-9]+$ ]]; then
+    echo "EVAL_START_SEED must be a non-negative integer, got: ${EVAL_START_SEED}" >&2
+    exit 2
+  fi
+  eval_end_seed=$((EVAL_START_SEED + EVAL_N_EPISODES - 1))
+  if (( EVAL_START_SEED <= 49 && eval_end_seed >= 0 )); then
+    echo "Random eval seeds must not overlap 0..49, got: ${EVAL_START_SEED}..${eval_end_seed}" >&2
+    exit 2
+  fi
 fi
 
 if [[ "${RESUME}" == "true" ]]; then
@@ -375,6 +396,7 @@ if [[ "${RESUME}" == "true" ]]; then
     --steps="${STEPS}"
     --save_freq="${SAVE_FREQ}"
     --eval_freq="${EVAL_FREQ}"
+    --eval.n_episodes="${EVAL_N_EPISODES}"
     --log_freq="${LOG_FREQ}"
   )
   if [[ "${EVAL_ENV_MODE}" == "random" ]]; then
@@ -382,6 +404,8 @@ if [[ "${RESUME}" == "true" ]]; then
       --eval.dataset_repo_id=null
       --eval.dataset_root=null
       --eval.dataset_episodes=null
+      --eval.start_seed="${EVAL_START_SEED}"
+      --env.init_states=false
     )
   fi
 else
@@ -466,12 +490,18 @@ else
     )
     if [[ "${EVAL_ENV_MODE}" == "fixed" ]]; then
       train_args+=(
+        --env.init_states=true
         --eval.dataset_repo_id="${EVAL_DATASET_REPO_ID}"
         --eval.dataset_root="${EVAL_DATASET_ROOT}"
       )
       if [[ -n "${EVAL_DATASET_EPISODES}" ]]; then
         train_args+=(--eval.dataset_episodes="${EVAL_DATASET_EPISODES}")
       fi
+    else
+      train_args+=(
+        --env.init_states=false
+        --eval.start_seed="${EVAL_START_SEED}"
+      )
     fi
   fi
 fi
@@ -482,7 +512,7 @@ echo "  eval_env_mode=${EVAL_ENV_MODE}"
 if [[ "${EVAL_ENV_MODE}" == "fixed" ]]; then
   echo "  eval=${EVAL_DATASET_ROOT}"
 else
-  echo "  eval=random environment seeds"
+  echo "  eval=random LPB seeds ${EVAL_START_SEED}..$((EVAL_START_SEED + EVAL_N_EPISODES - 1)) per task"
 fi
 echo "  GPUs=${NUM_GPUS} (${CUDA_VISIBLE_DEVICES}), batch/GPU=${BATCH_SIZE}, effective_batch=$((NUM_GPUS * BATCH_SIZE))"
 echo "  steps=${STEPS}, lr=${LEARNING_RATE}, horizon=${HORIZON}, n_action_steps=${N_ACTION_STEPS}"

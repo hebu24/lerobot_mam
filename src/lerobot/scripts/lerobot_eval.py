@@ -601,6 +601,7 @@ def eval_main(cfg: EvalPipelineConfig):
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
 
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
+        eval_start_seed = cfg.eval.start_seed if cfg.eval.start_seed is not None else cfg.seed
         info = run_policy_evaluation(
             evaluation_runtime,
             eval_policy_all,
@@ -613,7 +614,7 @@ def eval_main(cfg: EvalPipelineConfig):
             n_episodes=cfg.eval.n_episodes,
             max_episodes_rendered=10,
             videos_dir=Path(cfg.output_dir) / "videos",
-            start_seed=cfg.seed,
+            start_seed=eval_start_seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
         )
         print("Overall Aggregated Metrics:")

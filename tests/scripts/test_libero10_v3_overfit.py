@@ -488,6 +488,24 @@ def test_full_dp_launcher_rejects_invalid_eval_env_mode():
     assert "EVAL_ENV_MODE must be fixed or random" in result.stderr
 
 
+def test_full_dp_launcher_rejects_random_eval_seed_overlap():
+    result = subprocess.run(
+        ["bash", "scripts/run_diffusion_libero10.sh"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "EVAL_ENV_MODE": "random",
+            "EVAL_START_SEED": "49",
+            "EVAL_N_EPISODES": "2",
+        },
+    )
+
+    assert result.returncode == 2
+    assert "Random eval seeds must not overlap 0..49" in result.stderr
+
+
 def test_training_preflight_rejects_overfit_eval_trajectory_mismatch(tmp_path):
     train_root = tmp_path / "train"
     eval_root = tmp_path / "eval"

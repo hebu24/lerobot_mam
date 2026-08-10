@@ -87,3 +87,38 @@ def test_fixed_libero_eval_requires_n_episodes_for_every_task(monkeypatch):
     with pytest.raises(ValueError, match="interpreted per task"):
         cfg = _cfg(n_episodes=2)
         cfg.env.prepare_evaluation(cfg)
+
+
+def _random_cfg(*, start_seed=None, n_episodes=50):
+    return SimpleNamespace(
+        env=LiberoEnv(task="libero_10", init_states=False),
+        eval=SimpleNamespace(
+            dataset_repo_id=None,
+            start_seed=start_seed,
+            n_episodes=n_episodes,
+        ),
+    )
+
+
+def test_random_libero_eval_defaults_to_lpb_seed_range():
+    cfg = _random_cfg()
+
+    cfg.env.prepare_evaluation(cfg)
+
+    assert cfg.eval.start_seed == 100_000
+
+
+def test_random_libero_eval_preserves_non_overlapping_explicit_seed():
+    cfg = _random_cfg(start_seed=120_000, n_episodes=7)
+
+    cfg.env.prepare_evaluation(cfg)
+
+    assert cfg.eval.start_seed == 120_000
+
+
+@pytest.mark.parametrize(("start_seed", "n_episodes"), [(0, 1), (49, 2)])
+def test_random_libero_eval_rejects_demo_seed_overlap(start_seed, n_episodes):
+    cfg = _random_cfg(start_seed=start_seed, n_episodes=n_episodes)
+
+    with pytest.raises(ValueError, match=r"must not overlap demonstration seeds 0\.\.49"):
+        cfg.env.prepare_evaluation(cfg)

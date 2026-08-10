@@ -67,6 +67,11 @@ class WandBConfig:
 @dataclass
 class EvalConfig:
     n_episodes: int = 50
+    # Optional seed for the first evaluation rollout. Each subsequent rollout
+    # increments it by one. Keeping this separate from the training seed makes
+    # deterministic held-out environment resets possible (e.g. LPB's LIBERO
+    # protocol uses 100000..100049 for 50 rollouts per task).
+    start_seed: int | None = None
     # Optional fixed evaluation dataset. For LIBERO, only episode metadata is
     # loaded; each task is reset to the recorded init states from this split.
     dataset_repo_id: str | None = None
@@ -80,6 +85,8 @@ class EvalConfig:
     use_async_envs: bool = True
 
     def __post_init__(self) -> None:
+        if self.start_seed is not None and self.start_seed < 0:
+            raise ValueError("eval.start_seed must be non-negative.")
         if self.dataset_episodes is not None:
             if any(episode < 0 for episode in self.dataset_episodes):
                 raise ValueError("eval.dataset_episodes must contain non-negative indices.")

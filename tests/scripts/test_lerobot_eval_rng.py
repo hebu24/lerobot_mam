@@ -227,6 +227,38 @@ def test_eval_policy_seeds_policy_rng_and_restores_caller_state(monkeypatch):
     assert policy_draws[-1] == first_policy_draw
 
 
+def test_eval_policy_uses_consecutive_lpb_seed_range(monkeypatch):
+    rollout_seed_batches: list[list[int]] = []
+
+    def fake_rollout(**kwargs):
+        rollout_seed_batches.append(kwargs["seeds"])
+        return {
+            ACTION: torch.zeros(2, 1, 1),
+            "reward": torch.zeros(2, 1),
+            "success": torch.zeros(2, 1, dtype=torch.bool),
+            "done": torch.ones(2, 1, dtype=torch.bool),
+        }
+
+    monkeypatch.setattr(eval_module, "rollout", fake_rollout)
+    result = eval_module.eval_policy(
+        env=SimpleNamespace(num_envs=2),
+        policy=_StubPolicy(),
+        env_preprocessor=None,
+        env_postprocessor=None,
+        preprocessor=None,
+        postprocessor=None,
+        n_episodes=5,
+        start_seed=100_000,
+    )
+
+    assert rollout_seed_batches == [
+        [100_000, 100_001],
+        [100_002, 100_003],
+        [100_004, 100_005],
+    ]
+    assert [episode["seed"] for episode in result["per_episode"]] == list(range(100_000, 100_005))
+
+
 def test_eval_policy_metrics_exclude_steps_after_first_done(monkeypatch):
     def fake_rollout(**kwargs):
         return {
