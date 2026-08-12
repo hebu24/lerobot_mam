@@ -19,9 +19,13 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 """
 
 import dataclasses
+import json
 import logging
+import os
 import time
 from contextlib import nullcontext
+from copy import deepcopy
+from datetime import timedelta
 from pathlib import Path
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
@@ -72,6 +76,7 @@ from lerobot.utils.collate import lerobot_collate_fn
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
+from lerobot.utils.tmux_eval_recorder import append_tmux_eval_result
 from lerobot.utils.utils import (
     cycle,
     format_big_number,
@@ -81,6 +86,164 @@ from lerobot.utils.utils import (
 )
 
 from .lerobot_eval import eval_policy_all
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return value.detach().cpu().item()
+        return value.detach().cpu().tolist()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "__fspath__"):
+        return str(value)
+    if hasattr(value, "tolist"):
+        return _json_safe(value.tolist())
+    if hasattr(value, "item"):
+        return _json_safe(value.item())
+    return str(value)
+
+
+def _mean(values: list[float]) -> float:
+    if not values:
+        return float("nan")
+    return float(sum(values) / len(values))
+
+
+def _empty_eval_info(rank: int, task_ids: list[int]) -> dict[str, Any]:
+    return {
+        "per_task": [],
+        "per_group": {},
+        "overall": {
+            "avg_sum_reward": float("nan"),
+            "avg_max_reward": float("nan"),
+            "pc_success": float("nan"),
+            "n_episodes": 0,
+            "eval_s": 0.0,
+            "eval_ep_s": float("nan"),
+            "video_paths": [],
+        },
+        "rank_eval": [{"rank": rank, "task_ids": task_ids, "n_episodes": 0, "eval_s": 0.0}],
+    }
+
+
+def _merge_distributed_eval_infos(rank_infos: list[dict[str, Any]]) -> dict[str, Any]:
+    sum_rewards: list[float] = []
+    max_rewards: list[float] = []
+    successes: list[bool] = []
+    video_paths: list[str] = []
+    per_task: list[dict[str, Any]] = []
+    per_episode: list[dict[str, Any]] = []
+    rank_eval: list[dict[str, Any]] = []
+    group_acc: dict[str, dict[str, list[Any]]] = {}
+
+    def group_state(group: str) -> dict[str, list[Any]]:
+        return group_acc.setdefault(
+            group,
+            {"sum_rewards": [], "max_rewards": [], "successes": [], "video_paths": []},
+        )
+
+    for rank_info in sorted(rank_infos, key=lambda item: int(item["rank"])):
+        rank = int(rank_info["rank"])
+        task_ids = [int(task_id) for task_id in rank_info.get("task_ids", [])]
+        info = rank_info["eval_info"]
+        overall = info.get("overall", {})
+        rank_eval.append(
+            {
+                "rank": rank,
+                "task_ids": task_ids,
+                "n_episodes": int(overall.get("n_episodes", 0) or 0),
+                "pc_success": overall.get("pc_success"),
+                "avg_sum_reward": overall.get("avg_sum_reward"),
+                "eval_s": overall.get("eval_s", 0.0),
+            }
+        )
+
+        task_infos = info.get("per_task", []) or []
+        if not task_infos:
+            video_paths.extend(str(path) for path in overall.get("video_paths", []) or [])
+        for episode_info in info.get("per_episode", []) or []:
+            episode_record = dict(episode_info)
+            episode_record["rank"] = rank
+            per_episode.append(episode_record)
+
+        for task_info in task_infos:
+            task_group = str(task_info.get("task_group"))
+            metrics = task_info.get("metrics", {})
+            task_sum_rewards = [float(value) for value in metrics.get("sum_rewards", []) or []]
+            task_max_rewards = [float(value) for value in metrics.get("max_rewards", []) or []]
+            task_successes = [bool(value) for value in metrics.get("successes", []) or []]
+            task_video_paths = [str(path) for path in metrics.get("video_paths", []) or []]
+
+            sum_rewards.extend(task_sum_rewards)
+            max_rewards.extend(task_max_rewards)
+            successes.extend(task_successes)
+            video_paths.extend(task_video_paths)
+
+            acc = group_state(task_group)
+            acc["sum_rewards"].extend(task_sum_rewards)
+            acc["max_rewards"].extend(task_max_rewards)
+            acc["successes"].extend(task_successes)
+            acc["video_paths"].extend(task_video_paths)
+
+            task_record = dict(task_info)
+            task_record["rank"] = rank
+            per_task.append(task_record)
+
+    per_group = {
+        group: {
+            "avg_sum_reward": _mean([float(value) for value in acc["sum_rewards"]]),
+            "avg_max_reward": _mean([float(value) for value in acc["max_rewards"]]),
+            "pc_success": _mean([1.0 if value else 0.0 for value in acc["successes"]]) * 100
+            if acc["successes"]
+            else float("nan"),
+            "n_episodes": len(acc["sum_rewards"]),
+            "video_paths": list(acc["video_paths"]),
+        }
+        for group, acc in sorted(group_acc.items())
+    }
+    eval_s = max((float(rank.get("eval_s") or 0.0) for rank in rank_eval), default=0.0)
+    n_episodes = len(successes)
+    for episode_ix, episode_info in enumerate(per_episode):
+        episode_info["episode_ix"] = episode_ix
+
+    def success_by(key: str) -> dict[str, float]:
+        buckets: dict[str, list[bool]] = {}
+        for episode_info in per_episode:
+            if key not in episode_info:
+                continue
+            buckets.setdefault(str(episode_info[key]), []).append(bool(episode_info["success"]))
+        return {
+            bucket: _mean([1.0 if value else 0.0 for value in values]) * 100
+            for bucket, values in sorted(buckets.items())
+        }
+
+    return {
+        "per_task": sorted(
+            per_task,
+            key=lambda item: (str(item.get("task_group")), int(item.get("task_id", -1))),
+        ),
+        "per_episode": per_episode,
+        "per_mask_type_success": success_by("mask_type"),
+        "per_mask_slot_success": success_by("mask_type_slot"),
+        "per_group": per_group,
+        "overall": {
+            "avg_sum_reward": _mean(sum_rewards),
+            "avg_max_reward": _mean(max_rewards),
+            "pc_success": _mean([1.0 if value else 0.0 for value in successes]) * 100
+            if successes
+            else float("nan"),
+            "n_episodes": n_episodes,
+            "eval_s": eval_s,
+            "eval_ep_s": eval_s / n_episodes if n_episodes else float("nan"),
+            "video_paths": video_paths,
+        },
+        "rank_eval": rank_eval,
+    }
 
 
 def update_policy(
@@ -216,15 +379,17 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # We set step_scheduler_with_optimizer=False to prevent accelerate from adjusting the lr_scheduler steps based on the num_processes
     # We set find_unused_parameters=True to handle models with conditional computation
     if accelerator is None:
-        from accelerate.utils import DistributedDataParallelKwargs
+        from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs
 
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        ddp_timeout_s = int(os.environ.get("LEROBOT_DDP_TIMEOUT_S", "7200"))
+        process_group_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=ddp_timeout_s))
         # Accelerate auto-detects the device based on the available hardware and ignores the policy.device setting.
         # Force the device to be CPU when the active config's device is set to CPU (works for both policy and reward model training).
         force_cpu = cfg.trainable_config.device == "cpu"
         accelerator = Accelerator(
             step_scheduler_with_optimizer=False,
-            kwargs_handlers=[ddp_kwargs],
+            kwargs_handlers=[ddp_kwargs, process_group_kwargs],
             cpu=force_cpu,
         )
 
@@ -273,16 +438,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if not is_main_process:
         dataset = make_dataset(cfg)
 
-    prepare_dataset_for_training(cfg, dataset, configure_eval=is_main_process)
+    should_evaluate = cfg.env is not None and cfg.eval_freq > 0
+    prepare_dataset_for_training(cfg, dataset, configure_eval=should_evaluate)
 
-    if is_main_process:
-        evaluation_runtime = (
-            prepare_policy_evaluation(cfg) if cfg.env is not None and cfg.eval_freq > 0 else None
-        )
-        if evaluation_runtime is None and cfg.env is not None and cfg.eval_freq > 0:
-            cfg.env.prepare_evaluation(cfg)
-    else:
-        evaluation_runtime = None
+    evaluation_runtime = prepare_policy_evaluation(cfg) if should_evaluate else None
+    if evaluation_runtime is None and should_evaluate:
+        cfg.env.prepare_evaluation(cfg)
 
     # Evaluation owns and closes each environment batch at the corresponding step.
     eval_env = None
@@ -406,14 +567,18 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
 
-    if is_main_process:
-        logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
-        if cfg.env is not None:
+    env_preprocessor = None
+    env_postprocessor = None
+    if cfg.env is not None:
+        if is_main_process:
             logging.info(f"{cfg.env.task=}")
             logging.info("Creating environment processors")
-            env_preprocessor, env_postprocessor = make_env_pre_post_processors(
-                env_cfg=cfg.env, policy_cfg=cfg.policy
-            )
+        env_preprocessor, env_postprocessor = make_env_pre_post_processors(
+            env_cfg=cfg.env, policy_cfg=cfg.policy
+        )
+
+    if is_main_process:
+        logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
         logging.info(f"{cfg.steps=} ({format_big_number(cfg.steps)})")
         logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
         logging.info(f"{dataset.num_episodes=}")
@@ -599,6 +764,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     prune_checkpoints_keep(
                         checkpoint_dir.parent,
                         keep_checkpoint_dirs=[best_checkpoint_dir, last_checkpoint_dir],
+                        keep_scheduled_from_step=cfg.keep_all_checkpoints_after_step,
+                        save_freq=cfg.save_freq,
+                        total_steps=cfg.steps,
                     )
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
@@ -606,37 +774,244 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             accelerator.wait_for_everyone()
 
         if cfg.env and is_eval_step:
-            if is_main_process:
-                step_id = get_step_identifier(step, cfg.steps)
-                logging.info(f"Eval policy at step {step}")
-                logging.info("Creating eval env")
-                eval_env = make_env(
-                    cfg.env,
-                    n_envs=cfg.eval.batch_size,
-                    use_async_envs=cfg.eval.use_async_envs,
+            step_id = get_step_identifier(step, cfg.steps)
+            eval_info = None
+            eval_start_seed = cfg.eval.start_seed if cfg.eval.start_seed is not None else cfg.seed
+            eval_task_ids = list(getattr(cfg.env, "task_ids", None) or [])
+            random_eval_seed_task_ids = (
+                eval_task_ids
+                if (
+                    eval_start_seed is not None
+                    and eval_task_ids
+                    and not bool(getattr(cfg.env, "init_states", True))
+                    and not getattr(cfg.eval, "dataset_repo_id", None)
+                    and not getattr(cfg.eval, "dataset_root", None)
                 )
-                try:
-                    with torch.no_grad(), accelerator.autocast():
-                        eval_start_seed = cfg.eval.start_seed if cfg.eval.start_seed is not None else cfg.seed
-                        eval_info = run_policy_evaluation(
-                            evaluation_runtime,
-                            eval_policy_all,
-                            envs=eval_env,
-                            policy=accelerator.unwrap_model(policy),
-                            env_preprocessor=env_preprocessor,
-                            env_postprocessor=env_postprocessor,
-                            preprocessor=preprocessor,
-                            postprocessor=postprocessor,
-                            n_episodes=cfg.eval.n_episodes,
-                            videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
-                            max_episodes_rendered=4,
-                            start_seed=eval_start_seed,
-                            max_parallel_tasks=cfg.env.max_parallel_tasks,
+                else None
+            )
+            distributed_policy_runtime = (
+                evaluation_runtime is not None
+                and accelerator.num_processes > 1
+                and bool(eval_task_ids)
+                and hasattr(evaluation_runtime, "shard")
+            )
+            if distributed_policy_runtime:
+                rank_task_ids = eval_task_ids[accelerator.process_index :: accelerator.num_processes]
+                rank_runtime = evaluation_runtime.shard(rank_task_ids, cfg.eval.n_episodes)
+                rank_n_episodes = int(rank_runtime.num_episodes)
+                rank_info_dir = cfg.output_dir / "eval" / f"rank_metrics_step_{step_id}"
+                if rank_task_ids and rank_n_episodes:
+                    rank_env_cfg = deepcopy(cfg.env)
+                    rank_env_cfg.task_ids = rank_task_ids
+                    logging.info(
+                        "Rank %d/%d MAM eval at step %s for task_ids=%s, n_episodes=%d",
+                        accelerator.process_index,
+                        accelerator.num_processes,
+                        step,
+                        rank_task_ids,
+                        rank_n_episodes,
+                    )
+                    logging.info("Creating eval env")
+                    eval_env = make_env(
+                        rank_env_cfg,
+                        n_envs=min(cfg.eval.batch_size, rank_n_episodes),
+                        use_async_envs=cfg.eval.use_async_envs,
+                    )
+                    try:
+                        with torch.no_grad(), accelerator.autocast():
+                            eval_info = run_policy_evaluation(
+                                rank_runtime,
+                                eval_policy_all,
+                                envs=eval_env,
+                                policy=accelerator.unwrap_model(policy),
+                                env_preprocessor=env_preprocessor,
+                                env_postprocessor=env_postprocessor,
+                                preprocessor=preprocessor,
+                                postprocessor=postprocessor,
+                                n_episodes=rank_n_episodes,
+                                videos_dir=cfg.output_dir
+                                / "eval"
+                                / f"videos_step_{step_id}"
+                                / f"rank_{accelerator.process_index}",
+                                max_episodes_rendered=4 if is_main_process else 0,
+                                start_seed=(
+                                    None
+                                    if eval_start_seed is None
+                                    else eval_start_seed + accelerator.process_index * cfg.eval.n_episodes
+                                ),
+                                max_parallel_tasks=rank_env_cfg.max_parallel_tasks,
+                            )
+                    finally:
+                        if eval_env is not None:
+                            close_envs(eval_env)
+                        eval_env = None
+                else:
+                    eval_info = _empty_eval_info(accelerator.process_index, rank_task_ids)
+
+                rank_info_dir.mkdir(parents=True, exist_ok=True)
+                rank_info_path = rank_info_dir / f"rank_{accelerator.process_index}.json"
+                rank_info_path.write_text(
+                    json.dumps(
+                        _json_safe(
+                            {
+                                "rank": accelerator.process_index,
+                                "task_ids": rank_task_ids,
+                                "eval_info": eval_info,
+                            }
+                        ),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    encoding="utf-8",
+                )
+                accelerator.wait_for_everyone()
+                if is_main_process:
+                    rank_infos = [
+                        json.loads((rank_info_dir / f"rank_{rank}.json").read_text(encoding="utf-8"))
+                        for rank in range(accelerator.num_processes)
+                    ]
+                    eval_info = _merge_distributed_eval_infos(rank_infos)
+                    (rank_info_dir / "merged.json").write_text(
+                        json.dumps(_json_safe(eval_info), ensure_ascii=False, indent=2, sort_keys=True),
+                        encoding="utf-8",
+                    )
+            elif evaluation_runtime is not None:
+                if is_main_process:
+                    logging.info(f"Eval policy at step {step}")
+                    logging.info("Creating eval env")
+                    eval_env = make_env(
+                        cfg.env,
+                        n_envs=cfg.eval.batch_size,
+                        use_async_envs=cfg.eval.use_async_envs,
+                    )
+                    try:
+                        with torch.no_grad(), accelerator.autocast():
+                            eval_info = run_policy_evaluation(
+                                evaluation_runtime,
+                                eval_policy_all,
+                                envs=eval_env,
+                                policy=accelerator.unwrap_model(policy),
+                                env_preprocessor=env_preprocessor,
+                                env_postprocessor=env_postprocessor,
+                                preprocessor=preprocessor,
+                                postprocessor=postprocessor,
+                                n_episodes=cfg.eval.n_episodes,
+                                videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
+                                max_episodes_rendered=4,
+                                start_seed=eval_start_seed,
+                                max_parallel_tasks=cfg.env.max_parallel_tasks,
+                            )
+                    finally:
+                        if eval_env is not None:
+                            close_envs(eval_env)
+                        eval_env = None
+            else:
+                if accelerator.num_processes > 1 and eval_task_ids:
+                    rank_task_ids = eval_task_ids[accelerator.process_index :: accelerator.num_processes]
+                    rank_info_dir = cfg.output_dir / "eval" / f"rank_metrics_step_{step_id}"
+                    if rank_task_ids:
+                        rank_env_cfg = deepcopy(cfg.env)
+                        rank_env_cfg.task_ids = rank_task_ids
+                        logging.info(
+                            "Rank %d/%d eval policy at step %s for task_ids=%s",
+                            accelerator.process_index,
+                            accelerator.num_processes,
+                            step,
+                            rank_task_ids,
                         )
-                finally:
-                    if eval_env is not None:
-                        close_envs(eval_env)
-                    eval_env = None
+                        logging.info("Creating eval env")
+                        eval_env = make_env(
+                            rank_env_cfg,
+                            n_envs=cfg.eval.batch_size,
+                            use_async_envs=cfg.eval.use_async_envs,
+                        )
+                        try:
+                            with torch.no_grad(), accelerator.autocast():
+                                eval_info = eval_policy_all(
+                                    envs=eval_env,
+                                    policy=accelerator.unwrap_model(policy),
+                                    env_preprocessor=env_preprocessor,
+                                    env_postprocessor=env_postprocessor,
+                                    preprocessor=preprocessor,
+                                    postprocessor=postprocessor,
+                                    n_episodes=cfg.eval.n_episodes,
+                                    videos_dir=cfg.output_dir
+                                    / "eval"
+                                    / f"videos_step_{step_id}"
+                                    / f"rank_{accelerator.process_index}",
+                                    max_episodes_rendered=4 if is_main_process else 0,
+                                    start_seed=eval_start_seed,
+                                    start_seed_task_ids=random_eval_seed_task_ids,
+                                    max_parallel_tasks=cfg.env.max_parallel_tasks,
+                                )
+                        finally:
+                            if eval_env is not None:
+                                close_envs(eval_env)
+                            eval_env = None
+                    else:
+                        eval_info = _empty_eval_info(accelerator.process_index, rank_task_ids)
+
+                    rank_info_dir.mkdir(parents=True, exist_ok=True)
+                    rank_info_path = rank_info_dir / f"rank_{accelerator.process_index}.json"
+                    rank_info_path.write_text(
+                        json.dumps(
+                            _json_safe(
+                                {
+                                    "rank": accelerator.process_index,
+                                    "task_ids": rank_task_ids,
+                                    "eval_info": eval_info,
+                                }
+                            ),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        encoding="utf-8",
+                    )
+                    accelerator.wait_for_everyone()
+                    if is_main_process:
+                        rank_infos = [
+                            json.loads(
+                                (rank_info_dir / f"rank_{rank}.json").read_text(encoding="utf-8")
+                            )
+                            for rank in range(accelerator.num_processes)
+                        ]
+                        eval_info = _merge_distributed_eval_infos(rank_infos)
+                        (rank_info_dir / "merged.json").write_text(
+                            json.dumps(_json_safe(eval_info), ensure_ascii=False, indent=2, sort_keys=True),
+                            encoding="utf-8",
+                        )
+                elif is_main_process:
+                    logging.info(f"Eval policy at step {step}")
+                    logging.info("Creating eval env")
+                    eval_env = make_env(
+                        cfg.env,
+                        n_envs=cfg.eval.batch_size,
+                        use_async_envs=cfg.eval.use_async_envs,
+                    )
+                    try:
+                        with torch.no_grad(), accelerator.autocast():
+                            eval_info = eval_policy_all(
+                                envs=eval_env,
+                                policy=accelerator.unwrap_model(policy),
+                                env_preprocessor=env_preprocessor,
+                                env_postprocessor=env_postprocessor,
+                                preprocessor=preprocessor,
+                                postprocessor=postprocessor,
+                                n_episodes=cfg.eval.n_episodes,
+                                videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
+                                max_episodes_rendered=4,
+                                start_seed=eval_start_seed,
+                                start_seed_task_ids=random_eval_seed_task_ids,
+                                max_parallel_tasks=cfg.env.max_parallel_tasks,
+                            )
+                    finally:
+                        if eval_env is not None:
+                            close_envs(eval_env)
+                        eval_env = None
+
+            if is_main_process:
+                if eval_info is None:
+                    raise RuntimeError("Main process did not produce eval metrics.")
                 # overall metrics (suite-agnostic)
                 aggregated = eval_info["overall"]
                 eval_score = (float(aggregated["pc_success"]), float(aggregated["avg_sum_reward"]))
@@ -702,17 +1077,34 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                         prune_checkpoints_keep(
                             checkpoint_dir.parent,
                             keep_checkpoint_dirs=[best_checkpoint_dir, last_checkpoint_dir],
+                            keep_scheduled_from_step=cfg.keep_all_checkpoints_after_step,
+                            save_freq=cfg.save_freq,
+                            total_steps=cfg.steps,
                         )
 
+                eval_timestamp = time.time()
                 append_jsonl(
                     eval_log_path,
                     {
                         "mode": "eval",
                         "step": step,
-                        "time": time.time(),
+                        "time": eval_timestamp,
                         "metrics": eval_info,
                     },
                 )
+                try:
+                    shared_record_path = append_tmux_eval_result(
+                        cfg=cfg,
+                        step=step,
+                        eval_time=eval_timestamp,
+                        eval_info=eval_info,
+                    )
+                    if shared_record_path is not None:
+                        logging.info("Recorded tmux eval result in %s", shared_record_path)
+                except Exception:
+                    # A shared-ledger failure must never interrupt model training. The complete
+                    # result remains available in the run-local eval_metrics.jsonl as a fallback.
+                    logging.exception("Failed to record tmux eval result in the shared ledger")
 
                 # meters/tracker
                 eval_metrics = {

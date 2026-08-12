@@ -177,9 +177,22 @@ def update_best_checkpoint(checkpoint_dir: Path) -> Path:
     return best_checkpoint_dir
 
 
-def prune_checkpoints_keep(checkpoints_dir: Path, keep_checkpoint_dirs: Iterable[Path | None]) -> None:
+def prune_checkpoints_keep(
+    checkpoints_dir: Path,
+    keep_checkpoint_dirs: Iterable[Path | None],
+    *,
+    keep_scheduled_from_step: int | None = None,
+    save_freq: int | None = None,
+    total_steps: int | None = None,
+) -> None:
     if not checkpoints_dir.exists():
         return
+    if keep_scheduled_from_step is not None and (
+        save_freq is None or save_freq <= 0 or total_steps is None
+    ):
+        raise ValueError(
+            "save_freq must be positive and total_steps must be set when retaining scheduled checkpoints"
+        )
 
     keep_names = {
         checkpoint_dir.name for checkpoint_dir in keep_checkpoint_dirs if checkpoint_dir is not None
@@ -187,6 +200,11 @@ def prune_checkpoints_keep(checkpoints_dir: Path, keep_checkpoint_dirs: Iterable
     for child in checkpoints_dir.iterdir():
         if child.name in {LAST_CHECKPOINT_LINK, "best"} or child.name in keep_names:
             continue
+        if keep_scheduled_from_step is not None and child.name.isdigit():
+            child_step = int(child.name)
+            is_scheduled = child_step % save_freq == 0 or child_step == total_steps
+            if child_step >= keep_scheduled_from_step and is_scheduled:
+                continue
         if child.is_symlink() or child.is_file():
             child.unlink()
         elif child.is_dir():

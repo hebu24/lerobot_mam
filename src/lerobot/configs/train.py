@@ -106,6 +106,9 @@ class TrainPipelineConfig(HubMixin):
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 20_000
+    # Keep every scheduled full checkpoint at or after this step. Earlier checkpoints and
+    # eval-only policy snapshots continue to use the best+last retention policy.
+    keep_all_checkpoints_after_step: int | None = None
     use_policy_training_preset: bool = True
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
@@ -208,6 +211,17 @@ class TrainPipelineConfig(HubMixin):
                 "num_overfit_per_task must be positive when overfit_per_task=True, "
                 f"got {self.num_overfit_per_task}."
             )
+        if self.keep_all_checkpoints_after_step is not None:
+            if self.keep_all_checkpoints_after_step < 0:
+                raise ValueError(
+                    "keep_all_checkpoints_after_step must be non-negative, "
+                    f"got {self.keep_all_checkpoints_after_step}."
+                )
+            if self.save_freq <= 0:
+                raise ValueError(
+                    "save_freq must be positive when keep_all_checkpoints_after_step is set, "
+                    f"got {self.save_freq}."
+                )
 
         if not self.use_policy_training_preset and (self.optimizer is None or self.scheduler is None):
             raise ValueError("Optimizer and Scheduler must be set when the policy presets are not used.")

@@ -701,6 +701,7 @@ def run_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    start_seed_task_offsets: dict[int, int] | None,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -713,6 +714,10 @@ def run_one(
         task_videos_dir.mkdir(parents=True, exist_ok=True)
 
     # Call the existing eval_one (assumed to return TaskMetrics-like dict)
+    task_start_seed = start_seed
+    if start_seed is not None and start_seed_task_offsets is not None:
+        task_start_seed = start_seed + start_seed_task_offsets.get(int(task_id), 0)
+
     metrics = eval_one(
         env,
         policy=policy,
@@ -724,7 +729,7 @@ def run_one(
         max_episodes_rendered=max_episodes_rendered,
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
-        start_seed=start_seed,
+        start_seed=task_start_seed,
     )
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
@@ -745,6 +750,7 @@ def eval_policy_all(
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
+    start_seed_task_ids: list[int] | None = None,
     max_parallel_tasks: int = 1,
 ) -> dict:
     """
@@ -765,6 +771,12 @@ def eval_policy_all(
 
     # Flatten envs into list of (task_group, task_id, env)
     tasks = [(tg, tid, vec) for tg, group in envs.items() for tid, vec in group.items()]
+    start_seed_task_offsets = None
+    if start_seed is not None and start_seed_task_ids is not None:
+        start_seed_task_offsets = {
+            int(task_id): task_index * int(n_episodes)
+            for task_index, task_id in enumerate(start_seed_task_ids)
+        }
 
     # accumulators: track metrics at both per-group level and across all groups
     group_acc: dict[str, dict[str, list]] = defaultdict(lambda: {k: [] for k in ACC_KEYS})
@@ -808,6 +820,7 @@ def eval_policy_all(
         videos_dir=videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        start_seed_task_offsets=start_seed_task_offsets,
     )
 
     if max_parallel_tasks <= 1:

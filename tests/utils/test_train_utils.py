@@ -22,6 +22,7 @@ from lerobot.common.train_utils import (
     get_step_identifier,
     load_training_state,
     load_training_step,
+    prune_checkpoints_keep,
     save_checkpoint,
     save_policy_checkpoint,
     save_training_state,
@@ -71,6 +72,31 @@ def test_update_last_checkpoint(tmp_path):
     last_checkpoint = tmp_path / LAST_CHECKPOINT_LINK
     assert last_checkpoint.is_symlink()
     assert last_checkpoint.resolve() == checkpoint
+
+
+def test_prune_checkpoints_keep_preserves_scheduled_checkpoints_after_threshold(tmp_path):
+    checkpoints = tmp_path / CHECKPOINTS_DIR
+    checkpoints.mkdir()
+    dirs = {}
+    for step in (90_000, 95_000, 100_000, 105_000, 110_000, 200_000):
+        checkpoint = checkpoints / f"{step:06d}"
+        checkpoint.mkdir()
+        dirs[step] = checkpoint
+
+    prune_checkpoints_keep(
+        checkpoints,
+        keep_checkpoint_dirs=[dirs[95_000], dirs[200_000]],
+        keep_scheduled_from_step=100_000,
+        save_freq=10_000,
+        total_steps=200_000,
+    )
+
+    assert {path.name for path in checkpoints.iterdir()} == {
+        "095000",
+        "100000",
+        "110000",
+        "200000",
+    }
 
 
 @patch("lerobot.common.train_utils.save_training_state")

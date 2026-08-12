@@ -9,6 +9,7 @@ from lerobot.policies import prepare_policy_evaluation
 from lerobot.policies.mam.configuration_mam import MamConfig
 from lerobot.policies.mam.eval_mam import (
     MamEvalEpisode,
+    MamEvaluationRuntime,
     _episode_task_description,
     _resolve_stpm_paths,
     _slice_episode_window,
@@ -198,6 +199,24 @@ def test_eval_all_consumes_only_the_same_selected_episode_prefix(monkeypatch):
     assert calls == [[0, 2], [1]]
     assert result["overall"]["n_episodes"] == 3
     assert [episode["episode_ix"] for episode in result["per_episode"]] == [0, 1, 2]
+
+
+def test_mam_evaluation_runtime_shards_only_the_selected_prefix():
+    episodes = [_episode(index, index % 3) for index in range(9)]
+    runtime = MamEvaluationRuntime(episodes)
+
+    shard = runtime.shard(task_ids=[0, 2], n_episodes=7)
+
+    assert shard.num_episodes == 5
+    assert [episode.episode_index for episode in shard.episodes] == [0, 2, 3, 5, 6]
+
+
+def test_mam_evaluation_runtime_shard_requires_task_metadata():
+    episode = _episode(0, 0)
+    episode.task_id = None
+
+    with pytest.raises(ValueError, match="task_id metadata"):
+        MamEvaluationRuntime([episode]).shard(task_ids=[0], n_episodes=1)
 
 
 def test_task_scoped_stpm_rejects_checkpoint_from_another_task(monkeypatch, tmp_path):

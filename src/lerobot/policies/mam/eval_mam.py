@@ -64,6 +64,20 @@ class MamEvalEpisode:
 class MamEvaluationRuntime:
     episodes: list[MamEvalEpisode]
 
+    @property
+    def num_episodes(self) -> int:
+        return len(self.episodes)
+
+    def shard(self, task_ids: list[int], n_episodes: int) -> MamEvaluationRuntime:
+        """Return this evaluation prefix restricted to one rank's tasks."""
+        selected = self.episodes[:n_episodes]
+        if any(episode.task_id is None for episode in selected):
+            raise ValueError("Distributed MAM evaluation requires task_id metadata for every episode.")
+        task_id_set = {int(task_id) for task_id in task_ids}
+        return MamEvaluationRuntime(
+            episodes=[episode for episode in selected if int(episode.task_id) in task_id_set]
+        )
+
     def __call__(
         self,
         *,
@@ -853,7 +867,12 @@ def eval_mam_policy_all(
                 {
                     "task_group": task_group,
                     "task_id": task_id,
-                    "metrics": task_result["aggregated"],
+                    "metrics": {
+                        **task_result["aggregated"],
+                        "sum_rewards": [float(ep["sum_reward"]) for ep in per_episode],
+                        "max_rewards": [float(ep["max_reward"]) for ep in per_episode],
+                        "successes": [bool(ep["success"]) for ep in per_episode],
+                    },
                 }
             )
             consumed += task_n
