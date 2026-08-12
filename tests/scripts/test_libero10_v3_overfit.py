@@ -107,6 +107,49 @@ def test_mam_conversion_preserves_float64_init_state():
     assert np.array_equal(converted, value)
 
 
+def test_mam_remask_accepts_complete_embedded_source_manifests(tmp_path):
+    source_root = tmp_path / "merged_mam_train"
+    write_libero_pipeline_manifest(
+        source_root,
+        {
+            "stage": "absolute_to_mam",
+            "official_source_manifest": {
+                "source_root": "/datasets/official",
+                "source_repo_id": "local/official",
+            },
+            "rollout_source_manifest": {
+                "source_root": "/datasets/rollout",
+                "source_repo_id": "local/rollout",
+            },
+        },
+    )
+    args = SimpleNamespace(input_root=source_root, input_repo_id="local/merged")
+
+    source_path, source_repo_id = convert_libero_absolute_to_mam._absolute_source_provenance(args)
+
+    assert source_path == str(source_root.resolve())
+    assert source_repo_id == "local/merged"
+
+
+def test_mam_remask_rejects_incomplete_embedded_source_manifest(tmp_path):
+    source_root = tmp_path / "merged_mam_train"
+    write_libero_pipeline_manifest(
+        source_root,
+        {
+            "stage": "absolute_to_mam",
+            "official_source_manifest": {
+                "source_root": "/datasets/official",
+                "source_repo_id": "local/official",
+            },
+            "rollout_source_manifest": {"source_root": "/datasets/rollout"},
+        },
+    )
+    args = SimpleNamespace(input_root=source_root, input_repo_id=None)
+
+    with pytest.raises(ValueError, match=r"complete embedded \*_source_manifest"):
+        convert_libero_absolute_to_mam._absolute_source_provenance(args)
+
+
 def test_mam_pose_mask_retains_complete_actions_at_sampled_timesteps():
     actions = np.arange(70, dtype=np.float32).reshape(10, 7)
 
@@ -462,6 +505,46 @@ def test_training_preflight_certifies_normal_and_exact_overfit_splits(tmp_path):
     mam_cfg.trainable_config.mam_eval_dataset_root = str(eval_root)
     mam_cfg.trainable_config.mam_eval_episodes = None
     validate_libero_v3_training_dataset(mam_cfg, dataset)
+
+
+def test_mam_training_preflight_allows_opt_in_independent_eval_source(tmp_path):
+    train_root = tmp_path / "train"
+    eval_root = tmp_path / "eval"
+    _write_mam_manifest(train_root, "train")
+    _write_mam_manifest(eval_root, "eval")
+    eval_manifest_path = eval_root / "meta" / "libero_pipeline.json"
+    payload = json.loads(eval_manifest_path.read_text())
+    payload["source_root"] = str(tmp_path / "independent_absolute")
+    payload["source_repo_id"] = "local/independent_absolute"
+    payload["source_episode_ids"] = [1, 2]
+    write_libero_pipeline_manifest(eval_root, payload)
+
+    cfg = _training_cfg(train_root, eval_root, overfit=False)
+    cfg.trainable_config.type = "mam"
+    cfg.trainable_config.mam_eval_dataset_repo_id = "local/eval"
+    cfg.trainable_config.mam_eval_dataset_root = str(eval_root)
+    cfg.trainable_config.mam_eval_episodes = None
+    cfg.trainable_config.allow_independent_eval_source = True
+    dataset = SimpleNamespace(root=train_root, meta=SimpleNamespace(robot_type="libero"))
+
+    validate_libero_v3_training_dataset(cfg, dataset)
+
+
+def test_mam_training_preflight_rejects_independent_override_for_normal_split(tmp_path):
+    train_root = tmp_path / "train"
+    eval_root = tmp_path / "eval"
+    _write_mam_manifest(train_root, "train")
+    _write_mam_manifest(eval_root, "eval")
+    cfg = _training_cfg(train_root, eval_root, overfit=False)
+    cfg.trainable_config.type = "mam"
+    cfg.trainable_config.mam_eval_dataset_repo_id = "local/eval"
+    cfg.trainable_config.mam_eval_dataset_root = str(eval_root)
+    cfg.trainable_config.mam_eval_episodes = None
+    cfg.trainable_config.allow_independent_eval_source = True
+    dataset = SimpleNamespace(root=train_root, meta=SimpleNamespace(robot_type="libero"))
+
+    with pytest.raises(ValueError, match="requires train and eval to identify different source datasets"):
+        validate_libero_v3_training_dataset(cfg, dataset)
 
 
 def test_training_preflight_allows_random_env_evaluation_without_eval_dataset(tmp_path):

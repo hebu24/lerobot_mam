@@ -347,11 +347,33 @@ def _absolute_source_provenance(args: argparse.Namespace) -> tuple[str, str]:
     if input_manifest.get("stage") == "absolute_to_mam":
         source_root = input_manifest.get("source_root")
         source_repo_id = input_manifest.get("source_repo_id")
-        if not source_root or not source_repo_id:
-            raise ValueError(
-                "An existing MAM split must retain its absolute source_root and source_repo_id."
+        if source_root and source_repo_id:
+            return str(source_root), str(source_repo_id)
+
+        # A merged MAM split can have more than one absolute source. Such datasets
+        # retain the individual manifests under keys such as
+        # ``official_source_manifest`` and ``rollout_source_manifest`` rather than
+        # inventing a single top-level absolute source. Use the merged split as the
+        # immediate remask provenance boundary; the complete inherited manifest is
+        # embedded in the output by the remask writer below.
+        embedded_source_manifests = [
+            value
+            for key, value in input_manifest.items()
+            if key.endswith("_source_manifest") and isinstance(value, dict)
+        ]
+        if embedded_source_manifests and all(
+            manifest.get("source_root") and manifest.get("source_repo_id")
+            for manifest in embedded_source_manifests
+        ):
+            return (
+                str(args.input_root.resolve()),
+                args.input_repo_id or _repo_id_from_root(args.input_root),
             )
-        return str(source_root), str(source_repo_id)
+
+        raise ValueError(
+            "An existing MAM split must retain source_root/source_repo_id or "
+            "complete embedded *_source_manifest provenance."
+        )
     return (
         str(args.input_root.resolve()),
         args.input_repo_id or _repo_id_from_root(args.input_root),
@@ -859,35 +881,36 @@ def _write_existing_split_with_new_masks(
         for episode_id in episode_ids
     ]
     absolute_source_root, absolute_source_repo_id = _absolute_source_provenance(args)
-    write_libero_pipeline_manifest(
-        root,
-        {
-            "pipeline_version": LIBERO_PIPELINE_VERSION,
-            "stage": "absolute_to_mam",
-            "conversion_complete": True,
-            "dataset_split": dataset_split,
-            "action_representation": LIBERO_ABSOLUTE_ACTION,
-            "policy_action_representation": LIBERO_CHUNK_RELATIVE_ACTION,
-            "relative_action_stats": True,
-            "relative_action_stats_n_obs_steps": int(args.n_obs_steps),
-            "relative_action_stats_horizon": int(args.horizon),
-            "relative_action_stats_action_delta_indices": list(
-                range(1 - args.n_obs_steps, 1 - args.n_obs_steps + args.horizon)
-            ),
-            "observation_materialization": LIBERO_CLOSED_LOOP_ABSOLUTE_MATERIALIZATION,
-            "relative_action_ready": True,
-            "state_representation": LIBERO_STATE_14D,
-            "source_root": absolute_source_root,
-            "source_repo_id": absolute_source_repo_id,
-            "source_episode_ids": manifest_source_episode_ids,
-            "mask_types": [str(spec["mask_type"]) for spec in mask_specs],
-            "mask_assign_mode": mask_assign_mode,
-            "mask_composition_scope": "per_task",
-            "mask_specs": mask_specs,
-            "source_episode_count": len(episode_ids),
-            "expanded_episode_count": len(episode_ids),
-        },
-    )
+    output_manifest = {
+        "pipeline_version": LIBERO_PIPELINE_VERSION,
+        "stage": "absolute_to_mam",
+        "conversion_complete": True,
+        "dataset_split": dataset_split,
+        "action_representation": LIBERO_ABSOLUTE_ACTION,
+        "policy_action_representation": LIBERO_CHUNK_RELATIVE_ACTION,
+        "relative_action_stats": True,
+        "relative_action_stats_n_obs_steps": int(args.n_obs_steps),
+        "relative_action_stats_horizon": int(args.horizon),
+        "relative_action_stats_action_delta_indices": list(
+            range(1 - args.n_obs_steps, 1 - args.n_obs_steps + args.horizon)
+        ),
+        "observation_materialization": LIBERO_CLOSED_LOOP_ABSOLUTE_MATERIALIZATION,
+        "relative_action_ready": True,
+        "state_representation": LIBERO_STATE_14D,
+        "source_root": absolute_source_root,
+        "source_repo_id": absolute_source_repo_id,
+        "source_episode_ids": manifest_source_episode_ids,
+        "mask_types": [str(spec["mask_type"]) for spec in mask_specs],
+        "mask_assign_mode": mask_assign_mode,
+        "mask_composition_scope": "per_task",
+        "mask_specs": mask_specs,
+        "source_episode_count": len(episode_ids),
+        "expanded_episode_count": len(episode_ids),
+    }
+    input_manifest = read_libero_pipeline_manifest(args.input_root)
+    if not input_manifest.get("source_root") or not input_manifest.get("source_repo_id"):
+        output_manifest["remask_source_manifest"] = input_manifest
+    write_libero_pipeline_manifest(root, output_manifest)
 
 
 def _write_split(

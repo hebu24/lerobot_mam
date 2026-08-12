@@ -31,6 +31,10 @@ class MamConfig(DiffusionConfig):
     mam_eval_dataset_repo_id: str | None = None
     mam_eval_dataset_root: str | None = None
     mam_eval_episodes: list[int] | None = None
+    # Allow evaluation trajectories recorded in a separate, independently
+    # provenance-tracked source dataset. This stays opt-in so the standard
+    # train/eval split continues to require a shared source manifest.
+    allow_independent_eval_source: bool = False
     stpm_path: str | None = None
     stpm_checkpoint_path: str | None = None
     stpm_config_path: str | None = None

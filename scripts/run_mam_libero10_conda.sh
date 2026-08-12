@@ -4,7 +4,14 @@ set -euo pipefail
 # Formal LIBERO-10 MAM launcher. Environment variables may override every
 # important dataset, mask, optimization, STPM, and evaluation setting below.
 
-if [[ -f "${CONDA_PREFIX:-}/etc/profile.d/conda.sh" ]]; then
+if [[ -n "${CONDA_ENV_PATH:-}" && -f "${CONDA_ENV_PATH}/bin/activate" ]]; then
+  source "${CONDA_ENV_PATH}/bin/activate"
+elif [[ -n "${CONDA_ENV_PATH:-}" && -x "${CONDA_ENV_PATH}/bin/python" ]]; then
+  export CONDA_PREFIX="${CONDA_ENV_PATH}"
+  export PATH="${CONDA_ENV_PATH}/bin:${PATH}"
+elif [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]]; then
+  true
+elif [[ -f "${CONDA_PREFIX:-}/etc/profile.d/conda.sh" ]]; then
   source "${CONDA_PREFIX}/etc/profile.d/conda.sh"
 elif [[ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]]; then
   source "${HOME}/miniconda3/etc/profile.d/conda.sh"
@@ -13,14 +20,11 @@ elif command -v conda >/dev/null 2>&1; then
 else
   echo "Could not find conda.sh. Activate the lerobot env before running this script." >&2
   exit 1
-fi
-
-if [[ -n "${CONDA_ENV_PATH:-}" ]]; then
-  conda activate "${CONDA_ENV_PATH}"
-elif [[ "${CONDA_DEFAULT_ENV:-}" == "${CONDA_ENV_NAME:-lerobot}" ]]; then
-  true
-else
-  conda activate "${CONDA_ENV_NAME:-lerobot}"
+  if [[ -n "${CONDA_ENV_PATH:-}" ]]; then
+    conda activate "${CONDA_ENV_PATH}"
+  elif [[ "${CONDA_DEFAULT_ENV:-}" != "${CONDA_ENV_NAME:-lerobot}" ]]; then
+    conda activate "${CONDA_ENV_NAME:-lerobot}"
+  fi
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,6 +32,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
 export LIBERO_ASSETS_PATH="${LIBERO_ASSETS_PATH:-${REPO_ROOT}/.cache/libero/assets}"
+export LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH:-${HOME}/.libero}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export HF_HOME="${HF_HOME:-${REPO_ROOT}/.hf-cache}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
@@ -39,6 +44,20 @@ export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export NUM_GPUS="${NUM_GPUS:-1}"
+
+if [[ ! -f "${LIBERO_CONFIG_PATH}/config.yaml" ]]; then
+  echo "Missing LIBERO config: ${LIBERO_CONFIG_PATH}/config.yaml" >&2
+  exit 1
+fi
+if [[ ! -d "${LIBERO_ASSETS_PATH}" ]]; then
+  echo "Missing LIBERO assets: ${LIBERO_ASSETS_PATH}" >&2
+  exit 1
+fi
+mkdir -p "${HOME}/.cache/libero"
+libero_cached_assets="${HOME}/.cache/libero/assets"
+if [[ ! -e "${libero_cached_assets}" && ! -L "${libero_cached_assets}" ]]; then
+  ln -s "${LIBERO_ASSETS_PATH}" "${libero_cached_assets}"
+fi
 
 export DATASET_REPO_ID="${DATASET_REPO_ID:-local/libero10_mam_v3_unfiltered_train}"
 export DATASET_ROOT="${DATASET_ROOT:-outputs/datasets/libero10_mam_v3_unfiltered_train}"
@@ -61,6 +80,9 @@ export MAS_SHORT_WINDOW_HORIZON="${MAS_SHORT_WINDOW_HORIZON:-15}"
 export MAS_LONG_BACKWARD_LENGTH="${MAS_LONG_BACKWARD_LENGTH:-0}"
 export MAS_LONG_FORWARD_LENGTH="${MAS_LONG_FORWARD_LENGTH:-32}"
 export MAS_LONG_FEATURE_DIM="${MAS_LONG_FEATURE_DIM:-64}"
+export N_OBS_STEPS="${N_OBS_STEPS:-2}"
+export HORIZON="${HORIZON:-32}"
+export N_ACTION_STEPS="${N_ACTION_STEPS:-15}"
 
 export BATCH_SIZE="${BATCH_SIZE:-32}"
 export NUM_WORKERS="${NUM_WORKERS:-8}"
@@ -164,10 +186,12 @@ from pathlib import Path
 train_root, eval_root = map(Path, sys.argv[1:3])
 train_mask_types = [item.strip() for item in sys.argv[3].split(",") if item.strip()]
 eval_mask_types = [item.strip() for item in sys.argv[4].split(",") if item.strip()]
+n_obs_steps = int(sys.argv[5])
+horizon = int(sys.argv[6])
 if not train_mask_types or not eval_mask_types:
     raise SystemExit("TRAIN_MASK_TYPES and EVAL_MASK_TYPES must each contain at least one mask type")
 expected_mask_types = {"train": train_mask_types, "eval": eval_mask_types}
-expected_indices = list(range(-1, 31))
+expected_indices = list(range(1 - n_obs_steps, horizon - n_obs_steps + 1))
 payloads = {}
 for split, root in (("train", train_root), ("eval", eval_root)):
     path = root / "meta" / "libero_pipeline.json"
@@ -186,7 +210,10 @@ for split, root in (("train", train_root), ("eval", eval_root)):
     if data.get("relative_action_ready") is not True:
         raise SystemExit(f"{path}: relative_action_ready must be true")
     if data.get("relative_action_stats_action_delta_indices") != expected_indices:
-        raise SystemExit(f"{path}: relative action stats do not match n_obs_steps=2/horizon=32")
+        raise SystemExit(
+            f"{path}: relative action stats do not match "
+            f"n_obs_steps={n_obs_steps}/horizon={horizon}"
+        )
     if data.get("mask_types") != expected_mask_types[split]:
         raise SystemExit(
             f"{path}: expected mask_types={expected_mask_types[split]!r}, "
@@ -201,12 +228,24 @@ for split, root in (("train", train_root), ("eval", eval_root)):
             f"got mask_composition_scope={data.get('mask_composition_scope')!r}"
         )
     payloads[split] = data
-overlap = set(payloads["train"].get("source_episode_ids", [])) & set(
-    payloads["eval"].get("source_episode_ids", [])
+train_source_root = payloads["train"].get("source_root")
+eval_source_root = payloads["eval"].get("source_root")
+train_source_repo = payloads["train"].get("source_repo_id")
+eval_source_repo = payloads["eval"].get("source_repo_id")
+same_source = (
+    train_source_root
+    and eval_source_root
+    and Path(train_source_root).resolve() == Path(eval_source_root).resolve()
+    and train_source_repo
+    and train_source_repo == eval_source_repo
 )
-if overlap:
-    raise SystemExit(f"train/eval source leakage: {sorted(overlap)}")
-' "${DATASET_ROOT}" "${MAM_EVAL_DATASET_ROOT}" "${TRAIN_MASK_TYPES}" "${EVAL_MASK_TYPES}"
+if same_source:
+    overlap = set(payloads["train"].get("source_episode_ids", [])) & set(
+        payloads["eval"].get("source_episode_ids", [])
+    )
+    if overlap:
+        raise SystemExit(f"train/eval source leakage: {sorted(overlap)}")
+' "${DATASET_ROOT}" "${MAM_EVAL_DATASET_ROOT}" "${TRAIN_MASK_TYPES}" "${EVAL_MASK_TYPES}" "${N_OBS_STEPS}" "${HORIZON}"
 
   if [[ "${ENABLE_EVAL}" == "true" ]]; then
     python -c '
@@ -239,9 +278,9 @@ train_cmd=(
   --seed="${SEED}"
   --cudnn_deterministic="${CUDNN_DETERMINISTIC}"
   --optimizer.grad_clip_norm="${GRAD_CLIP_NORM}"
-  --policy.n_obs_steps=2
-  --policy.horizon=32
-  --policy.n_action_steps=15
+  --policy.n_obs_steps="${N_OBS_STEPS}"
+  --policy.horizon="${HORIZON}"
+  --policy.n_action_steps="${N_ACTION_STEPS}"
   --policy.use_relative_actions=true
   --policy.spatial_softmax_num_keypoints=32
   --policy.use_language_conditioning=true
