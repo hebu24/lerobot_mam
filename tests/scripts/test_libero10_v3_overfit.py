@@ -1,9 +1,12 @@
 import json
 import os
+import shlex
 import subprocess
 from types import SimpleNamespace
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from lerobot.datasets.libero_pipeline import (
@@ -575,7 +578,25 @@ def test_full_dp_launcher_rejects_invalid_eval_env_mode():
     )
 
     assert result.returncode == 2
-    assert "EVAL_ENV_MODE must be fixed or random" in result.stderr
+    assert "EVAL_ENV_MODE must be fixed, random or official" in result.stderr
+
+
+@pytest.mark.parametrize("n_episodes", [50, 51])
+def test_full_dp_launcher_rejects_too_many_official_eval_episodes(n_episodes):
+    result = subprocess.run(
+        ["bash", "scripts/libero/train/run_diffusion_libero10.sh"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "EVAL_ENV_MODE": "official",
+            "EVAL_N_EPISODES": str(n_episodes),
+        },
+    )
+
+    assert result.returncode == 2
+    assert f"Official eval requires EVAL_N_EPISODES < 50, got: {n_episodes}" in result.stderr
 
 
 def test_full_dp_launcher_rejects_random_eval_seed_overlap():
@@ -594,6 +615,76 @@ def test_full_dp_launcher_rejects_random_eval_seed_overlap():
 
     assert result.returncode == 2
     assert "Random eval seeds must not overlap 0..49" in result.stderr
+
+
+def test_full_dp_launcher_official_eval_uses_first_ten_libero_init_states(tmp_path):
+    train_root = tmp_path / "train"
+    _write_mam_manifest(train_root, "train")
+    manifest_path = train_root / "meta" / "libero_pipeline.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.update(
+        {
+            "relative_action_stats": True,
+            "relative_action_stats_action_delta_indices": list(range(-1, 31)),
+        }
+    )
+    write_libero_pipeline_manifest(train_root, manifest)
+
+    info = {
+        "total_episodes": 10,
+        "features": {
+            "action": {"shape": [7]},
+            "observation.state": {"shape": [14]},
+            "observation.images.image": {"shape": [128, 128, 3]},
+            "observation.images.image2": {"shape": [128, 128, 3]},
+        },
+    }
+    (train_root / "meta" / "info.json").write_text(json.dumps(info))
+    episode_path = train_root / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    episode_path.parent.mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "episode_index": task_id,
+                    "libero/task_id": task_id,
+                    "libero/source_episode_id": task_id,
+                }
+                for task_id in range(10)
+            ]
+        ),
+        episode_path,
+    )
+
+    result = subprocess.run(
+        ["bash", "scripts/libero/train/run_diffusion_libero10.sh"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "DATASET_ROOT": str(train_root),
+            "DATASET_REPO_ID": "local/test_train",
+            "EVAL_DATASET_ROOT": str(tmp_path / "missing_eval"),
+            "EVAL_ENV_MODE": "official",
+            "OUTPUT_DIR": str(tmp_path / "output"),
+            "NUM_GPUS": "1",
+            "NUM_WORKERS": "0",
+            "MIN_FREE_GB": "0",
+            "REQUIRE_FULL_DATASET": "false",
+            "DRY_RUN": "true",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    argv = shlex.split(result.stdout.splitlines()[-1])
+    assert "--eval.n_episodes=10" in argv
+    assert "--env.init_states=true" in argv
+    assert "--env.init_state_ids=[0,1,2,3,4,5,6,7,8,9]" in argv
+    assert "--env.episode_length=600" in argv
+    assert "--env.num_steps_wait=5" in argv
+    assert "--eval.dataset_repo_id=null" in argv
+    assert not any(str(tmp_path / "missing_eval") in arg for arg in argv)
 
 
 def test_training_preflight_rejects_overfit_eval_trajectory_mismatch(tmp_path):

@@ -12,6 +12,8 @@ set -euo pipefail
 #   EVAL_ENV_MODE=random EVAL_START_SEED=100000 EVAL_N_EPISODES=50 \
 #     bash scripts/libero/train/run_diffusion_libero10.sh
 #   EVAL_ENV_MODE=fixed bash scripts/libero/train/run_diffusion_libero10.sh
+#   EVAL_ENV_MODE=official EVAL_N_EPISODES=10 \
+#     bash scripts/libero/train/run_diffusion_libero10.sh
 #
 # Resume:
 #   RESUME=true OUTPUT_DIR=outputs/train/diffusion_libero10_v3_full \
@@ -32,7 +34,8 @@ DATASET_ROOT="${DATASET_ROOT:-outputs/datasets/libero10_mam_v3_train}"
 EVAL_DATASET_REPO_ID="${EVAL_DATASET_REPO_ID:-local/libero10_mam_v3_eval}"
 EVAL_DATASET_ROOT="${EVAL_DATASET_ROOT:-outputs/datasets/libero10_mam_v3_eval}"
 EVAL_ENV_MODE="${EVAL_ENV_MODE:-${eval_env_mode:-fixed}}"
-# random/fixed
+# fixed: repository v3 eval dataset; random: held-out native resets;
+# official: first N states from LIBERO's per-task .pruned_init files.
 DATASET_EPISODES="${DATASET_EPISODES:-}"
 EVAL_DATASET_EPISODES="${EVAL_DATASET_EPISODES:-}"
 JOB_NAME="${JOB_NAME:-diffusion_libero10_v3_full}"
@@ -102,6 +105,9 @@ EVAL_FREQ="${EVAL_FREQ:-5000}"
 if [[ "${EVAL_ENV_MODE}" == "random" ]]; then
   # Match LPB: 50 deterministic held-out resets per task by default.
   EVAL_N_EPISODES="${EVAL_N_EPISODES:-50}"
+elif [[ "${EVAL_ENV_MODE}" == "official" ]]; then
+  # Use official LIBERO .pruned_init states 0..N-1 for every task.
+  EVAL_N_EPISODES="${EVAL_N_EPISODES:-10}"
 else
   EVAL_N_EPISODES="${EVAL_N_EPISODES:-5}"
 fi
@@ -157,9 +163,9 @@ if [[ "${DENOISER_TYPE}" != "unet" && "${DENOISER_TYPE}" != "dit" ]]; then
 fi
 
 case "${EVAL_ENV_MODE}" in
-  fixed|random) ;;
+  fixed|random|official) ;;
   *)
-    echo "EVAL_ENV_MODE must be fixed or random, got: ${EVAL_ENV_MODE}" >&2
+    echo "EVAL_ENV_MODE must be fixed, random or official, got: ${EVAL_ENV_MODE}" >&2
     exit 2
     ;;
 esac
@@ -201,6 +207,15 @@ if [[ "${EVAL_ENV_MODE}" == "random" ]]; then
     exit 2
   fi
 fi
+if [[ "${EVAL_ENV_MODE}" == "official" ]] && (( EVAL_N_EPISODES >= 50 )); then
+  echo "Official eval requires EVAL_N_EPISODES < 50, got: ${EVAL_N_EPISODES}" >&2
+  exit 2
+fi
+
+OFFICIAL_INIT_STATE_IDS=""
+if [[ "${EVAL_ENV_MODE}" == "official" ]]; then
+  OFFICIAL_INIT_STATE_IDS="[$(seq -s, 0 $((EVAL_N_EPISODES - 1)))]"
+fi
 
 if [[ "${RESUME}" == "true" ]]; then
   if [[ ! -f "${RESUME_CONFIG_PATH}" ]]; then
@@ -230,7 +245,7 @@ fi
 # trajectories, with exactly five eval trajectories per task.
 uv run python - \
   "${DATASET_ROOT}" "${EVAL_DATASET_ROOT}" "${REQUIRE_FULL_DATASET}" \
-  "${EVAL_ENV_MODE}" "${N_OBS_STEPS}" "${HORIZON}" <<'PY'
+  "${EVAL_ENV_MODE}" "${N_OBS_STEPS}" "${HORIZON}" "${EVAL_N_EPISODES}" <<'PY'
 import json
 import sys
 from collections import Counter
@@ -306,11 +321,16 @@ def read_dataset(root_text: str, expected_split: str):
 
 
 train_info, train_manifest, train_sources, train_counts = read_dataset(sys.argv[1], "train")
-if sys.argv[4] == "random":
+if sys.argv[4] in {"random", "official"}:
+    eval_description = (
+        "eval=random environment seeds"
+        if sys.argv[4] == "random"
+        else f"eval=official LIBERO init states 0..{int(sys.argv[7]) - 1}"
+    )
     print(
         "Dataset preflight OK: "
         f"train={train_info['total_episodes']} episodes/{sum(train_counts.values())} sources, "
-        "eval=random environment seeds"
+        f"{eval_description}"
     )
     raise SystemExit(0)
 
@@ -407,6 +427,19 @@ if [[ "${RESUME}" == "true" ]]; then
       --eval.start_seed="${EVAL_START_SEED}"
       --env.init_states=false
     )
+  elif [[ "${EVAL_ENV_MODE}" == "official" ]]; then
+    train_args+=(
+      --eval.dataset_repo_id=null
+      --eval.dataset_root=null
+      --eval.dataset_episodes=null
+      --env.init_states=true
+      --env.init_state_ids="${OFFICIAL_INIT_STATE_IDS}"
+      --env.init_state_ids_by_task=null
+      --env.init_state_values=null
+      --env.init_state_values_by_task=null
+      --env.episode_length=600
+      --env.num_steps_wait=5
+    )
   fi
 else
   train_args=(
@@ -497,10 +530,20 @@ else
       if [[ -n "${EVAL_DATASET_EPISODES}" ]]; then
         train_args+=(--eval.dataset_episodes="${EVAL_DATASET_EPISODES}")
       fi
-    else
+    elif [[ "${EVAL_ENV_MODE}" == "random" ]]; then
       train_args+=(
         --env.init_states=false
         --eval.start_seed="${EVAL_START_SEED}"
+      )
+    else
+      train_args+=(
+        --env.init_states=true
+        --env.init_state_ids="${OFFICIAL_INIT_STATE_IDS}"
+        --env.episode_length=600
+        --env.num_steps_wait=5
+        --eval.dataset_repo_id=null
+        --eval.dataset_root=null
+        --eval.dataset_episodes=null
       )
     fi
   fi
@@ -511,8 +554,10 @@ echo "  train=${DATASET_ROOT}"
 echo "  eval_env_mode=${EVAL_ENV_MODE}"
 if [[ "${EVAL_ENV_MODE}" == "fixed" ]]; then
   echo "  eval=${EVAL_DATASET_ROOT}"
-else
+elif [[ "${EVAL_ENV_MODE}" == "random" ]]; then
   echo "  eval=random LPB seeds ${EVAL_START_SEED}..$((EVAL_START_SEED + EVAL_N_EPISODES - 1)) per task"
+else
+  echo "  eval=official LIBERO init states 0..$((EVAL_N_EPISODES - 1)) per task"
 fi
 echo "  GPUs=${NUM_GPUS} (${CUDA_VISIBLE_DEVICES}), batch/GPU=${BATCH_SIZE}, effective_batch=$((NUM_GPUS * BATCH_SIZE))"
 echo "  steps=${STEPS}, lr=${LEARNING_RATE}, horizon=${HORIZON}, n_action_steps=${N_ACTION_STEPS}"
