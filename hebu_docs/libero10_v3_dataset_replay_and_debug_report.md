@@ -12,20 +12,20 @@
 
 本轮重新生成了 LIBERO-10 v3 全量训练集和固定评估集，并完成了数据结构、split、relative action、真实环境 replay、真实 inference 预处理/后处理和 CUDA 训练 smoke test。
 
-| 项目 | 结果 |
-| --- | --- |
-| 原始 source episode | 500 |
-| 闭环转换可用 episode | 485 |
-| 显式排除 episode | 15 |
-| Train | 435 episodes / 119,467 frames |
-| Eval | 50 episodes / 13,665 frames |
-| Train/Eval source 泄漏 | 0 |
-| Eval runtime absolute replay | 50/50 成功 |
-| Eval chunk=15 relative inference oracle | 50/50 成功 |
-| 最大 runtime 位置偏差 | 0.834 mm |
-| 最大 runtime 旋转偏差 | 0.001691 rad，约 0.097° |
-| CUDA 训练 smoke test | forward/backward/optimizer 全部通过 |
-| Task6 替代 demo 过拟合 | 4k、5k eval 均成功 |
+| 项目                                    | 结果                                |
+| --------------------------------------- | ----------------------------------- |
+| 原始 source episode                     | 500                                 |
+| 闭环转换可用 episode                    | 485                                 |
+| 显式排除 episode                        | 15                                  |
+| Train                                   | 435 episodes / 119,467 frames       |
+| Eval                                    | 50 episodes / 13,665 frames         |
+| Train/Eval source 泄漏                  | 0                                   |
+| Eval runtime absolute replay            | 50/50 成功                          |
+| Eval chunk=15 relative inference oracle | 50/50 成功                          |
+| 最大 runtime 位置偏差                   | 0.834 mm                            |
+| 最大 runtime 旋转偏差                   | 0.001691 rad，约 0.097°             |
+| CUDA 训练 smoke test                    | forward/backward/optimizer 全部通过 |
+| Task6 替代 demo 过拟合                  | 4k、5k eval 均成功                  |
 
 最终数据：
 
@@ -53,7 +53,7 @@ export MPLCONFIGDIR="$PWD/.cache/matplotlib"
 ### 2.2 官方 HDF5 转 LeRobot delta 数据
 
 ```bash
-uv run python scripts/convert_libero10_hdf5_to_lerobot.py \
+uv run python scripts/libero/data/convert_libero10_hdf5_to_lerobot.py \
   --input-dir=outputs/source/libero_official/libero_10 \
   --output-root=outputs/datasets/libero10_full_v3 \
   --output-repo-id=local/libero10_full_v3 \
@@ -68,7 +68,7 @@ uv run python scripts/convert_libero10_hdf5_to_lerobot.py \
 ### 2.3 Delta 转 closed-loop absolute 数据
 
 ```bash
-uv run python scripts/convert_libero_delta_to_absolute.py \
+uv run python scripts/libero/data/convert_libero_delta_to_absolute.py \
   --input-root=outputs/datasets/libero10_full_v3 \
   --input-repo-id=local/libero10_full_v3 \
   --output-root=outputs/datasets/libero10_absolute_v3 \
@@ -103,7 +103,7 @@ uv run python scripts/convert_libero_delta_to_absolute.py \
 最终 eval 使用 replay-certified 的固定 source episode，而不是每次随机切分：
 
 ```bash
-uv run python scripts/convert_libero_absolute_to_mam.py \
+uv run python scripts/libero/data/convert_libero_absolute_to_mam.py \
   --input-root=outputs/datasets/libero10_absolute_v3 \
   --input-repo-id=local/libero10_absolute_v3 \
   --output-root=outputs/datasets/libero10_mam_v3 \
@@ -121,18 +121,18 @@ uv run python scripts/convert_libero_absolute_to_mam.py \
 
 最终每个 task 的数量：
 
-| Task | Train | Eval source episode |
-| ---: | ---: | --- |
-| 0 | 43 | 252, 254, 269, 272, 295 |
-| 1 | 45 | 305, 307, 320, 331, 337 |
-| 2 | 45 | 6, 25, 26, 32, 33 |
-| 3 | 44 | 50, 59, 71, 79, 96 |
-| 4 | 45 | 366, 369, 377, 386, 395 |
-| 5 | 43 | 453, 455, 483, 490, 496 |
-| 6 | 43 | 403, 416, 418, 424, 434 |
-| 7 | 45 | 201, 203, 222, 236, 243 |
-| 8 | 42 | 152, 164, 178, 180, 199 |
-| 9 | 40 | 121, 130, 133, 140, 146 |
+| Task | Train | Eval source episode     |
+| ---: | ----: | ----------------------- |
+|    0 |    43 | 252, 254, 269, 272, 295 |
+|    1 |    45 | 305, 307, 320, 331, 337 |
+|    2 |    45 | 6, 25, 26, 32, 33       |
+|    3 |    44 | 50, 59, 71, 79, 96      |
+|    4 |    45 | 366, 369, 377, 386, 395 |
+|    5 |    43 | 453, 455, 483, 490, 496 |
+|    6 |    43 | 403, 416, 418, 424, 434 |
+|    7 |    45 | 201, 203, 222, 236, 243 |
+|    8 |    42 | 152, 164, 178, 180, 199 |
+|    9 |    40 | 121, 130, 133, 140, 146 |
 
 Task3 最初选择的 source 85 在同一环境连续 replay 中不稳定，因此将 source 85 留在 train，并用 source 50 替换进 eval。替换后 Task3 的 5 条 eval 连续 replay 全部通过。
 
@@ -200,7 +200,7 @@ n_obs_steps - 1 + n_action_steps <= horizon
 执行命令：
 
 ```bash
-uv run python scripts/audit_libero10_mam_dataset.py \
+uv run python scripts/libero/audit/audit_libero10_mam_dataset.py \
   --train-root=outputs/datasets/libero10_mam_v3_train \
   --train-repo-id=local/libero10_mam_v3_train \
   --eval-root=outputs/datasets/libero10_mam_v3_eval \
@@ -233,7 +233,7 @@ uv run python scripts/audit_libero10_mam_dataset.py \
 最终 eval split 在标准训练评估 runtime 中逐条执行磁盘中的 absolute action：
 
 ```bash
-uv run python scripts/replay_libero_dataset_success_by_task.py \
+uv run python scripts/libero/audit/replay_libero_dataset_success_by_task.py \
   --dataset-root=outputs/datasets/libero10_mam_v3_eval \
   --action-key=action \
   --action-transform=none \
@@ -262,7 +262,7 @@ success_rate=1.0
 这一步不使用学习模型。它将数据集中的 absolute action 编码成 relative action，直接伪装成模型输出，再走真实 inference 后处理，用 live observation anchor 解码并执行。
 
 ```bash
-uv run python scripts/audit_libero_chunk_relative_oracle.py \
+uv run python scripts/libero/audit/audit_libero_chunk_relative_oracle.py \
   --dataset-root=outputs/datasets/libero10_mam_v3_eval \
   --max-episodes=50 \
   --chunk-sizes=15 \
@@ -314,7 +314,7 @@ STEPS=1 \
 ENABLE_EVAL=false \
 SAVE_FREQ=100000 \
 OUTPUT_DIR=outputs/train/diffusion_libero10_v3_full_smoke_finalsplit_20260718 \
-bash scripts/run_diffusion_libero10.sh
+bash scripts/libero/train/run_diffusion_libero10.sh
 ```
 
 结果：
@@ -331,7 +331,7 @@ step_time=16.94s
 随后执行宿主机 dry-run：
 
 ```bash
-DRY_RUN=true bash scripts/run_diffusion_libero10.sh
+DRY_RUN=true bash scripts/libero/train/run_diffusion_libero10.sh
 ```
 
 通过以下启动门禁：
@@ -362,14 +362,14 @@ put the white mug on the plate and put the chocolate pudding to the right of the
 
 ### 7.1 原 demo
 
-| 字段 | 值 |
-| --- | --- |
-| source episode | 401 |
-| 当前 train episode | 350 |
-| 长度 | 325 frames |
-| oracle replay | 成功 |
-| 学习 eval | 1k–9k 均为 0 |
-| 训练终止原因 | 10k checkpoint 保存时磁盘无空间 |
+| 字段               | 值                              |
+| ------------------ | ------------------------------- |
+| source episode     | 401                             |
+| 当前 train episode | 350                             |
+| 长度               | 325 frames                      |
+| oracle replay      | 成功                            |
+| 学习 eval          | 1k–9k 均为 0                    |
+| 训练终止原因       | 10k checkpoint 保存时磁盘无空间 |
 
 原 demo 本身不是损坏数据，relative oracle 也能执行成功。视频表现为：
 
@@ -381,18 +381,18 @@ put the white mug on the plate and put the chocolate pudding to the right of the
 
 ### 7.2 替代 demo
 
-| 字段 | 值 |
-| --- | --- |
-| source episode | 400 |
-| 当前 train episode | 349 |
-| 长度 | 203 frames |
-| chunk oracle | 1/4/15/full 全部成功 |
-| 1k eval | 0% |
-| 2k eval | 0% |
-| 3k eval | 0% |
-| 4k eval | 100% |
-| 5k eval | 100% |
-| 5k loss | 0.0044437 |
+| 字段               | 值                   |
+| ------------------ | -------------------- |
+| source episode     | 400                  |
+| 当前 train episode | 349                  |
+| 长度               | 203 frames           |
+| chunk oracle       | 1/4/15/full 全部成功 |
+| 1k eval            | 0%                   |
+| 2k eval            | 0%                   |
+| 3k eval            | 0%                   |
+| 4k eval            | 100%                 |
+| 5k eval            | 100%                 |
+| 5k loss            | 0.0044437            |
 
 过程表现：
 
@@ -429,7 +429,7 @@ I/O error: No space left on device (os error 28)
 ```bash
 df -h .
 nvidia-smi
-SAVE_FREQ=20000 bash scripts/run_diffusion_libero10.sh
+SAVE_FREQ=20000 bash scripts/libero/train/run_diffusion_libero10.sh
 ```
 
 ### 8.2 Robosuite private macro warning
@@ -442,12 +442,12 @@ No private macro file found!
 
 ## 9. 正式训练命令
 
-启动脚本：[`scripts/run_diffusion_libero10.sh`](../scripts/run_diffusion_libero10.sh)
+启动脚本：[`scripts/libero/train/run_diffusion_libero10.sh`](../scripts/libero/train/run_diffusion_libero10.sh)
 
 推荐在确认磁盘空间后启动：
 
 ```bash
-SAVE_FREQ=20000 bash scripts/run_diffusion_libero10.sh
+SAVE_FREQ=20000 bash scripts/libero/train/run_diffusion_libero10.sh
 ```
 
 默认核心配置：
@@ -469,7 +469,7 @@ eval_n_episodes=5 per task
 如需只检查命令而不启动训练：
 
 ```bash
-DRY_RUN=true bash scripts/run_diffusion_libero10.sh
+DRY_RUN=true bash scripts/libero/train/run_diffusion_libero10.sh
 ```
 
 ## 10. 训练前硬门禁

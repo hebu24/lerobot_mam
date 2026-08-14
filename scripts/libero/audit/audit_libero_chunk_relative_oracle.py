@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 import pyarrow.parquet as pq
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
@@ -134,7 +134,7 @@ def _parse_chunk_sizes(text: str, episode_length: int) -> list[int]:
         token = item.strip().lower()
         if not token:
             continue
-        size = episode_length if token == "full" else int(token)
+        size = episode_length if token == "full" else int(token)  # nosec B105
         if size <= 0:
             raise ValueError(f"Chunk sizes must be positive, got {size}.")
         if size not in sizes:
@@ -161,18 +161,14 @@ def _load_episode_specs(root: Path, selected: set[int] | None, max_episodes: int
                 raise ValueError(
                     f"Episode {episode_index} needs raw init_state and task_id for an exact oracle replay."
                 )
-            source_episode_id = _first_present(
-                row, ("libero/source_episode_id", "source_episode_id")
-            )
+            source_episode_id = _first_present(row, ("libero/source_episode_id", "source_episode_id"))
             specs.append(
                 EpisodeSpec(
                     episode_index=episode_index,
                     suite=str(_first_present(row, ("libero/suite", "suite")) or "libero_10"),
                     task_id=int(task_id),
                     init_state=np.asarray(init_state, dtype=np.float64).reshape(-1).tolist(),
-                    source_episode_id=(
-                        None if source_episode_id is None else int(source_episode_id)
-                    ),
+                    source_episode_id=(None if source_episode_id is None else int(source_episode_id)),
                     source_file=_first_present(row, ("libero/source_file", "source_file")),
                     source_demo=_first_present(row, ("libero/source_demo", "source_demo")),
                 )
@@ -262,12 +258,8 @@ def _rotation_error_rad(first: np.ndarray, second: np.ndarray) -> np.ndarray:
 
 
 def _anchor_rotation_error_rad(recorded: np.ndarray, live: np.ndarray) -> float:
-    recorded_matrix = np.asarray(
-        eef_body_quaternion_to_controller_matrix(recorded[3:7]), dtype=np.float64
-    )
-    live_matrix = np.asarray(
-        eef_body_quaternion_to_controller_matrix(live[3:7]), dtype=np.float64
-    )
+    recorded_matrix = np.asarray(eef_body_quaternion_to_controller_matrix(recorded[3:7]), dtype=np.float64)
+    live_matrix = np.asarray(eef_body_quaternion_to_controller_matrix(live[3:7]), dtype=np.float64)
     relative = recorded_matrix @ live_matrix.T
     cosine = float(np.clip((np.trace(relative) - 1.0) * 0.5, -1.0, 1.0))
     return math.acos(cosine)
@@ -309,9 +301,7 @@ def _run_oracle(
         recorded_anchor = states[start]
         live_anchor = _state_from_observation(observation)
         relative_chunk = absolute_to_chunk_relative(actions[start:stop], recorded_anchor)
-        absolute_chunk = np.asarray(
-            chunk_relative_to_absolute(relative_chunk, live_anchor), dtype=np.float32
-        )
+        absolute_chunk = np.asarray(chunk_relative_to_absolute(relative_chunk, live_anchor), dtype=np.float32)
 
         anchor_position_errors.append(float(np.linalg.norm(live_anchor[:3] - recorded_anchor[:3])))
         anchor_rotation_errors.append(_anchor_rotation_error_rad(recorded_anchor, live_anchor))

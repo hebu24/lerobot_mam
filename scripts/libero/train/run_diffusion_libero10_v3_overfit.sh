@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # Strict LIBERO-10 v3 Diffusion Policy overfit.
-# Usage: bash scripts/run_diffusion_libero10_v3_overfit.sh 3
-#        K=5 DEMO_RANK=0 bash scripts/run_diffusion_libero10_v3_overfit.sh
-#        RESUME=true bash scripts/run_diffusion_libero10_v3_overfit.sh
+# Usage: bash scripts/libero/train/run_diffusion_libero10_v3_overfit.sh 3
+#        K=5 DEMO_RANK=0 bash scripts/libero/train/run_diffusion_libero10_v3_overfit.sh
+#        RESUME=true bash scripts/libero/train/run_diffusion_libero10_v3_overfit.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 cd "${REPO_ROOT}"
 
 if [[ -z "${K:-}" && ${#} -gt 0 && "${1}" != --* ]]; then
@@ -175,7 +175,7 @@ if [[ "${RESUME}" == "true" ]]; then
 fi
 
 selector=(
-  uv run python scripts/prepare_libero10_v3_overfit.py
+  uv run python scripts/libero/data/prepare_libero10_v3_overfit.py
   --dataset-root="${DATASET_ROOT}"
   --dataset-repo-id="${DATASET_REPO_ID}"
   --k="${K}"
@@ -201,7 +201,7 @@ EPISODES_CSV="${EPISODES_CSV%]}"
 EPISODES_CSV="${EPISODES_CSV// /}"
 
 oracle_cmd=(
-  uv run python scripts/audit_libero_chunk_relative_oracle.py
+  uv run python scripts/libero/audit/audit_libero_chunk_relative_oracle.py
   --dataset-root="${DATASET_ROOT}"
   --episodes="${EPISODES_CSV}"
   --max-episodes="${K}"

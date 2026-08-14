@@ -4,7 +4,7 @@
 The collector deliberately separates rollout from LeRobot materialization:
 accepted trajectories are first written as resumable NPZ staging files, then
 materialized into a v3 absolute-action dataset that can be consumed by
-``scripts/convert_libero_absolute_to_mam.py``.
+``scripts/libero/data/convert_libero_absolute_to_mam.py``.
 """
 
 from __future__ import annotations
@@ -36,14 +36,14 @@ from lerobot.datasets.libero_pipeline import (
 )
 from lerobot.envs.configs import LiberoEnv as LiberoEnvConfig
 from lerobot.envs.factory import make_env_pre_post_processors
-from lerobot.envs.libero import LiberoEnv, _get_suite, get_task_init_states
+from lerobot.envs.libero import LiberoEnv, _get_suite
 from lerobot.envs.utils import preprocess_observation
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 from lerobot.utils.random_utils import seeded_context, set_seed
 
 DEFAULT_CHECKPOINT = Path("outputs/checkpoints/dp_libero10_v3_filtered_best_sr94_step095000/pretrained_model")
-DEFAULT_OUTPUT_ROOT = Path("outputs/datasets/libero10_100_rollout_absolute")
+DEFAULT_OUTPUT_ROOT = Path("outputs/datasets/libero10_100_rollout_absolute_lpb")
 DEFAULT_REFERENCE_ROOT = Path("outputs/datasets/libero10_500_train")
 DEFAULT_TOKENIZER_REPO = "openai/clip-vit-base-patch32"
 
@@ -57,15 +57,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
-    parser.add_argument("--output-repo-id", default="local/libero10_100_rollout_absolute")
+    parser.add_argument("--output-repo-id", default="local/libero10_100_rollout_absolute_lpb")
     parser.add_argument("--staging-root", type=Path, default=None)
     parser.add_argument("--reference-length-root", type=Path, default=DEFAULT_REFERENCE_ROOT)
     parser.add_argument("--suite", default="libero_10")
     parser.add_argument("--task-ids", default="0,1,2,3,4,5,6,7,8,9")
     parser.add_argument("--episodes-per-task", type=int, default=10)
-    parser.add_argument("--max-attempts-per-task", type=int, default=50)
+    parser.add_argument("--max-attempts-per-task", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--seed", type=int, default=1000)
+    parser.add_argument(
+        "--start-seed",
+        "--seed",
+        dest="start_seed",
+        type=int,
+        default=100_000,
+        help=(
+            "First native LIBERO reset seed for every task. Seeds advance consecutively until "
+            "the requested number of accepted trajectories is reached. --seed is a deprecated alias."
+        ),
+    )
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--height", type=int, default=128)
     parser.add_argument("--width", type=int, default=128)
@@ -159,8 +169,6 @@ def _rollout_batch(
     *,
     task_suite: Any,
     task_id: int,
-    init_states: list[np.ndarray],
-    init_state_ids: list[int],
     rollout_seeds: list[int],
     max_accepted_steps: int,
     policy: Any,
@@ -170,11 +178,11 @@ def _rollout_batch(
     preprocessor: Any,
     postprocessor: Any,
 ) -> list[tuple[dict[str, np.ndarray] | None, dict[str, Any]]]:
-    if not (len(init_states) == len(init_state_ids) == len(rollout_seeds)):
-        raise ValueError("Batched init states, ids, and seeds must have equal lengths.")
-    batch_size = len(init_states)
+    if not rollout_seeds:
+        raise ValueError("A rollout batch must contain at least one seed.")
+    batch_size = len(rollout_seeds)
 
-    def make_env_fn(init_state: np.ndarray):
+    def make_env_fn():
         def make_single_env() -> LiberoEnv:
             return LiberoEnv(
                 task_suite=task_suite,
@@ -184,8 +192,7 @@ def _rollout_batch(
                 obs_type=env_cfg.obs_type,
                 observation_height=env_cfg.observation_height,
                 observation_width=env_cfg.observation_width,
-                init_states=True,
-                init_state_values=[init_state],
+                init_states=False,
                 n_envs=batch_size,
                 num_steps_wait=0,
                 control_mode="absolute",
@@ -193,7 +200,7 @@ def _rollout_batch(
 
         return make_single_env
 
-    env = gym.vector.SyncVectorEnv([make_env_fn(state) for state in init_states])
+    env = gym.vector.SyncVectorEnv([make_env_fn() for _ in rollout_seeds])
     states: list[list[np.ndarray]] = [[] for _ in range(batch_size)]
     images: list[list[np.ndarray]] = [[] for _ in range(batch_size)]
     wrist_images: list[list[np.ndarray]] = [[] for _ in range(batch_size)]
@@ -204,6 +211,16 @@ def _rollout_batch(
     try:
         policy.reset()
         observation, _ = env.reset(seed=rollout_seeds)
+        # Save the exact state produced by the native seeded reset. The final
+        # fixed MAM evaluator restores these values with set_init_state(), while
+        # collection itself never touches LIBERO's official 0..49 init states.
+        init_states = []
+        for single_env in env.envs:
+            if single_env._env is None:
+                raise RuntimeError("LIBERO environment was not initialized by reset().")
+            init_states.append(
+                np.asarray(single_env._env.get_sim_state(), dtype=np.float64).reshape(-1).copy()
+            )
         task_descriptions = [str(value) for value in env.call("task_description")]
         postprocessed_action_queue: deque[torch.Tensor] = deque()
         requires_context = bool(getattr(postprocessor, "requires_transition_context", False))
@@ -231,6 +248,7 @@ def _rollout_batch(
                 context = deepcopy(policy_observation) if requires_context else None
                 model_observation = preprocessor(policy_observation)
                 if requires_context:
+                    assert context is not None
                     model_observation = policy.update_observation_queue(model_observation)
                     if not postprocessed_action_queue:
                         action_chunk = policy.predict_action_chunk(model_observation)
@@ -272,7 +290,11 @@ def _rollout_batch(
             "task_id": task_id,
             "task_name": task.name,
             "task_description": task.language,
-            "init_state_id": init_state_ids[index],
+            # Preserve the legacy integer field while making its meaning
+            # explicit: for native resets the seed uniquely identifies the
+            # captured initial state.
+            "init_state_id": rollout_seeds[index],
+            "init_state_source": "native_seed",
             "init_state": np.asarray(init_states[index], dtype=np.float64).reshape(-1).tolist(),
             "rollout_seed": rollout_seeds[index],
             "length": len(actions[index]),
@@ -302,7 +324,7 @@ def _staged_metadata(staging_root: Path, task_id: int) -> list[tuple[Path, dict[
     return result
 
 
-def _attempted_init_ids(path: Path, task_id: int) -> set[int]:
+def _attempted_rollout_seeds(path: Path, task_id: int) -> set[int]:
     if not path.is_file():
         return set()
     attempted = set()
@@ -314,7 +336,7 @@ def _attempted_init_ids(path: Path, task_id: int) -> set[int]:
         except json.JSONDecodeError as exc:
             raise ValueError(f"Invalid attempt log JSON at {path}:{line_number}") from exc
         if int(row["task_id"]) == task_id:
-            attempted.add(int(row["init_state_id"]))
+            attempted.add(int(row["rollout_seed"]))
     return attempted
 
 
@@ -370,54 +392,42 @@ def collect(args: argparse.Namespace, task_ids: list[int], limits: dict[int, int
     )
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg, policy_cfg)
     task_suite = _get_suite(args.suite)
-    set_seed(args.seed)
+    set_seed(args.start_seed)
 
     attempt_log_path = staging_root / "attempts.jsonl"
     for task_id in task_ids:
         staged = _staged_metadata(staging_root, task_id)
         if len(staged) > args.episodes_per_task:
             raise ValueError(f"Staging has too many task {task_id} episodes: {len(staged)}")
-        accepted_init_ids = {int(metadata["init_state_id"]) for _, metadata in staged}
-        attempted_init_ids = _attempted_init_ids(attempt_log_path, task_id)
-        init_states = np.asarray(get_task_init_states(task_suite, task_id), dtype=np.float64)
-        candidate_ids = np.arange(len(init_states), dtype=np.int64)
-        rng = np.random.default_rng(np.random.SeedSequence([args.seed, task_id]))
-        rng.shuffle(candidate_ids)
-        candidate_ids = [
-            int(value)
-            for value in candidate_ids
-            if int(value) not in accepted_init_ids and int(value) not in attempted_init_ids
-        ]
-        if len(candidate_ids) < args.episodes_per_task - len(staged):
-            raise ValueError(f"Task {task_id} has too few distinct init states for the requested demos.")
+        accepted_seeds = {int(metadata["rollout_seed"]) for _, metadata in staged}
+        attempted_seeds = _attempted_rollout_seeds(attempt_log_path, task_id)
+        if accepted_seeds - attempted_seeds:
+            raise ValueError(
+                f"Task {task_id} staging contains accepted seeds missing from attempts.jsonl: "
+                f"{sorted(accepted_seeds - attempted_seeds)}"
+            )
+        if any(seed < args.start_seed for seed in attempted_seeds):
+            raise ValueError(f"Task {task_id} attempt log contains seeds below start seed {args.start_seed}.")
+        next_seed = max(attempted_seeds, default=args.start_seed - 1) + 1
 
         logging.info(
-            "Task %d: resume=%d target=%d length_limit=%d candidates=%d",
+            "Task %d: resume=%d target=%d length_limit=%d next_seed=%d",
             task_id,
             len(staged),
             args.episodes_per_task,
             limits[task_id],
-            len(candidate_ids),
+            next_seed,
         )
         attempts = 0
-        cursor = 0
-        while (
-            len(staged) < args.episodes_per_task
-            and attempts < args.max_attempts_per_task
-            and cursor < len(candidate_ids)
-        ):
+        while len(staged) < args.episodes_per_task and attempts < args.max_attempts_per_task:
             batch_count = min(
                 args.batch_size,
                 args.max_attempts_per_task - attempts,
-                len(candidate_ids) - cursor,
             )
-            batch_ids = candidate_ids[cursor : cursor + batch_count]
-            batch_seeds = [args.seed + task_id * 100_000 + value for value in batch_ids]
+            batch_seeds = list(range(next_seed, next_seed + batch_count))
             batch_results = _rollout_batch(
                 task_suite=task_suite,
                 task_id=task_id,
-                init_states=[init_states[value] for value in batch_ids],
-                init_state_ids=batch_ids,
                 rollout_seeds=batch_seeds,
                 max_accepted_steps=limits[task_id],
                 policy=policy,
@@ -428,15 +438,14 @@ def collect(args: argparse.Namespace, task_ids: list[int], limits: dict[int, int
                 postprocessor=postprocessor,
             )
             attempts += batch_count
-            cursor += batch_count
+            next_seed += batch_count
             for trajectory, metadata in batch_results:
                 with attempt_log_path.open("a", encoding="utf-8") as file:
                     file.write(json.dumps(metadata, sort_keys=True) + "\n")
                 logging.info(
-                    "Task %d attempt %d init=%d seed=%d length=%d result=%s",
+                    "Task %d attempt %d seed=%d length=%d result=%s",
                     task_id,
                     attempts,
-                    metadata["init_state_id"],
                     metadata["rollout_seed"],
                     metadata["length"],
                     metadata["reason"],
@@ -574,7 +583,9 @@ def materialize(
             "episode_count": expected,
             "source_episode_ids": list(range(expected)),
             "source_policy_checkpoint": str(args.checkpoint.resolve()),
-            "collection_seed": args.seed,
+            "collection_protocol": "lpb_native_seeded_reset",
+            "test_start_seed": args.start_seed,
+            "collection_seed": args.start_seed,
             "length_filter_by_task": {str(key): value for key, value in limits.items()},
             "reference_length_root": str(args.reference_length_root.resolve()),
             "staging_root": str(staging_root.resolve()),
@@ -597,6 +608,8 @@ def main() -> None:
         or args.image_writer_threads < 0
     ):
         raise ValueError("Episode, attempt, and batch counts must be positive; threads cannot be negative.")
+    if args.start_seed < 50:
+        raise ValueError("--start-seed must be at least 50 and must not overlap training seeds 0..49.")
     if args.max_trajectory_steps is None:
         limits = _reference_length_limits(args.reference_length_root, task_ids)
     else:

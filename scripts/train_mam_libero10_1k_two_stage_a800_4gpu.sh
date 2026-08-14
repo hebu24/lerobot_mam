@@ -248,7 +248,7 @@ run_phase() {
   echo "[${phase}] eval=${eval_root} masks=${eval_masks}"
   echo "[${phase}] target=${end_step} output=${output_dir}"
 
-  bash scripts/run_mam_libero10_conda.sh \
+  bash scripts/libero/train/run_mam_libero10_conda.sh \
     --keep_all_checkpoints_after_step="${KEEP_ALL_CHECKPOINTS_AFTER_STEP}" \
     --policy.allow_independent_eval_source=true \
     --policy.language_tokenizer_name=/cephfs/shared/Yanbang/maniskill/pretrained/clip-vit-base-patch32 \

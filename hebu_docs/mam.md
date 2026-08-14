@@ -61,10 +61,10 @@ absolute action + 完整 absolute MAS + 独立 binary mask + progress
 `K` 可取 `1..10`，默认选择前 K 个 task，每个 task 选 1 条 trajectory。训练和评估使用完全相同的 episode ID 及 init state。
 
 ```bash
-bash scripts/run_diffusion_libero10_v3_overfit.sh 3
+bash scripts/libero/train/run_diffusion_libero10_v3_overfit.sh 3
 ```
 
-也可用 `K=5 bash scripts/run_diffusion_libero10_v3_overfit.sh`。该入口固定 `policy.use_relative_actions=true` 和 `env.control_mode=absolute`，默认训练 20000 steps；启动前会校验 v3 manifest、数据 schema、source identity、CUDA，并对所有选中 trajectory 运行 `1/4/n_action_steps/full` 的真实 runtime oracle。
+也可用 `K=5 bash scripts/libero/train/run_diffusion_libero10_v3_overfit.sh`。该入口固定 `policy.use_relative_actions=true` 和 `env.control_mode=absolute`，默认训练 20000 steps；启动前会校验 v3 manifest、数据 schema、source identity、CUDA，并对所有选中 trajectory 运行 `1/4/n_action_steps/full` 的真实 runtime oracle。
 
 ### 3. 正式数据重建命令
 
@@ -84,7 +84,7 @@ export MPLCONFIGDIR=/tmp/matplotlib-cache
 正式训练不要设置 `--max-episodes-per-task`，也不要设置 `--use-videos`。闭环重物化必须原子替换两路图像，不能沿用 delta rollout 的旧视频。
 
 ```bash
-uv run python scripts/convert_libero10_hdf5_to_lerobot.py \
+uv run python scripts/libero/data/convert_libero10_hdf5_to_lerobot.py \
   --input-dir=outputs/source/libero_official/libero_10 \
   --output-root=outputs/datasets/libero10_full_v3 \
   --output-repo-id=local/libero10_full_v3 \
@@ -99,7 +99,7 @@ uv run python scripts/convert_libero10_hdf5_to_lerobot.py \
 正式数据必须通过 `--source-hdf5-dir` 读取每条 demo 自带的 XML/状态，生成精确的 absolute controller goal，并在 absolute controller 下闭环重放、重新物化 RGB/state。只有转换完整结束后 manifest 才会写入 `relative_action_ready=true`；旧 action-only 输出必须用 `--overwrite` 重建。
 
 ```bash
-uv run python scripts/convert_libero_delta_to_absolute.py \
+uv run python scripts/libero/data/convert_libero_delta_to_absolute.py \
   --input-root=outputs/datasets/libero10_full_v3 \
   --input-repo-id=local/libero10_full_v3 \
   --output-root=outputs/datasets/libero10_absolute_v3 \
@@ -117,7 +117,7 @@ uv run python scripts/convert_libero_delta_to_absolute.py \
 #### 3.4 生成每个 task 固定 5 条 eval 的完整 MAM train/eval split
 
 ```bash
-uv run python scripts/convert_libero_absolute_to_mam.py \
+uv run python scripts/libero/data/convert_libero_absolute_to_mam.py \
   --input-root=outputs/datasets/libero10_absolute_v3 \
   --input-repo-id=local/libero10_absolute_v3 \
   --output-root=outputs/datasets/libero10_mam_v3 \
@@ -169,7 +169,7 @@ uv run python scripts/convert_libero_absolute_to_mam.py \
 任何一项失败都必须停止训练。
 
 ```bash
-uv run python scripts/audit_libero10_mam_dataset.py \
+uv run python scripts/libero/audit/audit_libero10_mam_dataset.py \
   --train-root=outputs/datasets/libero10_mam_v3_train \
   --train-repo-id=local/libero10_mam_v3_train \
   --eval-root=outputs/datasets/libero10_mam_v3_eval \
@@ -187,7 +187,7 @@ uv run python scripts/audit_libero10_mam_dataset.py \
 随后必须在真实 eval runtime 中运行 relative-action oracle。下面命令按实际 DP 配置对完整 eval split 执行 `chunk=15`；任何失败都会返回非零退出码，禁止开始训练。
 
 ```bash
-uv run python scripts/audit_libero_chunk_relative_oracle.py \
+uv run python scripts/libero/audit/audit_libero_chunk_relative_oracle.py \
   --dataset-root=outputs/datasets/libero10_mam_v3_eval \
   --max-episodes=50 \
   --chunk-sizes=15 \
@@ -241,7 +241,7 @@ ENV_TASK_IDS='[0,1,2,3,4,5,6,7,8,9]' \
 ENV_CONTROL_MODE=absolute \
 ENV_OBSERVATION_HEIGHT=128 \
 ENV_OBSERVATION_WIDTH=128 \
-bash scripts/train_diffusion_libero_put_bowl_on_plate_multigpu.sh \
+bash scripts/libero/train/train_diffusion_libero_put_bowl_on_plate_multigpu.sh \
   --policy.horizon=32 \
   --policy.n_action_steps=15 \
   --policy.use_language_conditioning=true
@@ -252,7 +252,7 @@ bash scripts/train_diffusion_libero_put_bowl_on_plate_multigpu.sh \
 ### 6. 正式 MAM 训练与固定 split 评估
 
 ```bash
-STPM_PATHS='{"libero_10/0":"outputs/train/stpm_libero10_v2_task0","bash scripts/run_mam_libero10_v3_overfit.sh 1libero_10/1":"outputs/train/stpm_libero10_v2_task1","libero_10/2":"outputs/train/stpm_libero10_v2_task2","libero_10/3":"outputs/train/stpm_libero10_v2_task3","libero_10/4":"outputs/train/stpm_libero10_v2_task4","libero_10/5":"outputs/train/stpm_libero10_v2_task5","libero_10/6":"outputs/train/stpm_libero10_v2_task6","libero_10/7":"outputs/train/stpm_libero10_v2_task7","libero_10/8":"outputs/train/stpm_libero10_v2_task8","libero_10/9":"outputs/train/stpm_libero10_v2_task9"}' \
+STPM_PATHS='{"libero_10/0":"outputs/train/stpm_libero10_v2_task0","libero_10/1":"outputs/train/stpm_libero10_v2_task1","libero_10/2":"outputs/train/stpm_libero10_v2_task2","libero_10/3":"outputs/train/stpm_libero10_v2_task3","libero_10/4":"outputs/train/stpm_libero10_v2_task4","libero_10/5":"outputs/train/stpm_libero10_v2_task5","libero_10/6":"outputs/train/stpm_libero10_v2_task6","libero_10/7":"outputs/train/stpm_libero10_v2_task7","libero_10/8":"outputs/train/stpm_libero10_v2_task8","libero_10/9":"outputs/train/stpm_libero10_v2_task9"}' \
 CUDA_VISIBLE_DEVICES=0 \
 NUM_GPUS=1 \
 POLICY_DEVICE=cuda \
@@ -269,7 +269,7 @@ ENV_TASK_IDS='[0,1,2,3,4,5,6,7,8,9]' \
 ENV_CONTROL_MODE=absolute \
 ENV_OBSERVATION_HEIGHT=128 \
 ENV_OBSERVATION_WIDTH=128 \
-bash scripts/run_mam_libero10_conda.sh
+bash scripts/libero/train/run_mam_libero10_conda.sh
 ```
 
 这里 `EVAL_N_EPISODES=50` 是所有 task 的总数。评估使用同一个选中 episode 前缀同时配置 init state、MAS 和 task 分组，避免三者错位；STPM 只在 action queue 为空时运行一次。

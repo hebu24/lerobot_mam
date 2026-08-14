@@ -208,12 +208,8 @@ def _extract_runtime_observation(
         raise ValueError("Runtime LIBERO state contains non-finite values.")
     return {
         OBS_STATE: state,
-        AGENTVIEW_IMAGE: _as_runtime_image(
-            pixels["image"], key=AGENTVIEW_IMAGE, height=height, width=width
-        ),
-        WRIST_IMAGE: _as_runtime_image(
-            pixels["image2"], key=WRIST_IMAGE, height=height, width=width
-        ),
+        AGENTVIEW_IMAGE: _as_runtime_image(pixels["image"], key=AGENTVIEW_IMAGE, height=height, width=width),
+        WRIST_IMAGE: _as_runtime_image(pixels["image2"], key=WRIST_IMAGE, height=height, width=width),
     }
 
 
@@ -331,8 +327,7 @@ def _compute_embedded_image_stats(values: list[Any]) -> dict[str, np.ndarray]:
     stacked = np.stack(sampled_images, axis=0)
     stats = get_feature_stats(stacked, axis=(0, 2, 3), keepdims=True)
     return {
-        key: value if key == "count" else np.squeeze(value / 255.0, axis=0)
-        for key, value in stats.items()
+        key: value if key == "count" else np.squeeze(value / 255.0, axis=0) for key, value in stats.items()
     }
 
 
@@ -414,19 +409,19 @@ def _recompute_materialized_stats(root: Path, meta: LeRobotDatasetMetadata) -> N
 def _convert_file_with_replay(
     df: pd.DataFrame,
     *,
-    episode_metadata: dict[int, dict[str, object]],
-    task_suites: dict[str, object],
+    episode_metadata: dict[int, dict[str, Any]],
+    task_suites: dict[str, Any],
     observation_width: int,
     observation_height: int,
     source_hdf5_dir: Path | None,
     source_action_strategy: str,
     pose_offset: int,
     pose_gripper_offset: int,
-    episode_strategy_overrides: dict[int, dict[str, object]],
+    episode_strategy_overrides: dict[int, dict[str, Any]],
     closed_loop_seed: int,
     selected_episode_ids: set[int] | None = None,
     auto_repair_failed_replays: bool = False,
-    resolved_strategy_overrides: dict[int, dict[str, object]] | None = None,
+    resolved_strategy_overrides: dict[int, dict[str, Any]] | None = None,
     allow_unrepairable_episodes: bool = False,
     unrepairable_episode_ids: set[int] | None = None,
 ) -> pd.DataFrame:
@@ -527,9 +522,7 @@ def _convert_file_with_replay(
         strategy_pose_offset = int(episode_strategy["pose_offset"])
         strategy_gripper_offset = int(episode_strategy["gripper_offset"])
         strategy_post_hold_steps = int(episode_strategy.get("post_hold_steps", 0))
-        fallback_action_candidates: list[
-            tuple[dict[int, np.ndarray], dict[str, object]]
-        ] = []
+        fallback_action_candidates: list[tuple[dict[int, np.ndarray], dict[str, Any]]] = []
 
         try:
             for row in ordered_episode.itertuples(index=True):
@@ -616,12 +609,8 @@ def _convert_file_with_replay(
                     candidate_actions: dict[int, np.ndarray] = {}
                     for row in ordered_episode.itertuples(index=True):
                         frame_index = int(row.frame_index)
-                        pose_index = min(
-                            frame_index + candidate_pose_offset, len(source_states) - 1
-                        )
-                        gripper_index = min(
-                            frame_index + candidate_gripper_offset, len(source_actions) - 1
-                        )
+                        pose_index = min(frame_index + candidate_pose_offset, len(source_states) - 1)
+                        gripper_index = min(frame_index + candidate_gripper_offset, len(source_actions) - 1)
                         replay_env.sim.set_state_from_flattened(source_states[pose_index])
                         replay_env.sim.forward()
                         sync_libero_controllers(replay_env)
@@ -650,9 +639,7 @@ def _convert_file_with_replay(
                                 },
                             )
                         )
-                fallback_action_candidates.sort(
-                    key=lambda item: int(item[1]["post_hold_steps"])
-                )
+                fallback_action_candidates.sort(key=lambda item: int(item[1]["post_hold_steps"]))
             if source_hdf5_dir is not None and not replay_success:
                 logging.warning(
                     "Source delta replay did not reach success for episode %s (%s/%s, %s:%s); "
@@ -784,9 +771,7 @@ def convert_dataset(args: argparse.Namespace) -> None:
 
     input_data_files = sorted((args.input_root / "data").glob("chunk-*/*.parquet"))
     input_episode_files = sorted((args.input_root / "meta" / "episodes").glob("**/*.parquet"))
-    source_hdf5_files = sorted(
-        [*args.source_hdf5_dir.glob("*.hdf5"), *args.source_hdf5_dir.glob("*.h5")]
-    )
+    source_hdf5_files = sorted([*args.source_hdf5_dir.glob("*.hdf5"), *args.source_hdf5_dir.glob("*.h5")])
     if not input_data_files or not input_episode_files or not source_hdf5_files:
         raise FileNotFoundError(
             "v3 conversion requires input data parquet, episode metadata parquet, and source HDF5 files."
@@ -806,16 +791,10 @@ def convert_dataset(args: argparse.Namespace) -> None:
         "auto_repair_failed_replays": args.auto_repair_failed_replays,
         "allow_unrepairable_episodes": args.allow_unrepairable_episodes,
         "observation_materialization": LIBERO_CLOSED_LOOP_ABSOLUTE_MATERIALIZATION,
-        "input_manifest_sha256": _file_sha256(
-            args.input_root / "meta" / "libero_pipeline.json"
-        ),
+        "input_manifest_sha256": _file_sha256(args.input_root / "meta" / "libero_pipeline.json"),
         "input_data_inventory_sha256": _inventory_sha256(args.input_root, input_data_files),
-        "input_episode_metadata_inventory_sha256": _inventory_sha256(
-            args.input_root, input_episode_files
-        ),
-        "source_hdf5_inventory_sha256": _inventory_sha256(
-            args.source_hdf5_dir, source_hdf5_files
-        ),
+        "input_episode_metadata_inventory_sha256": _inventory_sha256(args.input_root, input_episode_files),
+        "source_hdf5_inventory_sha256": _inventory_sha256(args.source_hdf5_dir, source_hdf5_files),
         "input_episode_count": input_manifest.get("episode_count"),
         "episode_strategy_overrides": (
             None
@@ -823,18 +802,14 @@ def convert_dataset(args: argparse.Namespace) -> None:
             else str(args.episode_strategy_overrides.resolve())
         ),
         "episode_strategy_overrides_sha256": (
-            None
-            if args.episode_strategy_overrides is None
-            else _file_sha256(args.episode_strategy_overrides)
+            None if args.episode_strategy_overrides is None else _file_sha256(args.episode_strategy_overrides)
         ),
     }
 
     converted_files: set[str] = set()
     resolved_strategy_overrides: dict[int, dict[str, object]] = {}
     unrepairable_episode_ids: set[int] = set()
-    expected_data_files = {
-        path.relative_to(args.input_root).as_posix(): path for path in input_data_files
-    }
+    expected_data_files = {path.relative_to(args.input_root).as_posix(): path for path in input_data_files}
     expected_relative_paths = set(expected_data_files)
     if args.output_root.exists():
         if args.resume:
@@ -848,9 +823,7 @@ def convert_dataset(args: argparse.Namespace) -> None:
                 int(key): dict(value)
                 for key, value in progress.get("resolved_episode_strategy_overrides", {}).items()
             }
-            unrepairable_episode_ids = {
-                int(value) for value in progress.get("unrepairable_episode_ids", [])
-            }
+            unrepairable_episode_ids = {int(value) for value in progress.get("unrepairable_episode_ids", [])}
             unexpected_markers = converted_files - expected_relative_paths
             if unexpected_markers:
                 raise ValueError(
@@ -909,10 +882,10 @@ def convert_dataset(args: argparse.Namespace) -> None:
 
     from lerobot.envs.libero import _get_suite
 
-    task_suites: dict[str, object] = {}
+    task_suites: dict[str, Any] = {}
     for suite_name in sorted({str(row["suite"]) for row in episode_metadata.values()}):
         task_suites[suite_name] = _get_suite(suite_name)
-    episode_strategy_overrides: dict[int, dict[str, object]] = {}
+    episode_strategy_overrides: dict[int, dict[str, Any]] = {}
     if args.episode_strategy_overrides is not None:
         raw_overrides = json.loads(args.episode_strategy_overrides.read_text(encoding="utf-8"))
         episode_strategy_overrides = {int(key): dict(value) for key, value in raw_overrides.items()}

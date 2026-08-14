@@ -7,11 +7,11 @@ set -euo pipefail
 #   2: two tasks, 5 demos per task
 #   3: five tasks, 2 demos per task
 # Examples:
-#   bash scripts/run_mam_libero10_v3_overfit.sh 3
-#   TASK_IDS=2,4 bash scripts/run_mam_libero10_v3_overfit.sh 2
+#   bash scripts/libero/train/run_mam_libero10_v3_overfit.sh 3
+#   TASK_IDS=2,4 bash scripts/libero/train/run_mam_libero10_v3_overfit.sh 2
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 cd "${REPO_ROOT}"
 
 # =============================================================================
@@ -144,7 +144,7 @@ export NUMBA_CACHE_DIR="${NUMBA_CACHE_DIR:-${REPO_ROOT}/.cache/numba}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-${REPO_ROOT}/.cache/matplotlib}"
 
 selector=(
-  uv run python scripts/prepare_libero10_v3_overfit.py
+  uv run python scripts/libero/data/prepare_libero10_v3_overfit.py
   --dataset-root="${DATASET_ROOT}"
   --dataset-repo-id="${DATASET_REPO_ID}"
   --k="${TASK_COUNT}"
@@ -212,7 +212,7 @@ export PRETRAINED_BACKBONE_WEIGHTS="${PRETRAINED_BACKBONE_WEIGHTS:-null}"
 export DO_MASK_LOSS_FOR_PADDING="${MASK_PADDING_LOSS}"
 
 train_cmd=(
-  bash scripts/run_mam_libero10_conda.sh
+  bash scripts/libero/train/run_mam_libero10_conda.sh
   --overfit_test=true
   --overfit_per_task=false
   --num_overfit="${TOTAL_DEMOS}"

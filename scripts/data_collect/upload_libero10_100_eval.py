@@ -11,12 +11,12 @@ from huggingface_hub import CommitOperationAdd, HfApi
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=Path, default=Path("outputs/datasets/libero10_100_eval"))
+    parser.add_argument("--root", type=Path, default=Path("outputs/datasets/libero10_100_eval_lpb"))
     parser.add_argument("--repo-id", default="hebu2024/libero10_mam")
-    parser.add_argument("--path-in-repo", default="libero10_100_eval")
+    parser.add_argument("--path-in-repo", default="libero10_100_eval_lpb")
     parser.add_argument(
         "--commit-message",
-        default="Add 100 seeded successful DP rollouts for fixed MAM evaluation",
+        default="Add LPB-seeded successful DP rollouts for fixed MAM evaluation",
     )
     parser.add_argument(
         "--num-threads",

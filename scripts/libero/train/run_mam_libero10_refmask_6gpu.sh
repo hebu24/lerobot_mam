@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "${REPO_ROOT}"
 
 export PATH="/cephfs/shared/Yanbang/envs/lerobot0.5.1/bin:${PATH}"
@@ -45,7 +45,7 @@ if ! manifest_uses_per_task_composition "${TRAIN_ROOT}/meta/libero_pipeline.json
   if [[ -e "${TRAIN_ROOT}" ]]; then
     train_overwrite_args+=(--overwrite)
   fi
-  "${PYTHON}" scripts/convert_libero_absolute_to_mam.py \
+  "${PYTHON}" scripts/libero/data/convert_libero_absolute_to_mam.py \
     --input-root="${TRAIN_SOURCE_ROOT}" \
     --input-repo-id=local/libero10_mam_v3_unfiltered_train \
     --output-root="${TRAIN_ROOT}" \
@@ -65,7 +65,7 @@ if ! manifest_uses_per_task_composition "${EVAL_ROOT}/meta/libero_pipeline.json"
   if [[ -e "${EVAL_ROOT}" ]]; then
     eval_overwrite_args+=(--overwrite)
   fi
-  "${PYTHON}" scripts/convert_libero_absolute_to_mam.py \
+  "${PYTHON}" scripts/libero/data/convert_libero_absolute_to_mam.py \
     --input-root="${EVAL_SOURCE_ROOT}" \
     --input-repo-id=local/libero10_mam_v3_unfiltered_eval \
     --output-root="${EVAL_ROOT}" \
@@ -132,5 +132,5 @@ export WANDB_ENABLE=false
 export JOB_NAME="${JOB_NAME:?JOB_NAME must be set by the tmux launcher}"
 export OUTPUT_DIR="${OUTPUT_DIR:-outputs/train/${JOB_NAME}}"
 
-exec bash scripts/run_mam_libero10_conda.sh \
+exec bash scripts/libero/train/run_mam_libero10_conda.sh \
   --policy.language_tokenizer_name=/cephfs/shared/Yanbang/maniskill/pretrained/clip-vit-base-patch32

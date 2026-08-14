@@ -28,7 +28,7 @@ else
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 cd "${REPO_ROOT}"
 
 export LIBERO_ASSETS_PATH="${LIBERO_ASSETS_PATH:-${REPO_ROOT}/.cache/libero/assets}"
@@ -266,7 +266,7 @@ for key in (f"libero_10/{task_id}" for task_id in range(10)):
             missing_files.append(str(path))
 if missing_files:
     raise SystemExit(
-        "missing STPM artifacts; run scripts/train_stpm_libero10_v3_all.sh first:\n"
+        "missing STPM artifacts; run scripts/libero/train/train_stpm_libero10_v3_all.sh first:\n"
         + "\n".join(missing_files)
     )
 ' "${STPM_PATHS}"
@@ -274,7 +274,7 @@ if missing_files:
 fi
 
 train_cmd=(
-  bash scripts/train_mam_libero_put_bowl_on_plate_multigpu.sh
+  bash scripts/libero/train/train_mam_libero_put_bowl_on_plate_multigpu.sh
   --seed="${SEED}"
   --cudnn_deterministic="${CUDNN_DETERMINISTIC}"
   --optimizer.grad_clip_norm="${GRAD_CLIP_NORM}"

@@ -7,7 +7,7 @@ import pytest
 from PIL import Image
 
 from lerobot.utils.constants import ACTION, OBS_STATE
-from scripts.convert_libero_delta_to_absolute import (
+from scripts.libero.data.convert_libero_delta_to_absolute import (
     AGENTVIEW_IMAGE,
     WRIST_IMAGE,
     _apply_materialized_values,
@@ -153,9 +153,7 @@ def test_closed_loop_schema_rejects_video_and_unknown_observation_fields():
     with pytest.raises(ValueError, match="video-backed"):
         _validate_closed_loop_observation_schema(_meta(video_keys=[AGENTVIEW_IMAGE]))
     with pytest.raises(ValueError, match="unsupported"):
-        _validate_closed_loop_observation_schema(
-            _meta(extra_features=["observation.environment_state"])
-        )
+        _validate_closed_loop_observation_schema(_meta(extra_features=["observation.environment_state"]))
 
 
 def _embedded_png(value: int) -> dict[str, bytes | None]:

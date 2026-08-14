@@ -154,8 +154,7 @@ def main() -> None:
     available_mask_types = [str(item) for item in manifest.get("mask_types", [])]
     if args.mask_type not in available_mask_types:
         raise ValueError(
-            f"Requested mask type {args.mask_type!r} is unavailable; "
-            f"dataset contains {available_mask_types}."
+            f"Requested mask type {args.mask_type!r} is unavailable; dataset contains {available_mask_types}."
         )
 
     metadata = LeRobotDatasetMetadata(args.dataset_repo_id, root=args.dataset_root)

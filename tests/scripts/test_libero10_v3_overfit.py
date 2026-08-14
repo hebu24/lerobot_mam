@@ -17,10 +17,10 @@ from lerobot.datasets.libero_pipeline import (
 )
 from lerobot.datasets.libero_training import validate_libero_v3_training_dataset
 from lerobot.envs.libero_eval import validate_libero_action_semantics
-from scripts import convert_libero_absolute_to_mam
-from scripts.convert_libero10_hdf5_to_lerobot import _assign_demo_index_map
-from scripts.convert_libero_absolute_to_mam import _as_float_list
-from scripts.prepare_libero10_v3_overfit import select_overfit_episodes
+from scripts.libero.data import convert_libero_absolute_to_mam
+from scripts.libero.data.convert_libero10_hdf5_to_lerobot import _assign_demo_index_map
+from scripts.libero.data.convert_libero_absolute_to_mam import _as_float_list
+from scripts.libero.data.prepare_libero10_v3_overfit import select_overfit_episodes
 
 
 def _row(task: int, episode: int, source: int, slot: int = 0, mask_type: str = "random_mask"):
@@ -35,6 +35,13 @@ def _row(task: int, episode: int, source: int, slot: int = 0, mask_type: str = "
         "mask_type": mask_type,
         "mask_type_slot": slot,
     }
+
+
+def test_zero_eval_ratio_keeps_every_episode_in_train():
+    train_ids, eval_ids = convert_libero_absolute_to_mam._selected_episode_ids(500, 0, 0)
+
+    assert train_ids == list(range(500))
+    assert eval_ids == []
 
 
 def test_v3_selection_is_unique_and_stable_as_k_grows():
@@ -560,7 +567,7 @@ def test_training_preflight_allows_random_env_evaluation_without_eval_dataset(tm
 
 def test_full_dp_launcher_rejects_invalid_eval_env_mode():
     result = subprocess.run(
-        ["bash", "scripts/run_diffusion_libero10.sh"],
+        ["bash", "scripts/libero/train/run_diffusion_libero10.sh"],
         check=False,
         capture_output=True,
         text=True,
@@ -573,7 +580,7 @@ def test_full_dp_launcher_rejects_invalid_eval_env_mode():
 
 def test_full_dp_launcher_rejects_random_eval_seed_overlap():
     result = subprocess.run(
-        ["bash", "scripts/run_diffusion_libero10.sh"],
+        ["bash", "scripts/libero/train/run_diffusion_libero10.sh"],
         check=False,
         capture_output=True,
         text=True,
@@ -683,7 +690,7 @@ def test_mam_conversion_rejects_legacy_action_only_absolute(tmp_path, monkeypatc
 
 def test_launcher_rejects_uncontrolled_extra_cli_arguments():
     result = subprocess.run(
-        ["bash", "scripts/run_diffusion_libero10_v3_overfit.sh", "3", "--resume=true"],
+        ["bash", "scripts/libero/train/run_diffusion_libero10_v3_overfit.sh", "3", "--resume=true"],
         check=False,
         capture_output=True,
         text=True,

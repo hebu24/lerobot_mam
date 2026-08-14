@@ -68,6 +68,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-repo-id", type=str, default=None)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--output-repo-id", type=str, required=True)
+    parser.add_argument(
+        "--eval-output-root",
+        type=Path,
+        default=None,
+        help="Optional exact output folder for the eval split instead of <output-root>_eval.",
+    )
+    parser.add_argument(
+        "--eval-output-repo-id",
+        type=str,
+        default=None,
+        help="Optional exact repo id for the eval split instead of <output-repo-id>_eval.",
+    )
     parser.add_argument("--eval-ratio", type=float, default=0.1)
     parser.add_argument("--eval-per-task", type=int, default=None)
     parser.add_argument(
@@ -181,11 +193,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def _resolve_mask_types(args: argparse.Namespace, split: str | None = None) -> list[str]:
-    raw_mask_types = (
-        getattr(args, f"{split}_mask_types", None)
-        if split is not None
-        else None
-    )
+    raw_mask_types = getattr(args, f"{split}_mask_types", None) if split is not None else None
     if raw_mask_types is None:
         raw_mask_types = getattr(args, "mask_types", None)
     if raw_mask_types is None:
@@ -274,12 +282,8 @@ def _resolve_mask_specs(
             "mask_type": mask_type,
             "mask_type_slot": slot,
             "composition": float(composition[slot]),
-            "retain_ratio": (
-                float(retain_ratios[slot]) if mask_type in MASK_TYPES_REQUIRING_RATIO else None
-            ),
-            "mask_seq_len": (
-                int(mask_seq_lens[slot]) if mask_type in MASK_TYPES_REQUIRING_SEQ_LEN else None
-            ),
+            "retain_ratio": (float(retain_ratios[slot]) if mask_type in MASK_TYPES_REQUIRING_RATIO else None),
+            "mask_seq_len": (int(mask_seq_lens[slot]) if mask_type in MASK_TYPES_REQUIRING_SEQ_LEN else None),
         }
         for slot, mask_type in enumerate(mask_types)
     ]
@@ -386,7 +390,7 @@ def _selected_episode_ids(total: int, eval_ratio: float, seed: int) -> tuple[lis
         return ids.tolist(), []
     rng = np.random.default_rng(seed)
     rng.shuffle(ids)
-    eval_count = max(1, int(round(total * float(eval_ratio))))
+    eval_count = 0 if eval_ratio == 0 else max(1, int(round(total * float(eval_ratio))))
     eval_ids = sorted(ids[:eval_count].astype(int).tolist())
     train_ids = sorted(ids[eval_count:].astype(int).tolist())
     if len(train_ids) == 0:
@@ -471,9 +475,7 @@ def _selected_explicit_eval_ids(
     )
     eval_set = set(values)
     if not eval_set <= eligible:
-        raise ValueError(
-            f"--eval-episode-ids contains ineligible ids: {sorted(eval_set - eligible)}"
-        )
+        raise ValueError(f"--eval-episode-ids contains ineligible ids: {sorted(eval_set - eligible)}")
 
     columns = _column_names(source)
     task_key = next((key for key in ("libero/task_id", "task_id") if key in columns), None)
@@ -558,7 +560,7 @@ def _selected_episode_ids_by_task_ratio(
         raise ValueError("No episodes found for task-stratified split.")
 
     total = sum(len(ids) for ids in groups.values())
-    eval_total = max(1, int(round(total * float(eval_ratio)))) if total > 1 else 0
+    eval_total = 0 if eval_ratio == 0 or total <= 1 else max(1, int(round(total * float(eval_ratio))))
     quotas = {task_id: len(ids) * float(eval_ratio) for task_id, ids in groups.items()}
     eval_counts = {task_id: int(np.floor(quota)) for task_id, quota in quotas.items()}
     remaining = eval_total - sum(eval_counts.values())
@@ -609,9 +611,7 @@ def _apply_mask(
         raise ValueError(f"mask_type={mask_type!r} requires retain_ratio.")
     if retain_ratio is not None and not 0.0 <= float(retain_ratio) <= 1.0:
         raise ValueError(f"retain_ratio must be in [0, 1], got {retain_ratio}.")
-    if mask_type in MASK_TYPES_REQUIRING_SEQ_LEN and (
-        mask_seq_len is None or int(mask_seq_len) <= 0
-    ):
+    if mask_type in MASK_TYPES_REQUIRING_SEQ_LEN and (mask_seq_len is None or int(mask_seq_len) <= 0):
         raise ValueError(f"mask_type={mask_type!r} requires a positive mask_seq_len.")
 
     n, _ = action.shape
@@ -632,18 +632,19 @@ def _apply_mask(
         mask[idx[0], :] = 1.0
         mask[idx[1:4], :3] = 1.0
     elif mask_type == "2D_partial_trajectory":
+        assert mask_seq_len is not None
         if int(mask_seq_len) >= n:
-            raise ValueError(
-                f"mask_seq_len ({mask_seq_len}) must be smaller than trajectory length ({n})."
-            )
+            raise ValueError(f"mask_seq_len ({mask_seq_len}) must be smaller than trajectory length ({n}).")
         start = int(rng.integers(0, n - int(mask_seq_len) + 1))
         mask[start : start + int(mask_seq_len), :2] = 1.0
     elif mask_type in {"pose", "pose_motion_planning"}:
+        assert retain_ratio is not None
         keep = int(n * float(retain_ratio))
         idx = np.arange(n)
         rng.shuffle(idx)
         mask[idx[:keep], :] = 1.0
     elif mask_type == "random_mask":
+        assert retain_ratio is not None
         total = action.size
         keep = int(total * float(retain_ratio))
         if keep > 0:
@@ -651,20 +652,21 @@ def _apply_mask(
             rng.shuffle(idx)
             mask.reshape(-1)[idx[:keep]] = 1.0
     elif mask_type == "3D_points":
+        assert retain_ratio is not None
         keep = int(n * float(retain_ratio))
         idx = np.arange(n)
         rng.shuffle(idx)
         mask[idx[:keep], :3] = 1.0
     elif mask_type == "points":
+        assert retain_ratio is not None
         keep = int(n * float(retain_ratio))
         idx = np.arange(n)
         rng.shuffle(idx)
         mask[idx[:keep], :2] = 1.0
     elif mask_type == "local_planner":
+        assert mask_seq_len is not None
         if int(mask_seq_len) >= n:
-            raise ValueError(
-                f"mask_seq_len ({mask_seq_len}) must be smaller than trajectory length ({n})."
-            )
+            raise ValueError(f"mask_seq_len ({mask_seq_len}) must be smaller than trajectory length ({n}).")
         mask[:, :] = 1.0
         start = int(rng.integers(0, n - int(mask_seq_len) + 1))
         mask[start : start + int(mask_seq_len), :] = 0.0
@@ -698,6 +700,8 @@ def _patch_episode_metadata(root: Path, rows: dict[int, dict]) -> None:
             "libero/suite",
             "libero/task_id",
             "libero/task_name",
+            "libero/rollout_seed",
+            "libero/policy_checkpoint",
             "libero/source_episode_id",
             "libero/source_file",
             "libero/source_demo",
@@ -714,7 +718,7 @@ def _patch_episode_metadata(root: Path, rows: dict[int, dict]) -> None:
 def _copy_existing_split_for_remask(source_root: Path, output_root: Path) -> None:
     """Clone a materialized MAM split while avoiding another image decode/encode pass."""
 
-    source_data_root = (source_root.resolve() / "data")
+    source_data_root = source_root.resolve() / "data"
 
     def copy_file(source_path: str, destination_path: str) -> str:
         source = Path(source_path).resolve()
@@ -783,9 +787,7 @@ def _write_existing_split_with_new_masks(
             row_indices = np.flatnonzero(parquet_episode_ids == episode_id)
             mask_spec = assigned_mask_specs[episode_id][0]
             rng = np.random.default_rng(
-                np.random.SeedSequence(
-                    [int(args.split_seed), episode_id, int(mask_spec["mask_type_slot"])]
-                )
+                np.random.SeedSequence([int(args.split_seed), episode_id, int(mask_spec["mask_type_slot"])])
             )
             _, episode_mask = _apply_mask(
                 actions[row_indices],
@@ -815,13 +817,13 @@ def _write_existing_split_with_new_masks(
                 "mask_type_slot": int(mask_spec["mask_type_slot"]),
                 "retain_ratio": mask_spec["retain_ratio"],
                 "mask_seq_len": mask_spec["mask_seq_len"],
-                "libero/init_state_id": int(
-                    _row_get(source_row, "libero/init_state_id", episode_id)
-                ),
+                "libero/init_state_id": int(_row_get(source_row, "libero/init_state_id", episode_id)),
                 "libero/init_state": _as_float_list(_row_get(source_row, "libero/init_state")),
                 "libero/suite": _row_get(source_row, "libero/suite"),
                 "libero/task_id": _row_get(source_row, "libero/task_id"),
                 "libero/task_name": _row_get(source_row, "libero/task_name"),
+                "libero/rollout_seed": _row_get(source_row, "libero/rollout_seed"),
+                "libero/policy_checkpoint": _row_get(source_row, "libero/policy_checkpoint"),
                 "libero/source_episode_id": original_source_episode_id,
                 "libero/source_file": _row_get(source_row, "libero/source_file"),
                 "libero/source_demo": _row_get(source_row, "libero/source_demo"),
@@ -863,10 +865,7 @@ def _write_existing_split_with_new_masks(
 
     stats = dict(source.meta.stats or {})
     stats[MAM_MAS_ACTION_MASK] = aggregate_stats(
-        [
-            {MAM_MAS_ACTION_MASK: episode_mask_stats[episode_id]}
-            for episode_id in episode_ids
-        ]
+        [{MAM_MAS_ACTION_MASK: episode_mask_stats[episode_id]} for episode_id in episode_ids]
     )[MAM_MAS_ACTION_MASK]
     write_stats(stats, root)
 
@@ -995,6 +994,8 @@ def _write_split(
         suite = _row_get(source_row, "libero/suite")
         task_id = _row_get(source_row, "libero/task_id")
         task_name = _row_get(source_row, "libero/task_name")
+        rollout_seed = _row_get(source_row, "libero/rollout_seed")
+        policy_checkpoint = _row_get(source_row, "libero/policy_checkpoint")
         init_state = _as_float_list(_row_get(source_row, "libero/init_state"))
         denom = max(len(frames) - 1, 1)
 
@@ -1035,6 +1036,8 @@ def _write_split(
                 "libero/suite": None if suite is None else str(suite),
                 "libero/task_id": None if task_id is None else int(task_id),
                 "libero/task_name": None if task_name is None else str(task_name),
+                "libero/rollout_seed": None if rollout_seed is None else int(rollout_seed),
+                "libero/policy_checkpoint": (None if policy_checkpoint is None else str(policy_checkpoint)),
                 "libero/source_episode_id": int(original_source_episode_id),
                 "libero/source_file": _row_get(source_row, "libero/source_file"),
                 "libero/source_demo": _row_get(source_row, "libero/source_demo"),
@@ -1127,9 +1130,7 @@ def main() -> None:
     if input_manifest.get("relative_action_ready") is True:
         input_manifest = require_libero_v3_relative_ready_dataset(args.input_root)
     elif getattr(args, "allow_source_exclusions", False):
-        excluded_episode_ids = {
-            int(value) for value in input_manifest.get("unrepairable_episode_ids", [])
-        }
+        excluded_episode_ids = {int(value) for value in input_manifest.get("unrepairable_episode_ids", [])}
         valid_absolute_episode_ids = {
             int(value) for value in input_manifest.get("valid_absolute_episode_ids", [])
         }
@@ -1163,14 +1164,10 @@ def main() -> None:
     eval_mask_assign_mode = _resolve_mask_assign_mode(args, split="eval")
     input_repo_id = args.input_repo_id or _repo_id_from_root(args.input_root)
     source = LeRobotDataset(input_repo_id, root=args.input_root, return_uint8=True)
-    source_episode_ids = {
-        int(row["episode_index"]) for row in source.meta.episodes
-    }
+    source_episode_ids = {int(row["episode_index"]) for row in source.meta.episodes}
     if valid_absolute_episode_ids is not None:
         if valid_absolute_episode_ids | excluded_episode_ids != source_episode_ids:
-            raise ValueError(
-                "Replay-audit valid/excluded episode ids do not exactly cover source metadata."
-            )
+            raise ValueError("Replay-audit valid/excluded episode ids do not exactly cover source metadata.")
         if args.eval_per_task is None:
             raise ValueError(
                 "An excluded replay-audit source requires --eval-per-task for a task-balanced split."
@@ -1204,9 +1201,11 @@ def main() -> None:
         )
 
     train_root = args.output_root.with_name(f"{args.output_root.name}_train")
-    eval_root = args.output_root.with_name(f"{args.output_root.name}_eval")
+    eval_root = getattr(args, "eval_output_root", None) or args.output_root.with_name(
+        f"{args.output_root.name}_eval"
+    )
     train_repo = f"{args.output_repo_id}_train"
-    eval_repo = f"{args.output_repo_id}_eval"
+    eval_repo = getattr(args, "eval_output_repo_id", None) or f"{args.output_repo_id}_eval"
     if args.only_split in {"both", "train"}:
         _write_split(source, train_ids, train_root, train_repo, args)
     if eval_ids and args.only_split in {"both", "eval"}:

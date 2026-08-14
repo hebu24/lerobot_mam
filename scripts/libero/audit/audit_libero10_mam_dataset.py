@@ -352,9 +352,7 @@ def main() -> None:
             raise AssertionError(f"Train task counts mismatch: {train_counts}")
     else:
         assert source is not None
-        source_episode_ids = {
-            int(row["episode_index"]) for row in source.meta.episodes
-        }
+        source_episode_ids = {int(row["episode_index"]) for row in source.meta.episodes}
         if source_valid_episode_ids | source_excluded_episode_ids != source_episode_ids:
             raise AssertionError("Source valid/excluded ids do not exactly cover source metadata.")
         selected_sources = train_sources | eval_sources
@@ -365,9 +363,7 @@ def main() -> None:
                 f"Final split does not exactly cover valid source ids: missing={missing}, unexpected={unexpected}"
             )
         source_task_by_episode = {
-            int(row["episode_index"]): int(
-                _episode_value(row, ("libero/task_id", "task_id"))
-            )
+            int(row["episode_index"]): int(_episode_value(row, ("libero/task_id", "task_id")))
             for row in source.meta.episodes
         }
         valid_counts: dict[int, int] = {}

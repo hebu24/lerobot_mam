@@ -6,7 +6,7 @@ from lerobot.processor.libero_relative_action_processor import (
     eef_body_quaternion_to_controller_matrix,
     matrix_to_axis_angle,
 )
-from scripts.audit_libero_chunk_relative_oracle import EpisodeSpec, _run_oracle, parse_args
+from scripts.libero.audit.audit_libero_chunk_relative_oracle import EpisodeSpec, _run_oracle, parse_args
 
 
 class _ClosedLoopOracleEnv:
@@ -33,9 +33,7 @@ class _ClosedLoopOracleEnv:
     def step(self, action):
         self.position = np.asarray(action[:3], dtype=np.float32).copy()
         self.step_index += 1
-        return self._observation(), 0.0, self.step_index == 4, False, {
-            "is_success": self.step_index == 4
-        }
+        return self._observation(), 0.0, self.step_index == 4, False, {"is_success": self.step_index == 4}
 
 
 def test_oracle_cli_defaults_to_strict_no_post_hold(monkeypatch) -> None:

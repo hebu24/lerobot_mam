@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # Train one STPM progress model for each LIBERO-10 task. The output naming
-# matches scripts/run_mam_libero10_conda.sh.
+# matches scripts/libero/train/run_mam_libero10_conda.sh.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 cd "${REPO_ROOT}"
 
 export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"

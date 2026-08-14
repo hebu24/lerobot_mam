@@ -5,23 +5,23 @@ set -euo pipefail
 #
 # Common overrides:
 #   STEPS=100000 BATCH_SIZE=16 LEARNING_RATE=1e-4 \
-#     bash scripts/run_diffusion_libero10.sh
+#     bash scripts/libero/train/run_diffusion_libero10.sh
 #
 # Evaluation environment:
-#   EVAL_ENV_MODE=random bash scripts/run_diffusion_libero10.sh
+#   EVAL_ENV_MODE=random bash scripts/libero/train/run_diffusion_libero10.sh
 #   EVAL_ENV_MODE=random EVAL_START_SEED=100000 EVAL_N_EPISODES=50 \
-#     bash scripts/run_diffusion_libero10.sh
-#   EVAL_ENV_MODE=fixed bash scripts/run_diffusion_libero10.sh
+#     bash scripts/libero/train/run_diffusion_libero10.sh
+#   EVAL_ENV_MODE=fixed bash scripts/libero/train/run_diffusion_libero10.sh
 #
 # Resume:
 #   RESUME=true OUTPUT_DIR=outputs/train/diffusion_libero10_v3_full \
-#     STEPS=100000 bash scripts/run_diffusion_libero10.sh
+#     STEPS=100000 bash scripts/libero/train/run_diffusion_libero10.sh
 #
 # Print the command without using the GPU:
-#   DRY_RUN=true bash scripts/run_diffusion_libero10.sh
+#   DRY_RUN=true bash scripts/libero/train/run_diffusion_libero10.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 cd "${REPO_ROOT}"
 
 # -----------------------------------------------------------------------------

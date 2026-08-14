@@ -3,11 +3,11 @@ set -euo pipefail
 
 # Multi-GPU launcher for MAM on LIBERO datasets.
 # The filename is kept for compatibility with existing local commands.
-# The dataset must be materialized with scripts/convert_libero_absolute_to_mam.py
+# The dataset must be materialized with scripts/libero/data/convert_libero_absolute_to_mam.py
 # so that mam.mas_action_absolute, mam.mas_action_mask, and mam.progress exist.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
 if [[ -z "${NUM_GPUS:-}" ]]; then

@@ -68,9 +68,7 @@ DEFAULT_ACTION_KEYS = ("actions", "action")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-dir", type=Path, default=Path("data/libero_10"))
-    parser.add_argument(
-        "--output-root", type=Path, default=Path("outputs/datasets/libero10_full_v3")
-    )
+    parser.add_argument("--output-root", type=Path, default=Path("outputs/datasets/libero10_full_v3"))
     parser.add_argument("--output-repo-id", default="local/libero10_full_v3")
     parser.add_argument("--suite", default="libero_10")
     parser.add_argument("--fps", type=int, default=30)
@@ -162,9 +160,7 @@ def _assign_demo_index_map(
     for hdf5_path in files:
         task = file_tasks[hdf5_path]
         matching_keys = [
-            key
-            for key in (str(task["task_id"]), hdf5_path.name, hdf5_path.stem)
-            if key in demo_index_map
+            key for key in (str(task["task_id"]), hdf5_path.name, hdf5_path.stem) if key in demo_index_map
         ]
         if len(matching_keys) > 1:
             raise ValueError(
@@ -186,8 +182,7 @@ def _assign_demo_index_map(
     unused_keys = sorted(set(demo_index_map) - consumed)
     if unused_keys:
         raise ValueError(
-            "Demo index map contains keys that did not match any resolved task/file: "
-            f"{unused_keys}."
+            f"Demo index map contains keys that did not match any resolved task/file: {unused_keys}."
         )
     return assigned
 
@@ -245,9 +240,9 @@ def _demo_groups(h5: h5py.File) -> list[tuple[str, h5py.Group]]:
         key=lambda item: (
             (
                 0,
-                int(re.search(r"\d+", item[0]).group(0)),
+                int(match.group(0)),
             )
-            if re.search(r"\d+", item[0])
+            if (match := re.search(r"\d+", item[0]))
             else (1, item[0])
         )
     )

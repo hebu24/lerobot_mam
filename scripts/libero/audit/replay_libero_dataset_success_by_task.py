@@ -27,7 +27,7 @@ from tqdm import tqdm
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+    return Path(__file__).resolve().parents[3]
 
 
 sys.path.insert(0, str(_repo_root() / "src"))
@@ -429,6 +429,7 @@ class _DirectReplayEnv:
         use_raw_init_state = refs[0].init_state is not None
         if any((ref.init_state is not None) != use_raw_init_state for ref in refs):
             raise ValueError(f"Task {suite_name}/{task_id} mixes raw init states and init state ids.")
+        self._init_state_values: list[np.ndarray] | None
         if use_raw_init_state:
             self._init_state_values = [
                 np.asarray(ref.init_state, dtype=np.float64).reshape(-1) for ref in refs

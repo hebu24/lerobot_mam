@@ -42,7 +42,7 @@ for gpu in 0 1 2 3 4 5; do
     EPOCHS=6 \
     STEPS= \
     VISION_CKPT=/cephfs/shared/Yanbang/maniskill/pretrained/clip-vit-base-patch32 \
-    bash scripts/train_stpm_libero10_v3_all.sh
+    bash scripts/libero/train/train_stpm_libero10_v3_all.sh
   ) >"${LOG_DIR}/gpu${gpu}_tasks_${tasks//,/_}.log" 2>&1 &
 done
 wait
@@ -88,20 +88,20 @@ Output prefix            stpm_libero10_v2_task    stpm_libero10_v3_large_d512_l4
 
 Best validation MSE comparison:
 
-| LIBERO-10 task | Baseline | Larger | Relative change |
-|---:|---:|---:|---:|
-| 0 | 0.00194768 | 0.00218154 | +12.01% |
-| 1 | 0.00220672 | 0.00172670 | -21.75% |
-| 2 | 0.00235228 | 0.00229707 | -2.35% |
-| 3 | 0.00285695 | 0.00300759 | +5.27% |
-| 4 | 0.00386689 | 0.00420679 | +8.79% |
-| 5 | 0.00293919 | 0.00231362 | -21.28% |
-| 6 | 0.00559830 | 0.00520008 | -7.11% |
-| 7 | 0.00234376 | 0.00224598 | -4.17% |
-| 8 | 0.00104366 | 0.00107031 | +2.55% |
-| 9 | 0.00111280 | 0.00142699 | +28.23% |
-| **Mean** | **0.00262682** | **0.00256767** | **-2.25%** |
-| **Median** | **0.00234802** | **0.00227152** | **-3.26%** |
+| LIBERO-10 task |       Baseline |         Larger | Relative change |
+| -------------: | -------------: | -------------: | --------------: |
+|              0 |     0.00194768 |     0.00218154 |         +12.01% |
+|              1 |     0.00220672 |     0.00172670 |         -21.75% |
+|              2 |     0.00235228 |     0.00229707 |          -2.35% |
+|              3 |     0.00285695 |     0.00300759 |          +5.27% |
+|              4 |     0.00386689 |     0.00420679 |          +8.79% |
+|              5 |     0.00293919 |     0.00231362 |         -21.28% |
+|              6 |     0.00559830 |     0.00520008 |          -7.11% |
+|              7 |     0.00234376 |     0.00224598 |          -4.17% |
+|              8 |     0.00104366 |     0.00107031 |          +2.55% |
+|              9 |     0.00111280 |     0.00142699 |         +28.23% |
+|       **Mean** | **0.00262682** | **0.00256767** |      **-2.25%** |
+|     **Median** | **0.00234802** | **0.00227152** |      **-3.26%** |
 
 The larger model improves five tasks and regresses five tasks. Its mean best
 validation MSE is 2.25% lower. The MAM run below intentionally uses all ten
@@ -214,7 +214,7 @@ RUN_ID="$(date +%Y%m%d_%H%M%S)"
 export JOB_NAME="mam_libero10_v3_relative_150k_6gpu_large_stpm_multirankeval_${RUN_ID}"
 export OUTPUT_DIR="outputs/train/${JOB_NAME}"
 
-bash scripts/run_mam_libero10_conda.sh \
+bash scripts/libero/train/run_mam_libero10_conda.sh \
   --policy.language_tokenizer_name=/cephfs/shared/Yanbang/maniskill/pretrained/clip-vit-base-patch32
 ```
 
@@ -232,7 +232,7 @@ startup:
 mkdir -p outputs/logs
 export MAM_LOG="outputs/logs/${JOB_NAME}.log"
 tmux new-session -d -s mam_large_stpm \
-  "bash scripts/run_mam_libero10_conda.sh \
+  "bash scripts/libero/train/run_mam_libero10_conda.sh \
     --policy.language_tokenizer_name=/cephfs/shared/Yanbang/maniskill/pretrained/clip-vit-base-patch32 \
     >'${MAM_LOG}' 2>&1"
 tmux attach -t mam_large_stpm
@@ -251,22 +251,22 @@ The mask configuration matches
 
 Training uses four slots in `composition` mode:
 
-| Slot | Mask type | Retain ratio | Episode composition |
-|---:|---|---:|---:|
-| 0 | `points` | 1.0 | 25% |
-| 1 | `3D_points` | 1.0 | 25% |
-| 2 | `3D_points` | 0.2 | 25% |
-| 3 | `pose_motion_planning` | 0.2 | 25% |
+| Slot | Mask type              | Retain ratio | Episode composition |
+| ---: | ---------------------- | -----------: | ------------------: |
+|    0 | `points`               |          1.0 |                 25% |
+|    1 | `3D_points`            |          1.0 |                 25% |
+|    2 | `3D_points`            |          0.2 |                 25% |
+|    3 | `pose_motion_planning` |          0.2 |                 25% |
 
 Evaluation uses five slots, each assigned to 20% of the fixed 50 episodes:
 
-| Slot | Mask type | Retain ratio | Episodes |
-|---:|---|---:|---:|
-| 0 | `points` | 1.0 | 10 |
-| 1 | `3D_points` | 1.0 | 10 |
-| 2 | `3D_points` | 0.2 | 10 |
-| 3 | `pose_motion_planning` | 0.2 | 10 |
-| 4 | `mix0` | n/a | 10 |
+| Slot | Mask type              | Retain ratio | Episodes |
+| ---: | ---------------------- | -----------: | -------: |
+|    0 | `points`               |          1.0 |       10 |
+|    1 | `3D_points`            |          1.0 |       10 |
+|    2 | `3D_points`            |          0.2 |       10 |
+|    3 | `pose_motion_planning` |          0.2 |       10 |
+|    4 | `mix0`                 |          n/a |       10 |
 
 Because the two `3D_points` settings share a mask type name, use
 `per_mask_slot_success` to read all five evaluation results independently.
@@ -279,7 +279,7 @@ separate directories.
 The reproducible launcher is:
 
 ```bash
-scripts/run_mam_libero10_refmask_6gpu.sh
+scripts/libero/train/run_mam_libero10_refmask_6gpu.sh
 ```
 
 It first creates:
@@ -314,7 +314,7 @@ tmux new-session -d -s mam_refmix \
     JOB_NAME='${JOB_NAME}' \
     OUTPUT_DIR='outputs/train/${JOB_NAME}' \
     PYTHONUNBUFFERED=1 \
-    bash scripts/run_mam_libero10_refmask_6gpu.sh \
+    bash scripts/libero/train/run_mam_libero10_refmask_6gpu.sh \
     >'${LOG_PATH}' 2>&1"
 ```
 

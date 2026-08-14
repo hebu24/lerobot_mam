@@ -1,6 +1,5 @@
 # Multi GPU
 
-
 ## 改动记录
 
 1. 训练入口继续复用 `src/lerobot/scripts/lerobot_train.py` 的 LeRobot 标准流程，不新增训练循环。
@@ -9,7 +8,7 @@
 4. 新增启动脚本：
 
 ```text
-scripts/train_diffusion_libero_put_bowl_on_plate_multigpu.sh
+scripts/libero/train/train_diffusion_libero_put_bowl_on_plate_multigpu.sh
 ```
 
 该脚本用 `uv run accelerate launch -m lerobot.scripts.lerobot_train` 启动训练，只负责多卡启动和 LIBERO put_bowl_on_plate diffusion baseline 默认参数。
@@ -28,7 +27,7 @@ uv sync --locked --extra training --extra diffusion --extra libero
 CUDA_VISIBLE_DEVICES=0,1 \
 NUM_GPUS=2 \
 OUTPUT_DIR=outputs/train/diffusion_libero_put_bowl_on_plate_multigpu \
-bash scripts/train_diffusion_libero_put_bowl_on_plate_multigpu.sh
+bash scripts/libero/train/train_diffusion_libero_put_bowl_on_plate_multigpu.sh
 ```
 
 默认训练数据：
@@ -48,7 +47,7 @@ SAVE_FREQ=10000 \
 LOG_FREQ=200 \
 MIXED_PRECISION=bf16 \
 OUTPUT_DIR=outputs/train/diffusion_libero_put_bowl_on_plate_4gpu \
-bash scripts/train_diffusion_libero_put_bowl_on_plate_multigpu.sh
+bash scripts/libero/train/train_diffusion_libero_put_bowl_on_plate_multigpu.sh
 ```
 
 说明：
@@ -60,7 +59,7 @@ bash scripts/train_diffusion_libero_put_bowl_on_plate_multigpu.sh
 - 继续传 CLI 参数会追加到训练命令末尾，例如：
 
 ```bash
-NUM_GPUS=2 bash scripts/train_diffusion_libero_put_bowl_on_plate_multigpu.sh \
+NUM_GPUS=2 bash scripts/libero/train/train_diffusion_libero_put_bowl_on_plate_multigpu.sh \
   --optimizer.lr=2e-4
 ```
 
@@ -77,7 +76,7 @@ EVAL_FREQ=5000 \
 ENV_TASK=libero_goal \
 ENV_TASK_IDS='[8]' \
 ENV_CONTROL_MODE=relative \
-bash scripts/train_diffusion_libero_put_bowl_on_plate_multigpu.sh
+bash scripts/libero/train/train_diffusion_libero_put_bowl_on_plate_multigpu.sh
 ```
 
 ## 可选：relative-action 版本
@@ -91,7 +90,7 @@ DATASET_REPO_ID=local/libero_put_bowl_on_plate_absolute \
 DATASET_ROOT=outputs/datasets/libero_put_bowl_on_plate_absolute \
 USE_RELATIVE_ACTIONS=true \
 OUTPUT_DIR=outputs/train/diffusion_relative_libero_put_bowl_on_plate_multigpu \
-bash scripts/train_diffusion_libero_put_bowl_on_plate_multigpu.sh
+bash scripts/libero/train/train_diffusion_libero_put_bowl_on_plate_multigpu.sh
 ```
 
 如果同时打开在线 eval，需额外设置 `ENV_CONTROL_MODE=absolute`。
