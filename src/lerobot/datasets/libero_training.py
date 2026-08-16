@@ -364,10 +364,9 @@ def validate_libero_v3_training_dataset(cfg: TrainPipelineConfig, dataset: Any) 
                 )
             if not getattr(active_cfg, "allow_independent_eval_source", False):
                 _validate_libero_split_provenance(train_manifest, eval_manifest)
-            elif (
-                train_manifest.get("source_root") == eval_manifest.get("source_root")
-                and train_manifest.get("source_repo_id") == eval_manifest.get("source_repo_id")
-            ):
+            elif train_manifest.get("source_root") == eval_manifest.get("source_root") and train_manifest.get(
+                "source_repo_id"
+            ) == eval_manifest.get("source_repo_id"):
                 raise ValueError(
                     "policy.allow_independent_eval_source=True requires train and eval to identify "
                     "different source datasets. Disable the override for a normal split."
@@ -404,4 +403,12 @@ def validate_libero_v3_training_dataset(cfg: TrainPipelineConfig, dataset: Any) 
             "Normal LIBERO v3 evaluation requires an absolute_to_mam/eval dataset "
             "with chunk-relative SE(3) policy actions."
         )
-    _validate_libero_split_provenance(train_manifest, eval_manifest)
+    if not getattr(cfg.eval, "allow_independent_source", False):
+        _validate_libero_split_provenance(train_manifest, eval_manifest)
+    elif train_manifest.get("source_root") == eval_manifest.get("source_root") and train_manifest.get(
+        "source_repo_id"
+    ) == eval_manifest.get("source_repo_id"):
+        raise ValueError(
+            "eval.allow_independent_source=True requires train and eval to identify "
+            "different source datasets. Disable the override for a normal split."
+        )

@@ -1,0 +1,5 @@
+assets: /cephfs/shared/Yanbang/lerobot/mam_lerobot0.5.1/lerobot_mam/.cache/libero/assets
+bddl_files: /cephfs/shared/Yanbang/envs/lerobot0.5.1/lib/python3.12/site-packages/libero/libero/bddl_files
+benchmark_root: /cephfs/shared/Yanbang/envs/lerobot0.5.1/lib/python3.12/site-packages/libero/libero
+datasets: /cephfs/shared/Yanbang/envs/lerobot0.5.1/lib/python3.12/site-packages/libero/datasets
+init_states: /cephfs/shared/Yanbang/envs/lerobot0.5.1/lib/python3.12/site-packages/libero/libero/init_files

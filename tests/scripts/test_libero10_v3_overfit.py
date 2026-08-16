@@ -557,6 +557,38 @@ def test_mam_training_preflight_rejects_independent_override_for_normal_split(tm
         validate_libero_v3_training_dataset(cfg, dataset)
 
 
+def test_dp_training_preflight_allows_opt_in_independent_eval_source(tmp_path):
+    train_root = tmp_path / "train"
+    eval_root = tmp_path / "eval"
+    _write_mam_manifest(train_root, "train")
+    _write_mam_manifest(eval_root, "eval")
+    eval_manifest_path = eval_root / "meta" / "libero_pipeline.json"
+    payload = json.loads(eval_manifest_path.read_text())
+    payload["source_root"] = str(tmp_path / "independent_absolute")
+    payload["source_repo_id"] = "local/independent_absolute"
+    payload["source_episode_ids"] = [1, 2]
+    write_libero_pipeline_manifest(eval_root, payload)
+
+    cfg = _training_cfg(train_root, eval_root, overfit=False)
+    cfg.eval.allow_independent_source = True
+    dataset = SimpleNamespace(root=train_root, meta=SimpleNamespace(robot_type="libero"))
+
+    validate_libero_v3_training_dataset(cfg, dataset)
+
+
+def test_dp_training_preflight_rejects_independent_override_for_normal_split(tmp_path):
+    train_root = tmp_path / "train"
+    eval_root = tmp_path / "eval"
+    _write_mam_manifest(train_root, "train")
+    _write_mam_manifest(eval_root, "eval")
+    cfg = _training_cfg(train_root, eval_root, overfit=False)
+    cfg.eval.allow_independent_source = True
+    dataset = SimpleNamespace(root=train_root, meta=SimpleNamespace(robot_type="libero"))
+
+    with pytest.raises(ValueError, match="requires train and eval to identify different source datasets"):
+        validate_libero_v3_training_dataset(cfg, dataset)
+
+
 def test_training_preflight_allows_random_env_evaluation_without_eval_dataset(tmp_path):
     train_root = tmp_path / "train"
     _write_mam_manifest(train_root, "train")

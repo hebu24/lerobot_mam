@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Two-stage LIBERO-10 1k MAM training on one 4xA800 VM:
+# Two-stage LIBERO-10 1k MAM training. Defaults preserve the original
+# single-node 4xA800 protocol; topology checks and batch size can be overridden
+# for an equivalent-global-batch run on another VM.
 #   1. random_mask from scratch through global step 90k
 #   2. resume the new 90k checkpoint with the four-slot refmix composition
 #      through global step 180k
@@ -25,8 +27,8 @@ RANDOM_EVAL_ROOT="${RANDOM_EVAL_ROOT:-${REPO_ROOT}/data/hf_libero10_mam/libero10
 REFMIX_EVAL_ROOT="${REFMIX_EVAL_ROOT:-${REPO_ROOT}/data/libero10_mam/libero10_100first50_refmix_eval}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
-export NUM_GPUS=4
-export BATCH_SIZE=24
+export NUM_GPUS="${NUM_GPUS:-4}"
+export BATCH_SIZE="${BATCH_SIZE:-24}"
 export MIXED_PRECISION=bf16
 export NUM_WORKERS=8
 export PREFETCH_FACTOR=4
@@ -83,26 +85,36 @@ KEEP_ALL_CHECKPOINTS_AFTER_STEP=90000
 PHASE1_END_STEP=90000
 PHASE2_END_STEP=180000
 
-if [[ "$(hostname)" != "zhangchenyu4-0" && "${ALLOW_OTHER_HOST:-false}" != "true" ]]; then
-  echo "This run is reserved for the A800 VM zhangchenyu4-0; got $(hostname)." >&2
+EXPECTED_HOST="${EXPECTED_HOST:-zhangchenyu4-0}"
+EXPECTED_GPU_COUNT="${EXPECTED_GPU_COUNT:-4}"
+EXPECTED_GPU_NAME="${EXPECTED_GPU_NAME:-A800}"
+
+if [[ "$(hostname)" != "${EXPECTED_HOST}" && "${ALLOW_OTHER_HOST:-false}" != "true" ]]; then
+  echo "Expected host ${EXPECTED_HOST}; got $(hostname)." >&2
   exit 2
 fi
 
 mapfile -t gpu_names < <(nvidia-smi --query-gpu=name --format=csv,noheader)
-if (( ${#gpu_names[@]} != 4 )); then
-  echo "Expected exactly four GPUs, found ${#gpu_names[@]}." >&2
+if (( ${#gpu_names[@]} != EXPECTED_GPU_COUNT )); then
+  echo "Expected ${EXPECTED_GPU_COUNT} GPUs, found ${#gpu_names[@]}." >&2
   exit 2
 fi
 for gpu_name in "${gpu_names[@]}"; do
-  if [[ "${gpu_name}" != *A800* ]]; then
-    echo "Expected four A800 GPUs, found: ${gpu_names[*]}" >&2
+  if [[ -n "${EXPECTED_GPU_NAME}" && "${gpu_name}" != *"${EXPECTED_GPU_NAME}"* ]]; then
+    echo "Expected GPU names containing '${EXPECTED_GPU_NAME}', found: ${gpu_names[*]}" >&2
     exit 2
   fi
 done
 
+IFS=',' read -r -a visible_gpu_ids <<<"${CUDA_VISIBLE_DEVICES}"
+if (( ${#visible_gpu_ids[@]} != NUM_GPUS )); then
+  echo "NUM_GPUS=${NUM_GPUS}, but CUDA_VISIBLE_DEVICES exposes ${#visible_gpu_ids[@]} devices." >&2
+  exit 2
+fi
+
 active_gpu_pids="$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits | sed '/^[[:space:]]*$/d')"
 if [[ -n "${active_gpu_pids}" ]]; then
-  echo "A800 GPU(s) are already used by process(es): ${active_gpu_pids//$'\n'/, }" >&2
+  echo "GPU(s) are already used by process(es): ${active_gpu_pids//$'\n'/, }" >&2
   exit 2
 fi
 
