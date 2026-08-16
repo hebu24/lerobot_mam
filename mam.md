@@ -1,327 +1,114 @@
-# LIBERO-10 STPM and MAM training
+# MAM / STPM LIBERO-10 实验记录
 
-Run these commands on the 6-GPU VM:
+更新：2026-08-16。
 
-```bash
-ssh root@10.233.75.162
-cd /cephfs/shared/Yanbang/lerobot/mam_lerobot0.5.1/lerobot_mam
-```
+## 公共口径
 
-## Action representation
+- 数据动作：原始数据是 OSC pose absolute-goal；MAM 训练目标是 chunk-relative SE(3)。
+- 执行口径：`policy.use_relative_actions=true`，`ENV_CONTROL_MODE=absolute`。
+- LIBERO-10 默认时序：`n_obs_steps=2`，`horizon=32`，`n_action_steps=15`。
+- TopN 口径：按 eval checkpoint 的 overall SR 降序；同分取更早 step；`avg` 是 TopN 平均 SR。
 
-- The dataset stores OSC pose absolute-goal actions.
-- The MAM preprocessor converts each absolute action chunk to chunk-relative
-  SE(3), anchored at the latest observation state.
-- The MAM model is trained to predict normalized relative actions.
-- The postprocessor unnormalizes the prediction and converts it back to an
-  absolute-goal action chunk.
-- LIBERO must therefore use `ENV_CONTROL_MODE=absolute`.
+## STPM 版本
 
-Do not change `--policy.use_relative_actions=true` or
-`ENV_CONTROL_MODE=absolute`; the launcher validates this contract.
+| 名称              | 输出前缀                                                                  | 变量                             |
+| ----------------- | ------------------------------------------------------------------------- | -------------------------------- |
+| STPM v2 baseline  | `stpm_libero10_v2_task{0..9}`                                             | d256 / l2 / h4，6 epochs         |
+| STPM v3 large     | `stpm_libero10_v3_large_d512_l4_task{0..9}`                               | d512 / l4 / h8，6 epochs         |
+| STPM v4 Maniskill | `stpm_libero10_v4_maniskill_d768_l8_obs6_gap2_seed42_20260729_task{0..9}` | d768 / l8，obs=6，gap=2，seed=42 |
+| STPM v5           | `stpm_libero10_v5_d768_l8_obs6_gap2_seed0_6epoch_task{0..9}`              | d768 / l8，obs=6，gap=2，seed=0  |
+| STPM v6           | `stpm_libero10_v6_d544_l5_obs6_gap2_seed0_6epoch_task{0..9}`              | d544 / l5，obs=6，gap=2，seed=0  |
 
-## STPM baseline: 10 task-specific models, 6 epochs
+## Mask 口径
 
-The following command uses all 6 GPUs by assigning independent LIBERO-10
-tasks to single-GPU workers. STPM itself does not implement DDP or DeepSpeed.
+| 名称                  | Train mask                                                 | Eval mask       |
+| --------------------- | ---------------------------------------------------------- | --------------- |
+| `random`              | `random_mask`                                              | `random_mask`   |
+| `refmix train4/eval5` | `points`, `3D_points`, `3D_points`, `pose_motion_planning` | train4 + `mix0` |
 
-```bash
-cd /cephfs/shared/Yanbang/lerobot/mam_lerobot0.5.1/lerobot_mam
-export PATH=/cephfs/shared/Yanbang/envs/lerobot0.5.1/bin:$PATH
+## LIBERO-10 MAM 主实验
 
-RUN_ID="stpm_libero10_6epoch_$(date +%Y%m%d_%H%M%S)"
-LOG_DIR="outputs/logs/${RUN_ID}"
-mkdir -p "${LOG_DIR}"
+| 实验名                                                                                                                                | Train / Eval data                 | Mask                          | STPM         | MAS                  |      BS |           Steps | Top3 SR                              | Top5 SR                                                |
+| ------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- | ----------------------------- | ------------ | -------------------- | ------: | --------------: | ------------------------------------ | ------------------------------------------------------ |
+| `mam_libero10_v3_relative_150k_6gpu_large_stpm_multirankeval_20260726_161112`                                                         | 450 unfiltered / 50 eval          | random                        | v3 large     | short15, long32, d64 | 6×16=96 | stopped @117.6k | 60@100k, 58@75k, 56@115k; avg 58.0   | 60@100k, 58@75k, 56@115k, 54@85k, 54@90k; avg 56.4     |
+| `mam_libero10_v3_refmix_150k_6gpu_large_stpm_multirankeval_20260727_183201`                                                           | 450 refmix / 50 refmix            | refmix train4/eval5           | v3 large     | short15, long32, d64 | 6×16=96 |  stopped @85.2k | 52@55k, 44@70k, 42@35k; avg 46.0     | 52@55k, 44@70k, 42@35k, 40@45k, 40@50k; avg 43.6       |
+| `mam_libero10_v3_refmix_150k_6gpu_large_stpm_short0_long64_dim128_avgmse_seed1000_cudnnbench_multirankeval_20260728_142023`           | 450 refmix / 50 refmix            | refmix train4/eval5           | v3 large     | short0, long64, d128 | 6×16=96 |            200k | 78@100k, 76@115k, 76@165k; avg 76.7  | 78@100k, 76@115k, 76@165k, 76@185k, 76@190k; avg 76.4  |
+| `mam_libero10_v4_refmix_150k_4gpu_maniskill_stpm_d768_l8_obs6gap2_short0_long64_dim128_avgmse_seed1000_multirankeval_20260729_213200` | 450 refmix / 50 refmix            | refmix train4/eval5           | v4 Maniskill | short0, long64, d128 |     4×? |   stopped @1.2k | —                                    | —                                                      |
+| `mam_libero10_500train_100eval5ptask_150k_4gpu_maniskill_short0_long64_dim128_avgmse_seed1000_20260803_173414`                        | 500 train / first 50 of 100 eval  | random                        | v4 Maniskill | short0, long64, d128 | 4×12=48 |    stopped @95k | 56@90k, 50@70k, 48@55k; avg 51.3     | 56@90k, 50@70k, 48@55k, 48@80k, 44@60k; avg 49.2       |
+| `mam_libero10_refmix_train4_eval5_long64_avgmse_scratch_8gpu_20260805_125120`                                                         | 450 refmix / 50 refmix            | refmix train4/eval5           | v4 Maniskill | short0, long64, d128 | 8×12=96 | stopped @135.2k | 68@125k, 68@130k, 64@110k; avg 66.7  | 68@125k, 68@130k, 64@110k, 64@120k, 64@135k; avg 65.6  |
+| `mam_libero10_refmix_train4_eval5_long64_avgmse_resume090000_4gpu_20260805_125120`                                                    | 450 refmix / 50 refmix            | refmix train4/eval5           | v4 Maniskill | short0, long64, d128 | 4×24=96 |            150k | 78@145k, 74@110k, 74@140k; avg 75.3  | 78@145k, 74@110k, 74@140k, 70@105k, 70@125k; avg 73.2  |
+| `mam_libero10_500train_100first50eval_refmix_train4_eval5_long64_avgmse_scratch_8gpu_20260806_140235`                                 | 500 refmix / 50 refmix            | refmix train4/eval5           | v4 Maniskill | short0, long64, d128 | 8×12=96 |            150k | 60@120k, 58@150k, 54@125k; avg 57.3  | 60@120k, 58@150k, 54@125k, 52@115k, 52@130k; avg 55.2  |
+| `mam_libero10_500train_100first50eval_refmix_long64_avgmse_resume090000to180000_4gpu_20260806_140856`                                 | 500 refmix / 50 refmix            | refmix train4/eval5           | v4 Maniskill | short0, long64, d128 | 4×24=96 |            180k | 66@125k, 64@140k, 64@150k; avg 64.7  | 66@125k, 64@140k, 64@150k, 64@175k, 62@110k; avg 64.0  |
+| `mam_libero10_500train_100first50eval_refmix_train4_eval5_long64_avgmse_stpmv3_scratch_8gpu_200k_keep100k_20260807_222122`            | 500 refmix / 50 refmix            | refmix train4/eval5           | v3 large     | short0, long64, d128 | 8×12=96 |            200k | 56@55k, 56@120k, 56@135k; avg 56.0   | 56@55k, 56@120k, 56@135k, 56@155k, 56@170k; avg 56.0   |
+| `mam_libero10_500train_100first50eval_refmix_train4_eval5_long64_avgmse_stpmv3_scratch_8gpu_150k_keep100k_20260809_2049_b64_h32_a15`  | 500 refmix / 50 refmix            | refmix train4/eval5           | v3 large     | short0, long64, d128 |  8×8=64 | stopped @144.7k | 56@95k, 56@120k, 50@130k; avg 54.0   | 56@95k, 56@120k, 50@130k, 48@110k, 48@115k; avg 51.6   |
+| `mam_libero10_1k_random090k_refmix180k_6a10_20260813_133350`                                                                          | 1000 train / fixed 50 of 100 eval | random 0–90k → refmix 90–180k | v4 Maniskill | short0, long64, d128 | 6×16=96 |            180k | 100@150k, 98@170k, 94@130k; avg 97.3 | 100@150k, 98@170k, 94@130k, 94@135k, 94@145k; avg 96.0 |
 
-assignments=("8" "9" "0,5" "7,3" "2,6" "1,4")
-for gpu in 0 1 2 3 4 5; do
-  tasks="${assignments[$gpu]}"
-  (
-    CUDA_VISIBLE_DEVICES="${gpu}" \
-    TASK_IDS="${tasks}" \
-    EPOCHS=6 \
-    STEPS= \
-    VISION_CKPT=/cephfs/shared/Yanbang/maniskill/pretrained/clip-vit-base-patch32 \
-    bash scripts/libero/train/train_stpm_libero10_v3_all.sh
-  ) >"${LOG_DIR}/gpu${gpu}_tasks_${tasks//,/_}.log" 2>&1 &
-done
-wait
-```
+## 1k random → refmix 两阶段实验（2026-08-13）
 
-Expected outputs:
+- 实验：`mam_libero10_1k_random090k_refmix180k_6a10_20260813_133350`。
+- 硬件：单机 6×NVIDIA A10；每卡 batch 16，全局 batch 96。
+- 数据：每个 LIBERO-10 task 100 个训练 episode；固定评测每个 task 5 个 episode，共 50 个。
+- Phase 1：从头训练至 90k，train/eval 均使用 `random_mask`。
+- Phase 2：从 90k 恢复训练至 180k；训练使用 4-slot refmix，评测使用 5-slot refmix。
+- 模型：STPM v4 Maniskill；MAM `horizon=32`、`n_action_steps=15`、short0/long64/d128、average MSE。
+- 评测频率 5k，checkpoint 频率 10k；训练正常完成，无 traceback、OOM 或 NCCL 错误。
 
-```text
-outputs/train/stpm_libero10_v2_task0
-...
-outputs/train/stpm_libero10_v2_task9
-```
+总体 SR 曲线：
 
-Verify all final checkpoints:
+| Phase  | Step (k)                     | SR (%)                  |
+| ------ | ---------------------------- | ----------------------- |
+| random | 5, 10, 15, 20, 25, 30        | 0, 10, 30, 42, 32, 38   |
+| random | 35, 40, 45, 50, 55, 60       | 70, 60, 78, 78, 90, 74  |
+| random | 65, 70, 75, 80, 85, 90       | 86, 94, 84, 82, 82, 84  |
+| refmix | 95, 100, 105, 110, 115, 120  | 64, 84, 86, 88, 80, 88  |
+| refmix | 125, 130, 135, 140, 145, 150 | 86, 94, 94, 90, 94, 100 |
+| refmix | 155, 160, 165, 170, 175, 180 | 90, 94, 94, 98, 94, 92  |
 
-```bash
-for task_id in {0..9}; do
-  test -f "outputs/train/stpm_libero10_v2_task${task_id}/config.yaml"
-  test -f "outputs/train/stpm_libero10_v2_task${task_id}/checkpoints/reward_best.pt"
-  test -f "outputs/train/stpm_libero10_v2_task${task_id}/checkpoints/reward_final.pt"
-done
-echo "All STPM checkpoints are present."
-```
+Phase 2 Top5 checkpoint 及 5-slot SR（同分取更早 step）：
 
-These 10 models were completed on 2026-07-26. Re-running the command with the
-default `SKIP_EXISTING=true` skips directories containing `config.yaml` and
-`reward_best.pt`.
+| Rank | Step | Overall | points | 3D_points r1.0 | 3D_points r0.2 | pose r0.2 | mix0 |
+| ---: | ---: | ------: | -----: | -------------: | -------------: | --------: | ---: |
+|    1 | 150k |     100 |    100 |            100 |            100 |       100 |  100 |
+|    2 | 170k |      98 |    100 |            100 |             90 |       100 |  100 |
+|    3 | 130k |      94 |     90 |            100 |             80 |       100 |  100 |
+|    4 | 135k |      94 |     90 |            100 |            100 |        90 |   90 |
+|    5 | 145k |      94 |     90 |            100 |            100 |        90 |   90 |
 
-## Larger STPM comparison
+- 原始结果位于 `outputs/train/mam_libero10_1k_random090k_refmix180k_6a10_20260813_133350/`。
 
-The larger STPM changes only model capacity. It uses the same dataset,
-per-task train/validation split, batch size, learning rate, and six epochs:
+## 短跑 / 失败 / 无有效 eval 的 MAM run
 
-```text
-                         Baseline                 Larger
-d_model                  256                      512
-Transformer layers       2                        4
-Attention heads          4                        8
-Trainable parameters     2,111,745                14,198,273
-reward_best.pt           about 8.1 MiB            about 54.2 MiB
-Output prefix            stpm_libero10_v2_task    stpm_libero10_v3_large_d512_l4_task
-```
+| 实验名                                                                                                                              | 变量                                                | 状态                             |
+| ----------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- | -------------------------------- |
+| `mam_libero10_v3_relative_150k_6gpu_multirankeval_20260726_151842`                                                                  | likely random mask, baseline STPM                   | stopped @2.8k，无 eval           |
+| `mam_libero10_v3_refmix_150k_6gpu_large_stpm_short0_long64_dim128_multirankeval_20260728_135202`                                    | refmix, v3 large, weighted loss, short0/long64/d128 | stopped @600，无 eval            |
+| `mam_libero10_v3_refmix_150k_6gpu_large_stpm_short0_long64_dim128_avgmse_multirankeval_20260728_141120`                             | refmix, v3 large, avg MSE, short0/long64/d128       | stopped @200，无 eval            |
+| `mam_libero10_refmix_train4_eval5_long64_avgmse_resume090000_8gpu_20260805_123100`                                                  | refmix, v4 Maniskill, 8GPU resume                   | stopped @92k，无 eval            |
+| `mam_libero10_500train_100first50eval_refmix_long64_avgmse_resume090000to200000_8gpu_20260807_191320`                               | 500 refmix, v4 Maniskill, 8GPU resume               | stopped @97.2k，只有 95k eval=52 |
+| `mam_libero10_500train_100first50eval_refmix_train4_eval5_long64_avgmse_stpmv3_scratch_8gpu_200k_20260807_220649`                   | 500 refmix, v3 large                                | stopped @1.2k，无 eval           |
+| `mam_libero10_500train_100first50eval_refmix_train4_eval5_long64_avgmse_stpmv3_scratch_8gpu_150k_keep100k_20260809_2021`            | 500 refmix, v3 large                                | stopped @600，无 eval            |
+| `mam_libero10_500train_100first50eval_refmix_train4_eval5_long64_avgmse_stpmv3_scratch_8gpu_150k_keep100k_20260809_2034_b64_h16_a8` | 500 refmix, v3 large, h16/a8                        | stopped @2k，无 eval             |
 
-Best validation MSE comparison:
+## 单任务 MAM 输出
 
-| LIBERO-10 task |       Baseline |         Larger | Relative change |
-| -------------: | -------------: | -------------: | --------------: |
-|              0 |     0.00194768 |     0.00218154 |         +12.01% |
-|              1 |     0.00220672 |     0.00172670 |         -21.75% |
-|              2 |     0.00235228 |     0.00229707 |          -2.35% |
-|              3 |     0.00285695 |     0.00300759 |          +5.27% |
-|              4 |     0.00386689 |     0.00420679 |          +8.79% |
-|              5 |     0.00293919 |     0.00231362 |         -21.28% |
-|              6 |     0.00559830 |     0.00520008 |          -7.11% |
-|              7 |     0.00234376 |     0.00224598 |          -4.17% |
-|              8 |     0.00104366 |     0.00107031 |          +2.55% |
-|              9 |     0.00111280 |     0.00142699 |         +28.23% |
-|       **Mean** | **0.00262682** | **0.00256767** |      **-2.25%** |
-|     **Median** | **0.00234802** | **0.00227152** |      **-3.26%** |
+| 实验名                                                                        |              Data | Eval                 |       BS | MAS / action              | Top SR                  |
+| ----------------------------------------------------------------------------- | ----------------: | -------------------- | -------: | ------------------------- | ----------------------- |
+| `mam_libero_put_bowl_on_plate_80m_multigpu`                                   | 44 train / 5 eval | `libero_goal` task 8 |  4×16=64 | h16/a8, short8/long16/d64 | 80@5k                   |
+| `mam_libero_put_bowl_on_plate_80m_multigpu_20260628_004227`                   | 44 train / 5 eval | `libero_goal` task 8 | 4×32=128 | h16/a8, short8/long16/d64 | 100@10k/15k/20k/25k/40k |
+| `mam_libero_put_bowl_on_plate_80m_multigpu_20260628_000250` and log-only dirs |           unknown | none                 |  unknown | unknown                   | —                       |
+| `mam_long_window_comparison`                                                  |           unknown | none                 |  unknown | comparison artifact       | —                       |
 
-The larger model improves five tasks and regresses five tasks. Its mean best
-validation MSE is 2.25% lower. The MAM run below intentionally uses all ten
-larger STPM models, including the tasks that regressed.
+## 当前结论
 
-The larger checkpoints were completed and verified on 2026-07-26:
+- 当前固定 MAM 条件评测的最好结果：`mam_libero10_1k_random090k_refmix180k_6a10_20260813_133350`，Top1 `100%@150k`，Top5 avg `96.0`；这不是独立 autonomous test SR。
+- 该 run 先用 random mask 预训练 90k，再用 refmix 续训；150k 的五个 eval mask slot 均达到 100% SR。
+- 审计未发现 train/eval 完整轨迹直接重合，但当前评测使用同一 eval episode 的 masked expert plan，并在固定 50 条数据上反复选择 checkpoint；100% 存在明显的口径和选择偏差。
+- 旧的 450 refmix 最好结果为 Top1 `78%@100k`、Top5 avg `76.4`；1k 两阶段方案显著超过此前结果。
+- 旧的 500 refmix 最好 Top1 为 `66%@125k`；此前在 500 refmix 上 v3 large STPM 明显弱于 v4 Maniskill STPM。
+- short0 + long64 + average MSE 仍是目前表现最稳定的 MAM 配置。
 
-```bash
-for task_id in {0..9}; do
-  root="outputs/train/stpm_libero10_v3_large_d512_l4_task${task_id}"
-  test -f "${root}/config.yaml"
-  test -f "${root}/checkpoints/reward_best.pt"
-  test -f "${root}/checkpoints/reward_final.pt"
-done
-```
+## Metrics paths
 
-## Previous MAM run: stopped
-
-The random-mask-only run started on 2026-07-26 and was stopped on
-2026-07-27 at approximately step 117,600 so it could be replaced by the
-reference mixed-mask experiment:
-
-```text
-VM:         root@10.233.75.162
-tmux:       mam_large_stpm
-job:        mam_libero10_v3_relative_150k_6gpu_large_stpm_multirankeval_20260726_161112
-output:     outputs/train/mam_libero10_v3_relative_150k_6gpu_large_stpm_multirankeval_20260726_161112
-log:        outputs/logs/mam_libero10_v3_relative_150k_6gpu_large_stpm_multirankeval_20260726_161112.log
-STPM:       stpm_libero10_v3_large_d512_l4_task0 through task9
-```
-
-Attach with `tmux attach -t mam_large_stpm`. The first logged training metric
-at step 200 had loss 0.53186, gradient norm 2.847, and warmup learning rate
-2.01e-5.
-
-Reviewed settings:
-
-- 6 A10 GPUs, batch size 16 per GPU, effective batch size 96.
-- BF16 mixed precision.
-- 293M trainable parameters with U-Net dimensions 512/1024/2048.
-- 150,000 optimizer steps.
-- Save every 10,000 steps and run fixed 50-episode LIBERO-10 evaluation every
-  5,000 steps. This gives 30 evaluations through the final 150,000-step
-  checkpoint.
-- Evaluation also uses all 6 GPUs. The ten tasks are assigned to ranks as
-  `[0,6]`, `[1,7]`, `[2,8]`, `[3,9]`, `[4]`, and `[5]`; with five episodes per
-  task, the per-rank loads are `10/10/10/10/5/5`. A full evaluation is expected
-  to take roughly 10 minutes when rollouts reach their time limit.
-- Weighted mask loss with known-region weight 0.2.
-- 32-step prediction horizon and 15 executed actions per inference call.
-- Local CLIP tokenizer path is required because the launcher runs offline and
-  the Hub tokenizer is not present in the configured HF cache.
-- The target VM's complete LIBERO simulator assets are in
-  `/root/.cache/libero/assets`; the repository-local default path is absent.
-
-Start training:
-
-```bash
-cd /cephfs/shared/Yanbang/lerobot/mam_lerobot0.5.1/lerobot_mam
-
-export CONDA_PREFIX=/root/miniconda3
-export CONDA_ENV_PATH=/cephfs/shared/Yanbang/envs/lerobot0.5.1
-export LIBERO_ASSETS_PATH=/root/.cache/libero/assets
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
-export NUM_GPUS=6
-
-export DATASET_REPO_ID=local/libero10_mam_v3_unfiltered_train
-export DATASET_ROOT=outputs/datasets/libero10_mam_v3_unfiltered_train
-export MAM_EVAL_DATASET_REPO_ID=local/libero10_mam_v3_unfiltered_eval
-export MAM_EVAL_DATASET_ROOT=outputs/datasets/libero10_mam_v3_unfiltered_eval
-export STPM_BASE_DIR=outputs/train
-export STPM_NAME_PREFIX=stpm_libero10_v3_large_d512_l4_task
-
-export STEPS=150000
-export BATCH_SIZE=16
-export NUM_WORKERS=8
-export PREFETCH_FACTOR=4
-export PERSISTENT_WORKERS=true
-export MIXED_PRECISION=bf16
-
-export ENABLE_EVAL=true
-export EVAL_FREQ=5000
-export SAVE_FREQ=10000
-export LOG_FREQ=200
-export EVAL_N_EPISODES=50
-export EVAL_BATCH_SIZE=1
-export EVAL_USE_ASYNC_ENVS=false
-export ENV_TASK=libero_10
-export ENV_TASK_IDS='[0,1,2,3,4,5,6,7,8,9]'
-export ENV_CONTROL_MODE=absolute
-export ENV_OBSERVATION_HEIGHT=128
-export ENV_OBSERVATION_WIDTH=128
-export ENV_MAX_PARALLEL_TASKS=1
-
-export LEARNING_RATE=1e-4
-export WEIGHT_DECAY=1e-6
-export WARMUP_STEPS=500
-export GRAD_CLIP_NORM=10.0
-export MASK_TYPE=random_mask
-export MASK_LOSS_MODE=weighted
-export MASK_KNOWN_REGION_WEIGHT=0.2
-export MASK_INPAINTING=false
-export MASK_PADDING_LOSS=true
-export DO_MASK_LOSS_FOR_PADDING=true
-export PRETRAINED_BACKBONE_WEIGHTS=null
-export PUSH_TO_HUB=false
-export WANDB_ENABLE=false
-
-RUN_ID="$(date +%Y%m%d_%H%M%S)"
-export JOB_NAME="mam_libero10_v3_relative_150k_6gpu_large_stpm_multirankeval_${RUN_ID}"
-export OUTPUT_DIR="outputs/train/${JOB_NAME}"
-
-bash scripts/libero/train/run_mam_libero10_conda.sh \
-  --policy.language_tokenizer_name=/cephfs/shared/Yanbang/maniskill/pretrained/clip-vit-base-patch32
-```
-
-The launcher maps all ten STPM roots from
-`outputs/train/stpm_libero10_v3_large_d512_l4_task0` through `task9`. Its
-preflight checks the train/eval manifests, relative-action statistics,
-source-episode separation, mask type, controller mode, and STPM artifacts
-before starting.
-
-Run the final command in a detached tmux session. Keep the log outside
-`OUTPUT_DIR` because the training config requires `OUTPUT_DIR` not to exist at
-startup:
-
-```bash
-mkdir -p outputs/logs
-export MAM_LOG="outputs/logs/${JOB_NAME}.log"
-tmux new-session -d -s mam_large_stpm \
-  "bash scripts/libero/train/run_mam_libero10_conda.sh \
-    --policy.language_tokenizer_name=/cephfs/shared/Yanbang/maniskill/pretrained/clip-vit-base-patch32 \
-    >'${MAM_LOG}' 2>&1"
-tmux attach -t mam_large_stpm
-```
-
-## MAM reference mixed-mask restart: 150,000 steps on 6 GPUs
-
-Only the mask dataset configuration changes. Model size, larger STPM models,
-optimizer, learning-rate schedule, batch size, six-GPU DDP, BF16, seed,
-training steps, save/eval frequency, loss settings, inpainting setting,
-relative-action representation, and LIBERO evaluation settings remain exactly
-the same as the previous run.
-
-The mask configuration matches
-`rgb_newnew_LiftPegUpright_500demo_points1(25%)_3D_points1(25%)_3D_points0.2(25%)_pose0.2(25%)_long32-128_evalAll`.
-
-Training uses four slots in `composition` mode:
-
-| Slot | Mask type              | Retain ratio | Episode composition |
-| ---: | ---------------------- | -----------: | ------------------: |
-|    0 | `points`               |          1.0 |                 25% |
-|    1 | `3D_points`            |          1.0 |                 25% |
-|    2 | `3D_points`            |          0.2 |                 25% |
-|    3 | `pose_motion_planning` |          0.2 |                 25% |
-
-Evaluation uses five slots, each assigned to 20% of the fixed 50 episodes:
-
-| Slot | Mask type              | Retain ratio | Episodes |
-| ---: | ---------------------- | -----------: | -------: |
-|    0 | `points`               |          1.0 |       10 |
-|    1 | `3D_points`            |          1.0 |       10 |
-|    2 | `3D_points`            |          0.2 |       10 |
-|    3 | `pose_motion_planning` |          0.2 |       10 |
-|    4 | `mix0`                 |          n/a |       10 |
-
-Because the two `3D_points` settings share a mask type name, use
-`per_mask_slot_success` to read all five evaluation results independently.
-
-The old MAM datasets preserve the complete absolute actions, so remasking
-reuses the original 450/50 source split and changes only
-`mam.mas_action_mask`. The new datasets and old checkpoints are kept in
-separate directories.
-
-The reproducible launcher is:
-
-```bash
-scripts/libero/train/run_mam_libero10_refmask_6gpu.sh
-```
-
-It first creates:
-
-```text
-data/libero10_mam/libero10_mam_v3_refmix_train
-data/libero10_mam/libero10_mam_v3_refmix_eval
-```
-
-and then launches the unchanged six-GPU training configuration.
-
-Active restart:
-
-```text
-VM:         root@10.233.75.162
-tmux:       mam_refmix
-job:        mam_libero10_v3_refmix_150k_6gpu_large_stpm_multirankeval_20260727_183201
-output:     outputs/train/mam_libero10_v3_refmix_150k_6gpu_large_stpm_multirankeval_20260727_183201
-log:        outputs/logs/mam_libero10_v3_refmix_150k_6gpu_large_stpm_multirankeval_20260727_183201.log
-```
-
-Start a new run manually:
-
-```bash
-cd /cephfs/shared/Yanbang/lerobot/mam_lerobot0.5.1/lerobot_mam
-RUN_ID="$(date +%Y%m%d_%H%M%S)"
-JOB_NAME="mam_libero10_v3_refmix_150k_6gpu_large_stpm_multirankeval_${RUN_ID}"
-LOG_PATH="outputs/logs/${JOB_NAME}.log"
-
-tmux new-session -d -s mam_refmix \
-  "cd '$PWD' && exec env \
-    JOB_NAME='${JOB_NAME}' \
-    OUTPUT_DIR='outputs/train/${JOB_NAME}' \
-    PYTHONUNBUFFERED=1 \
-    bash scripts/libero/train/run_mam_libero10_refmask_6gpu.sh \
-    >'${LOG_PATH}' 2>&1"
-```
-
-Monitor it with:
-
-```bash
-tmux attach -t mam_refmix
-tail -f outputs/logs/mam_libero10_v3_refmix_150k_6gpu_large_stpm_multirankeval_20260727_183201.log
-nvidia-smi
-```
+- MAM eval：`outputs/train/<实验名>/logs/eval_metrics.jsonl`
+- MAM train：`outputs/train/<实验名>/logs/train_metrics.jsonl`
+- checkpoint：`outputs/train/<实验名>/checkpoints/{best,last}`

@@ -127,6 +127,7 @@ RESUME="${RESUME:-false}"
 RESUME_CONFIG_PATH="${RESUME_CONFIG_PATH:-${OUTPUT_DIR}/checkpoints/last/pretrained_model/train_config.json}"
 REQUIRE_FULL_DATASET="${REQUIRE_FULL_DATASET:-true}"
 REQUIRE_IDLE_GPU="${REQUIRE_IDLE_GPU:-true}"
+ALLOW_INDEPENDENT_EVAL_SOURCE="${ALLOW_INDEPENDENT_EVAL_SOURCE:-false}"
 MIN_FREE_GB="${MIN_FREE_GB:-20}"
 DRY_RUN="${DRY_RUN:-false}"
 
@@ -149,6 +150,7 @@ is_bool() {
 
 for value_name in \
   ENABLE_EVAL RESUME REQUIRE_FULL_DATASET REQUIRE_IDLE_GPU DRY_RUN \
+  ALLOW_INDEPENDENT_EVAL_SOURCE \
   UNET_USE_FILM_SCALE_MODULATION DIT_USE_POSITIONAL_ENCODING DIT_USE_ROPE; do
   value="${!value_name}"
   if ! is_bool "${value}"; then
@@ -245,7 +247,8 @@ fi
 # trajectories, with exactly five eval trajectories per task.
 uv run python - \
   "${DATASET_ROOT}" "${EVAL_DATASET_ROOT}" "${REQUIRE_FULL_DATASET}" \
-  "${EVAL_ENV_MODE}" "${N_OBS_STEPS}" "${HORIZON}" "${EVAL_N_EPISODES}" <<'PY'
+  "${EVAL_ENV_MODE}" "${N_OBS_STEPS}" "${HORIZON}" "${EVAL_N_EPISODES}" \
+  "${ALLOW_INDEPENDENT_EVAL_SOURCE}" <<'PY'
 import json
 import sys
 from collections import Counter
@@ -335,17 +338,38 @@ if sys.argv[4] in {"random", "official"}:
     raise SystemExit(0)
 
 eval_info, eval_manifest, eval_sources, eval_counts = read_dataset(sys.argv[2], "eval")
-overlap = train_sources & eval_sources
-if overlap:
-    raise SystemExit(f"Train/eval source leakage detected: {sorted(overlap)[:10]}")
+train_source_root = train_manifest.get("source_root")
+eval_source_root = eval_manifest.get("source_root")
+train_source_repo = train_manifest.get("source_repo_id")
+eval_source_repo = eval_manifest.get("source_repo_id")
+same_source = bool(
+    train_source_root
+    and eval_source_root
+    and Path(train_source_root).resolve() == Path(eval_source_root).resolve()
+    and train_source_repo
+    and train_source_repo == eval_source_repo
+)
+allow_independent_source = sys.argv[8] == "true"
+if same_source:
+    if allow_independent_source:
+        raise SystemExit(
+            "ALLOW_INDEPENDENT_EVAL_SOURCE=true requires train and eval to identify "
+            "different source datasets"
+        )
+    overlap = train_sources & eval_sources
+    if overlap:
+        raise SystemExit(f"Train/eval source leakage detected: {sorted(overlap)[:10]}")
+elif not allow_independent_source:
+    raise SystemExit(
+        "Train/eval manifests do not identify the same source dataset; set "
+        "ALLOW_INDEPENDENT_EVAL_SOURCE=true only for an audited independent eval source"
+    )
 
 if sys.argv[3] == "true":
     expected_eval = {task: 5 for task in range(10)}
     if dict(eval_counts) != expected_eval:
         raise SystemExit(f"Eval is not the full 5/task source split: {dict(sorted(eval_counts.items()))}")
-    train_source_root = train_manifest.get("source_root")
-    eval_source_root = eval_manifest.get("source_root")
-    if not train_source_root or train_source_root != eval_source_root:
+    if not same_source:
         raise SystemExit(
             f"Train/eval source roots differ or are missing: {train_source_root!r}, {eval_source_root!r}"
         )
@@ -471,6 +495,7 @@ else
     --log_freq="${LOG_FREQ}"
     --seed="${SEED}"
     --cudnn_deterministic="${CUDNN_DETERMINISTIC}"
+    --eval.allow_independent_source="${ALLOW_INDEPENDENT_EVAL_SOURCE}"
     --wandb.enable="${WANDB_ENABLE}"
   )
   if [[ "${DENOISER_TYPE}" == "unet" ]]; then

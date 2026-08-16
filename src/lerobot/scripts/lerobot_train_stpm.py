@@ -4,10 +4,12 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 from pathlib import Path
 
 import torch
 import torch.nn.functional as functional
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
@@ -34,6 +36,24 @@ def parse_args() -> argparse.Namespace:
         help="If set, overrides --steps with len(train_loader) * epochs.",
     )
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-2)
+    parser.add_argument("--adam_beta1", type=float, default=0.9)
+    parser.add_argument("--adam_beta2", type=float, default=0.999)
+    parser.add_argument("--adam_eps", type=float, default=1e-8)
+    parser.add_argument("--warmup_steps", type=int, default=0)
+    parser.add_argument(
+        "--scheduler_total_steps",
+        type=int,
+        default=0,
+        help="Warmup/cosine scheduler horizon. Set to 0 to disable scheduling.",
+    )
+    parser.add_argument(
+        "--grad_clip_norm",
+        type=float,
+        default=0.0,
+        help="Maximum gradient norm. Set to 0 to disable clipping.",
+    )
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--require_cuda", action="store_true")
@@ -188,6 +208,30 @@ def _masked_mse_loss(
     return functional.mse_loss(prediction[valid], target[valid])
 
 
+def _endpoint_mse_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Return MSE at each sequence's last valid (rollout anchor) timestep."""
+    if prediction.shape != target.shape or prediction.ndim != 2:
+        raise ValueError(
+            "STPM prediction and target must have matching (B,T) shapes, got "
+            f"{tuple(prediction.shape)} and {tuple(target.shape)}."
+        )
+    lengths = lengths.to(device=prediction.device, dtype=torch.long)
+    if lengths.shape != (prediction.shape[0],):
+        raise ValueError(f"lengths must be (B,), got {tuple(lengths.shape)}.")
+    if torch.any(lengths <= 0) or torch.any(lengths > prediction.shape[1]):
+        raise ValueError(f"lengths must be in [1, {prediction.shape[1]}], got {lengths.tolist()}.")
+    endpoint_indices = lengths - 1
+    batch_indices = torch.arange(prediction.shape[0], device=prediction.device)
+    return functional.mse_loss(
+        prediction[batch_indices, endpoint_indices],
+        target[batch_indices, endpoint_indices],
+    )
+
+
 def _resolve_device(device_arg: str, require_cuda: bool) -> torch.device:
     device = torch.device(device_arg)
     if require_cuda and device.type != "cuda":
@@ -207,7 +251,7 @@ def _load_reward_checkpoint(
     *,
     allow_partial: bool,
 ) -> None:
-    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=True)
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
     if not isinstance(state_dict, dict):
         raise TypeError(f"STPM checkpoint must contain a state dict, got {type(state_dict).__name__}.")
@@ -245,6 +289,10 @@ def _encode_images_in_chunks(
 
 def main() -> None:
     args = parse_args()
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     device = _resolve_device(args.device, args.require_cuda)
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
@@ -269,6 +317,7 @@ def main() -> None:
     train_set, val_set, train_episode_ids, val_episode_ids, split_identity = _split_dataset_by_episode(
         dataset,
         args.val_ratio,
+        seed=args.seed,
     )
     train_indices = list(train_set.indices)
     all_states = _load_all_states(dataset, train_indices)
@@ -349,7 +398,49 @@ def main() -> None:
         )
     state_mean = all_states.reshape(-1, all_states.shape[-1]).mean(dim=0).to(device)
     state_std = all_states.reshape(-1, all_states.shape[-1]).std(dim=0).clamp_min(1e-6).to(device)
-    optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optim = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        betas=(args.adam_beta1, args.adam_beta2),
+        eps=args.adam_eps,
+        weight_decay=args.weight_decay,
+    )
+    scheduler = None
+    if args.scheduler_total_steps < 0:
+        raise ValueError(f"--scheduler_total_steps must be non-negative, got {args.scheduler_total_steps}.")
+    if args.warmup_steps < 0:
+        raise ValueError(f"--warmup_steps must be non-negative, got {args.warmup_steps}.")
+    if args.scheduler_total_steps > 0:
+        if args.warmup_steps >= args.scheduler_total_steps:
+            raise ValueError(
+                "--warmup_steps must be smaller than --scheduler_total_steps, got "
+                f"{args.warmup_steps} and {args.scheduler_total_steps}."
+            )
+        if args.warmup_steps > 0:
+            if args.lr <= 0:
+                raise ValueError(f"--lr must be positive when warmup is enabled, got {args.lr}.")
+            warmup = LinearLR(
+                optim,
+                start_factor=1e-6 / args.lr,
+                end_factor=1.0,
+                total_iters=args.warmup_steps,
+            )
+            cosine = CosineAnnealingLR(
+                optim,
+                T_max=args.scheduler_total_steps - args.warmup_steps,
+                eta_min=0.0,
+            )
+            scheduler = SequentialLR(
+                optim,
+                schedulers=[warmup, cosine],
+                milestones=[args.warmup_steps],
+            )
+        else:
+            scheduler = CosineAnnealingLR(
+                optim,
+                T_max=args.scheduler_total_steps,
+                eta_min=0.0,
+            )
 
     cfg = {
         "repo_id": args.repo_id,
@@ -364,7 +455,7 @@ def main() -> None:
         "train_episode_ids": train_episode_ids,
         "val_episode_ids": val_episode_ids,
         "split_identity": split_identity,
-        "split_seed": 0,
+        "split_seed": args.seed,
         "steps": total_steps,
         "epochs": args.epochs,
         "steps_per_epoch": steps_per_epoch,
@@ -372,6 +463,14 @@ def main() -> None:
         "val_len": val_len,
         "batch_size": args.batch_size,
         "val_ratio": args.val_ratio,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "adam_betas": [args.adam_beta1, args.adam_beta2],
+        "adam_eps": args.adam_eps,
+        "warmup_steps": args.warmup_steps,
+        "scheduler_total_steps": args.scheduler_total_steps,
+        "grad_clip_norm": args.grad_clip_norm,
+        "seed": args.seed,
         "task_description": "",
         "task_source": "dataset",
         "state_norm_path": str(state_norm_path),
@@ -383,11 +482,18 @@ def main() -> None:
         "reward_ckpt": str(args.reward_ckpt) if args.reward_ckpt is not None else "",
         "clip_encode_batch_size": args.clip_encode_batch_size,
         "architecture_version": RewardTransformer.ARCHITECTURE_VERSION,
+        "checkpoint_selection": {
+            "reward_best.pt": "validation_sequence_mse",
+            "reward_best_endpoint.pt": "validation_endpoint_mse",
+        },
     }
     with open(args.output_dir / "config.yaml", "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
 
     best_val = float("inf")
+    best_endpoint_val = float("inf")
+    final_val = float("inf")
+    final_endpoint_val = float("inf")
     loader_iter = iter(train_loader)
     pbar = tqdm(range(total_steps), desc="STPM")
     for step in pbar:
@@ -414,14 +520,22 @@ def main() -> None:
         loss = _masked_mse_loss(pred, targets, lengths)
         optim.zero_grad()
         loss.backward()
+        if args.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
         optim.step()
+        if scheduler is not None:
+            scheduler.step()
         pbar.set_postfix(loss=float(loss.item()))
 
         if step % 500 == 0 or step == total_steps - 1:
             val_loss = float(loss.item())
+            endpoint_val_loss = float(_endpoint_mse_loss(pred, targets, lengths).item())
             if val_loader is not None:
                 model.eval()
-                losses = []
+                sequence_squared_error = 0.0
+                sequence_count = 0
+                endpoint_squared_error = 0.0
+                endpoint_count = 0
                 with torch.no_grad():
                     for val_batch in val_loader:
                         images = val_batch["image_frames"].to(device)
@@ -442,8 +556,28 @@ def main() -> None:
                         norm_state = (state - state_mean) / state_std
                         lengths = val_batch["lengths"].to(device)
                         prediction = model(img_emb, text_emb, norm_state, lengths)
-                        losses.append(_masked_mse_loss(prediction, targets, lengths).item())
-                val_loss = float(sum(losses) / max(len(losses), 1))
+                        valid = torch.arange(prediction.shape[1], device=device).unsqueeze(
+                            0
+                        ) < lengths.unsqueeze(1)
+                        sequence_squared_error += float(
+                            torch.square(prediction[valid] - targets[valid]).sum().item()
+                        )
+                        sequence_count += int(valid.sum().item())
+                        endpoint_indices = lengths - 1
+                        batch_indices = torch.arange(prediction.shape[0], device=device)
+                        endpoint_squared_error += float(
+                            torch.square(
+                                prediction[batch_indices, endpoint_indices]
+                                - targets[batch_indices, endpoint_indices]
+                            )
+                            .sum()
+                            .item()
+                        )
+                        endpoint_count += int(prediction.shape[0])
+                val_loss = sequence_squared_error / max(sequence_count, 1)
+                endpoint_val_loss = endpoint_squared_error / max(endpoint_count, 1)
+            final_val = val_loss
+            final_endpoint_val = endpoint_val_loss
             if val_loss <= best_val:
                 best_val = val_loss
                 torch.save(
@@ -452,15 +586,37 @@ def main() -> None:
                         "architecture_version": RewardTransformer.ARCHITECTURE_VERSION,
                         "step": step,
                         "val_loss": val_loss,
+                        "val_sequence_mse": val_loss,
+                        "val_endpoint_mse": endpoint_val_loss,
+                        "selection_metric": "validation_sequence_mse",
                     },
                     ckpt_dir / "reward_best.pt",
+                )
+            if endpoint_val_loss <= best_endpoint_val:
+                best_endpoint_val = endpoint_val_loss
+                torch.save(
+                    {
+                        "model": model.state_dict(),
+                        "architecture_version": RewardTransformer.ARCHITECTURE_VERSION,
+                        "step": step,
+                        "val_loss": val_loss,
+                        "val_sequence_mse": val_loss,
+                        "val_endpoint_mse": endpoint_val_loss,
+                        "selection_metric": "validation_endpoint_mse",
+                    },
+                    ckpt_dir / "reward_best_endpoint.pt",
                 )
     torch.save(
         {
             "model": model.state_dict(),
             "architecture_version": RewardTransformer.ARCHITECTURE_VERSION,
-            "step": total_steps,
-            "val_loss": best_val,
+            "step": total_steps - 1,
+            "val_loss": final_val,
+            "val_sequence_mse": final_val,
+            "val_endpoint_mse": final_endpoint_val,
+            "best_val_sequence_mse": best_val,
+            "best_val_endpoint_mse": best_endpoint_val,
+            "selection_metric": "final_training_step",
         },
         ckpt_dir / "reward_final.pt",
     )

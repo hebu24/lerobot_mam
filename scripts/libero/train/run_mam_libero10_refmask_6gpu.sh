@@ -82,9 +82,9 @@ fi
 
 export CONDA_PREFIX=/root/miniconda3
 export CONDA_ENV_PATH=/cephfs/shared/Yanbang/envs/lerobot0.5.1
-export LIBERO_ASSETS_PATH=/root/.cache/libero/assets
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
-export NUM_GPUS=6
+export LIBERO_ASSETS_PATH="${LIBERO_ASSETS_PATH:-${REPO_ROOT}/.cache/libero/assets}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}"
+export NUM_GPUS="${NUM_GPUS:-6}"
 
 export DATASET_REPO_ID="${TRAIN_REPO_ID}"
 export DATASET_ROOT="${TRAIN_ROOT}"
@@ -93,14 +93,17 @@ export MAM_EVAL_DATASET_ROOT="${EVAL_ROOT}"
 export TRAIN_MASK_TYPES
 export EVAL_MASK_TYPES
 export STPM_BASE_DIR=outputs/train
-export STPM_NAME_PREFIX=stpm_libero10_v3_large_d512_l4_task
+export STPM_NAME_PREFIX="${STPM_NAME_PREFIX:-stpm_libero10_v3_large_d512_l4_task}"
 
-export STEPS=150000
+export STEPS="${STEPS:-150000}"
 export BATCH_SIZE=16
 export NUM_WORKERS=8
 export PREFETCH_FACTOR=4
 export PERSISTENT_WORKERS=true
 export MIXED_PRECISION=bf16
+export SEED="${SEED:-1000}"
+# The training entry point enables cudnn.benchmark when this is false.
+export CUDNN_DETERMINISTIC="${CUDNN_DETERMINISTIC:-false}"
 
 export ENABLE_EVAL=true
 export EVAL_FREQ=5000
@@ -120,7 +123,7 @@ export LEARNING_RATE=1e-4
 export WEIGHT_DECAY=1e-6
 export WARMUP_STEPS=500
 export GRAD_CLIP_NORM=10.0
-export MASK_LOSS_MODE=weighted
+export MASK_LOSS_MODE="${MASK_LOSS_MODE:-weighted}"
 export MASK_KNOWN_REGION_WEIGHT=0.2
 export MASK_INPAINTING=false
 export MASK_PADDING_LOSS=true

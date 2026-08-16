@@ -77,6 +77,10 @@ class EvalConfig:
     dataset_repo_id: str | None = None
     dataset_root: str | None = None
     dataset_episodes: list[int] | None = None
+    # Opt in only when the fixed eval trajectories come from a separately
+    # provenance-tracked source dataset. The default keeps the stricter
+    # same-source, disjoint-source-ID validation.
+    allow_independent_source: bool = False
     # `batch_size` specifies the number of environments to use in a gym.vector.VectorEnv.
     # Set to 0 for auto-tuning based on available CPU cores and n_episodes.
     batch_size: int = 0

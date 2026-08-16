@@ -31,6 +31,14 @@ PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 EPOCHS="${EPOCHS:-2}"
 STEPS="${STEPS:-}"
 LEARNING_RATE="${LEARNING_RATE:-1e-4}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-1e-2}"
+ADAM_BETA1="${ADAM_BETA1:-0.9}"
+ADAM_BETA2="${ADAM_BETA2:-0.999}"
+ADAM_EPS="${ADAM_EPS:-1e-8}"
+WARMUP_STEPS="${WARMUP_STEPS:-0}"
+SCHEDULER_TOTAL_STEPS="${SCHEDULER_TOTAL_STEPS:-0}"
+GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-0}"
+SEED="${SEED:-0}"
 VAL_RATIO="${VAL_RATIO:-0.1}"
 DEVICE="${DEVICE:-cuda}"
 REQUIRE_CUDA="${REQUIRE_CUDA:-true}"
@@ -82,7 +90,10 @@ for raw_task_id in "${requested_task_ids[@]}"; do
   output_dir="${STPM_BASE_DIR}/${STPM_NAME_PREFIX}${task_id}"
   if [[ "${SKIP_EXISTING}" == "true" \
         && -f "${output_dir}/config.yaml" \
-        && -f "${output_dir}/checkpoints/reward_best.pt" ]]; then
+        && -f "${output_dir}/state_norm.json" \
+        && -f "${output_dir}/checkpoints/reward_best.pt" \
+        && -f "${output_dir}/checkpoints/reward_best_endpoint.pt" \
+        && -f "${output_dir}/checkpoints/reward_final.pt" ]]; then
     echo "[Skip] task ${task_id}: complete STPM already exists at ${output_dir}"
     continue
   fi
@@ -119,6 +130,14 @@ print(json.dumps(episode_ids, separators=(",", ":")))
     --num_workers="${NUM_WORKERS}"
     --prefetch_factor="${PREFETCH_FACTOR}"
     --lr="${LEARNING_RATE}"
+    --weight_decay="${WEIGHT_DECAY}"
+    --adam_beta1="${ADAM_BETA1}"
+    --adam_beta2="${ADAM_BETA2}"
+    --adam_eps="${ADAM_EPS}"
+    --warmup_steps="${WARMUP_STEPS}"
+    --scheduler_total_steps="${SCHEDULER_TOTAL_STEPS}"
+    --grad_clip_norm="${GRAD_CLIP_NORM}"
+    --seed="${SEED}"
     --val_ratio="${VAL_RATIO}"
     --device="${DEVICE}"
     --vision_ckpt="${VISION_CKPT}"

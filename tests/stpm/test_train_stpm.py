@@ -1,6 +1,7 @@
 import torch
 
 from lerobot.scripts.lerobot_train_stpm import (
+    _endpoint_mse_loss,
     _load_all_states,
     _masked_mse_loss,
     _split_dataset_by_episode,
@@ -83,3 +84,12 @@ def test_masked_mse_loss_ignores_padded_timesteps():
     loss = _masked_mse_loss(prediction, target, torch.tensor([2, 3]))
 
     torch.testing.assert_close(loss, torch.tensor((0.0 + 1.0 + 0.0 + 1.0 + 4.0) / 5.0))
+
+
+def test_endpoint_mse_loss_uses_last_valid_timestep():
+    prediction = torch.tensor([[0.0, 2.0, 100.0], [1.0, 2.0, 4.0]])
+    target = torch.tensor([[0.0, 1.0, -100.0], [1.0, 1.0, 2.0]])
+
+    loss = _endpoint_mse_loss(prediction, target, torch.tensor([2, 3]))
+
+    torch.testing.assert_close(loss, torch.tensor((1.0 + 4.0) / 2.0))
